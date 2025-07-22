@@ -1,0 +1,9 @@
+python exp1-per_layer.py --param_num 3b --mode sample_k --temp 0.3 --dataset_name arc_easy
+python exp1-per_layer.py --param_num 3b --mode sample_k --temp 0.7 --dataset_name arc_easy
+python exp1-per_layer.py --param_num 3b --mode sample_k --temp 1.0 --dataset_name arc_easy
+python exp1-per_layer.py --param_num 3b --mode sample_k --temp 1.5 --dataset_name arc_easy
+python exp1-per_layer.py --param_num 3b --mode sample_k --temp 2.0 --dataset_name arc_easy
+
+
+ssh gpucluster2
+cd /vol/bitbucket/al1624/FIP/albus-bayesian-moe-router/scripts
