@@ -95,3 +95,4 @@ wandb/*
 adapters/*
 results/*
 archives/*
+intermediate_checkpoints/*

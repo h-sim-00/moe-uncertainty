@@ -1,20 +1,37 @@
 from .granitemoe.modeling_granitemoe import GraniteMoeForCausalLM
 from transformers import AutoModelForCausalLM, PreTrainedModel
-import torch
 from peft import LoraConfig, get_peft_model, TaskType, PeftModel
 
-def load_model(model_id: str, device_map: str = "auto"):
-    """
-    Load a model based on the provided model_id.
-    """
-    if "granite" in model_id:
-        return GraniteMoeForCausalLM.from_pretrained(model_id, device_map=device_map)
-    else:
-        return AutoModelForCausalLM.from_pretrained(model_id, device_map=device_map)
+MODEL_SHORTCODE2ID = {
+    "granite": "ibm-granite/granite-3.1-3b-a800m-instruct",
+    "deepseek": "deepseek-ai/deepseek-moe-16b-chat",
+    "qwen": "Qwen/Qwen1.5-MoE-A2.7B-Chat",
+}
 
-def load_peft_model(model_id: str, finetune_mode: str, r: int = 64, lora_dropout: float = 0.1, target_layer: int | None = None) -> PreTrainedModel:
+def load_tokenizer(model_shortcode: str):
+    """
+    Load a tokenizer based on the provided model_shortcode.
+    """
+    assert model_shortcode in MODEL_SHORTCODE2ID, f"Model shortcode '{model_shortcode}' not defined."
+    from transformers import AutoTokenizer
+    return AutoTokenizer.from_pretrained(MODEL_SHORTCODE2ID[model_shortcode])
+
+def load_model(model_shortcode: str, device_map: str = "auto"):
+    """
+    Load a model basmodel_shortcodee provided model_id.
+    """
+    assert model_shortcode in MODEL_SHORTCODE2ID, f"Model shortcode '{model_shortcode}' not defined."
+
+    if "granite" in model_shortcode:
+        return GraniteMoeForCausalLM.from_pretrained(MODEL_SHORTCODE2ID[model_shortcode], device_map=device_map)
+    else:
+        return AutoModelForCausalLM.from_pretrained(MODEL_SHORTCODE2ID[model_shortcode], device_map=device_map)
+
+def load_peft_model(model_shortcode: str, finetune_mode: str, r: int = 64, lora_dropout: float = 0.01, target_layer: int | None = None, device_map="auto") -> PreTrainedModel:
     """Loads the base model and applies LoRA configuration."""
-    base_model = load_model(model_id)
+    assert model_shortcode in MODEL_SHORTCODE2ID, f"Model shortcode '{model_shortcode}' not defined."
+
+    base_model = load_model(model_shortcode, device_map=device_map)
     base_model.config.use_cache = False
     base_model.config.pretraining_tp = 1
 
@@ -32,7 +49,6 @@ def load_peft_model(model_id: str, finetune_mode: str, r: int = 64, lora_dropout
     else:
         raise ValueError(f"Invalid finetune_mode: {finetune_mode}")
 
-
     peft_config = LoraConfig(
         lora_alpha=16,
         lora_dropout=lora_dropout,
@@ -47,11 +63,11 @@ def load_peft_model(model_id: str, finetune_mode: str, r: int = 64, lora_dropout
     
     return peft_model
 
-def load_peft_model_and_adapter(model_id: str, adapter_path: str, eval_mode: bool = True) -> PeftModel:
+def load_peft_model_and_adapter(model_shortcode: str, adapter_path: str, eval_mode: bool = True, device_map="auto") -> PeftModel:
     """Loads the base model and applies the trained LoRA adapter."""
-
-    print(f"Loading base model: {model_id}")
-    base_model = load_model(model_id)
+    assert model_shortcode in MODEL_SHORTCODE2ID, f"Model shortcode '{model_shortcode}' not defined."
+    print(f"Loading base model: {model_shortcode}")
+    base_model = load_model(model_shortcode, device_map=device_map)
     
     print(f"Loading PEFT adapter from: {adapter_path}")
     peft_model = PeftModel.from_pretrained(base_model, adapter_path, is_trainable=True)

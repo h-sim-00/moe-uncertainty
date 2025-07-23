@@ -7,3 +7,28 @@ python exp1-per_layer.py --param_num 3b --mode sample_k --temp 2.0 --dataset_nam
 
 ssh gpucluster2
 cd /vol/bitbucket/al1624/FIP/albus-bayesian-moe-router/scripts
+
+
+Loading MMLU subject: high_school_us_history
+Loaded 5 dev, 22 val, and 204 test samples for MMLU subject 'hs_us_his'.
+Dataset 'hs_us_his' loaded.
+Test dataset example: {'question': 'Question: This question refers to the following information.\nNow, we have organized a society, and we call it "Share Our Wealth Society," a society with the motto "Every Man a King."…\nWe propose to limit the wealth of big men in the country. There is an average of $15,000 in wealth to every family in America. That is right here today.\nWe do not propose to divide it up equally. We do not propose a division of wealth, but we do propose to limit poverty that we will allow to be inflicted on any man\'s family. We will not say we are going to try to guarantee any equality … but we do say that one third of the average is low enough for any one family to hold, that there should be a guarantee of a family wealth of around $5,000; enough for a home, an automobile, a radio, and the ordinary conveniences, and the opportunity to educate their children.…\nWe will have to limit fortunes. Our present plan is that we will allow no man to own more than $50,000,000. We think that with that limit we will be able to carry out the balance of the program.\n—Senator Huey P. Long of Louisiana, Radio Address, February 23, 1934\nSenator Long ran a political machine that made him the virtual dictator of Louisiana. As a political boss, he can best be compared to whom?\nChoices:\nA. George Washington\nB. Theodore Roosevelt\nC. William M. Tweed\nD. Barack Obama\nAnswer:', 'answer': 'C', 'id': 'mmlu_high_school_us_history_no_id'}
+hs_us_his: Train samples: 58, Validation samples: 22, Test samples: 200
+Loading MMLU subject: high_school_government_and_politics
+Loaded 5 dev, 21 val, and 193 test samples for MMLU subject 'hs_gp'.
+Dataset 'hs_gp' loaded.
+Test dataset example: {'question': "Question: Which of the following is true of the Supreme Court?\nChoices:\nA. Every case appealed to the Supreme Court is ruled upon by the court.\nB. The court helps set the public agenda by deciding which appeals to hear.\nC. The court hears all cases when two or more justices agree that the case has merit.\nD. In deciding cases, the chief justice's vote counts as two votes.\nAnswer:", 'answer': 'B', 'id': 'mmlu_high_school_government_and_politics_no_id'}
+hs_gp: Train samples: 45, Validation samples: 21, Test samples: 100
+Loading MMLU subject: high_school_psychology
+Loaded 5 dev, 60 val, and 545 test samples for MMLU subject 'hs_psy'.
+Dataset 'hs_psy' loaded.
+Test dataset example: {'question': "Question: Implications of Harlow's study (of baby monkeys reared by artificial mothers) for humans include which of the following?\nChoices:\nA. I only\nB. II only\nC. III only\nD. I and II only\nAnswer:", 'answer': 'B', 'id': 'mmlu_high_school_psychology_no_id'}
+hs_psy: Train samples: 475, Validation samples: 60, Test samples: 500
+Loading MMLU subject: sociology
+Loaded 5 dev, 22 val, and 201 test samples for MMLU subject 'soc'.
+Dataset 'soc' loaded.
+Test dataset example: {'question': 'Question: Someone who gains a higher (or lower) social position than he or she was born into has experienced\nChoices:\nA. absolute poverty\nB. relative poverty\nC. vertical mobility\nD. horizontal mobility\nAnswer:', 'answer': 'C', 'id': 'mmlu_sociology_no_id'}
+soc: Train samples: 55, Validation samples: 22, Test samples: 200
+Datasets '['hs_us_his', 'hs_gp', 'hs_psy', 'soc']' loaded and preprocessed.
+Train samples: 633, Eval samples: 125
+Train dataset size: 633, Validation dataset size: 125
