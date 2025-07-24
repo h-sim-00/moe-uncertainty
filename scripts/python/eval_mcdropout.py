@@ -20,7 +20,7 @@ def main():
     args = parse_args()
 
     # 1. Load the base model and attach the Stage 1 fine-tuned adapter
-    base_adapter_path = f".adapters/kvq_ft_{args.model_shortcode}_seed-{args.seed}"
+    base_adapter_path = f"./adapters/kvq_ft_{args.model_shortcode}_seed-{args.seed}"
     print(f"Loading base model '{args.model_shortcode}' and attaching adapter from '{base_adapter_path}'")
     model = load_peft_model_and_adapter(
         args.model_shortcode,
@@ -30,7 +30,7 @@ def main():
     tokenizer = load_tokenizer(args.model_shortcode)
 
     # 2. "Lego Swap": Replace original routers and load the trained weights
-    router_weights_path = f"./adapters/mcdropout_ft_{args.model_shortcode}_seed-{args.seed}/router_weights_dor-{args.dropout_rate}.pt"
+    router_weights_path = f"./adapters/mcdropout_ft_{args.model_shortcode}_dor-{args.dropout_rate}_seed-{args.seed}/router_weights.pt"
     model = add_mcdropout_routers_to_model(model, args.dropout_rate)
     model = load_router_weights(model, router_weights_path)
     model.eval()
@@ -47,7 +47,7 @@ def main():
         all_results.append(results)
 
     # 4. Save results to a CSV
-    results_csv_path = f"./results/eval_mcdropout-ft_dor-{args.dropout_rate}_n-{args.num_samples}_seed-{args.seed}.csv"
+    results_csv_path = f"./results/eval_mcdropout-ft_{args.model_shortcode}_dor-{args.dropout_rate}_n-{args.num_samples}_seed-{args.seed}.csv"
     df = pd.DataFrame(all_results)
     df.to_csv(results_csv_path, index=False)
     print(f"\nSaved all evaluation results to {results_csv_path}")

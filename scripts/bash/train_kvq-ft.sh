@@ -10,7 +10,8 @@
 #SBATCH --mail-user=al1624@ic.ac.uk
 
 # --- Setup ---
-source ~/.bashrc
+export HF_HOME="/vol/bitbucket/al1624/.cache/huggingface"
+
 source /vol/bitbucket/al1624/.venv/moe_env/bin/activate
 cd /vol/bitbucket/al1624/FIP/albus-bayesian-moe-router/
 echo "Current working directory: $(pwd)"

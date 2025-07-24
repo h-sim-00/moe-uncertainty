@@ -10,7 +10,7 @@ from utils import (load_classification_dataset,
 def parse_args():
     parser = argparse.ArgumentParser(description="Evaluate a fine-tuned PEFT model.")
     parser.add_argument("--model_shortcode", type=str, default="granite", help="Shortcode for the base model.")
-    parser.add_argument("--adapter_path", type=str, required=True, help="Path to the saved PEFT adapter weights.")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility.")
     return parser.parse_args()
 
 def evaluate(model, tokenizer, dataset, dataset_name):
@@ -38,12 +38,13 @@ def main():
     print("Setting up the environment...")
     setup_environment()
     args = parse_args()
+    adapter_path = f"./adapters/kvq_ft_{args.model_shortcode}_seed-{args.seed}"
 
     # 2. Load peft model with adapter and tokenizer
-    print(f"Loading base model '{args.model_shortcode}' and attaching adapter from '{args.adapter_path}'")
+    print(f"Loading base model '{args.model_shortcode}' and attaching adapter from '{adapter_path}'")
     model = load_peft_model_and_adapter(
         args.model_shortcode,
-        adapter_path=args.adapter_path,
+        adapter_path=adapter_path,
         device_map="auto",
         eval_mode=True
     )
@@ -60,7 +61,7 @@ def main():
         all_results.append(results)
 
     # 4. Save all results to a CSV file
-    output_csv_path = f"./results/finetuned_results_{args.model_shortcode}.csv"
+    output_csv_path = f"./results/eval_kvq-ft_results_{args.model_shortcode}_seed-{args.seed}.csv"
     df = pd.DataFrame(all_results)
     df.to_csv(output_csv_path, index=False)
     print(f"\nSaved all evaluation results to {output_csv_path}")

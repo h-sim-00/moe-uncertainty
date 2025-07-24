@@ -19,12 +19,14 @@ def setup_environment():
         
         HF_HOME = "/vol/bitbucket/al1624/.cache/huggingface"
         HF_DATASETS_CACHE = "/vol/bitbucket/al1624/.cache/huggingface/datasets"
+        HF_HUB_CACHE="/vol/bitbucket/al1624/.cache/huggingface/hub"
         WANDB_STORAGE_DIR = "/vol/bitbucket/al1624/.cache/wandb"
 
         os.makedirs(WANDB_STORAGE_DIR, exist_ok=True)
 
         os.environ['HF_HOME'] = HF_HOME
         os.environ['HF_DATASETS_CACHE'] = HF_DATASETS_CACHE
+        os.environ['HF_HUB_CACHE'] = HF_HUB_CACHE
         os.environ['WANDB_DIR'] = WANDB_STORAGE_DIR
 
     # Login to WandB and HuggingFace

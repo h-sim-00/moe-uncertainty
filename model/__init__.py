@@ -1,5 +1,4 @@
-from .granitemoe.modeling_granitemoe import GraniteMoeForCausalLM
-from transformers import AutoModelForCausalLM, PreTrainedModel
+from transformers import PreTrainedModel
 from peft import LoraConfig, get_peft_model, TaskType, PeftModel
 
 MODEL_SHORTCODE2ID = {
@@ -23,8 +22,13 @@ def load_model(model_shortcode: str, device_map: str = "auto"):
     assert model_shortcode in MODEL_SHORTCODE2ID, f"Model shortcode '{model_shortcode}' not defined."
 
     if "granite" in model_shortcode:
+        from .granitemoe.modeling_granitemoe import GraniteMoeForCausalLM
         return GraniteMoeForCausalLM.from_pretrained(MODEL_SHORTCODE2ID[model_shortcode], device_map=device_map)
+    elif "deepseek" in model_shortcode:
+        from .deepseekmoe.modeling_deepseek import DeepseekForCausalLM
+        return DeepseekForCausalLM.from_pretrained(MODEL_SHORTCODE2ID[model_shortcode], device_map=device_map, trust_remote_code=True)
     else:
+        from transformers import AutoModelForCausalLM
         return AutoModelForCausalLM.from_pretrained(MODEL_SHORTCODE2ID[model_shortcode], device_map=device_map)
 
 def load_peft_model(model_shortcode: str, finetune_mode: str, r: int = 64, lora_dropout: float = 0.01, target_layer: int | None = None, device_map="auto") -> PreTrainedModel:

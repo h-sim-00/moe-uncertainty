@@ -91,7 +91,6 @@ Desktop.ini
 
 # wandb logs
 wandb/*
-
 adapters/*
 results/*
 archives/*
