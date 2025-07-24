@@ -9,7 +9,7 @@ import os
 from tqdm import tqdm
 
 # Import the user-specified metric calculation utilities
-from ...utils import get_model_predictions, calculate_accuracy, calculate_ece_mce, calculate_nll
+from utils import get_model_predictions, calculate_accuracy, calculate_ece_mce, calculate_nll
 
 
 # --- Component 1: The Standard Router Class ---
@@ -23,7 +23,7 @@ class GraniteMoeDeterministicRouter(nn.Module):
         self.top_k = top_k
         self.layer = nn.Linear(input_size, num_experts, bias=False)
 
-    def forward(self, hidden_states):
+    def forward(self, hidden_states, mode="top_k", temp=1.0):
         logits = self.layer(hidden_states).float()
         # --- The rest of the routing logic remains identical ---
         top_k_logits, top_k_indices = logits.topk(self.top_k, dim=1)
@@ -40,7 +40,6 @@ class GraniteMoeDeterministicRouter(nn.Module):
         batch_gates = top_k_gates[index_sorted_experts]
         return index_sorted_experts, batch_index, batch_gates, expert_size, logits
 
-
 # --- Component 2: Function to Modify and Train the Router ---
 def train_and_fit_laplace(model, tokenizer, train_dataset, val_dataset, train_loader_for_laplace, args):
     """
@@ -52,52 +51,76 @@ def train_and_fit_laplace(model, tokenizer, train_dataset, val_dataset, train_lo
     for param in model.parameters():
         param.requires_grad = False
     
-    config = model.model.config
     device = model.device
-    for layer in model.model.layers:
+    causal_model = model.base_model.model
+
+    for layer in causal_model.model.layers:
+        old_router = layer.block_sparse_moe.router
         new_router = GraniteMoeDeterministicRouter(
-            input_size=config.hidden_size,
-            num_experts=config.num_local_experts,
-            top_k=config.num_experts_per_tok,
+            input_size=old_router.input_size,
+            num_experts=old_router.num_experts,
+            top_k=old_router.top_k,
         ).to(device)
+        new_router.layer.load_state_dict(old_router.layer.state_dict())
         layer.block_sparse_moe.router = new_router
         for param in layer.block_sparse_moe.router.parameters():
             param.requires_grad = True
 
     # 2. Train the routers to find the MAP estimate using the Trainer
     project_name = "bayesian-router-finetuning"
-    run_name = f"Laplace-MAP_{args.model_shortcode}_seed-{args.seed}"
-    wandb.init(project=project_name, name=run_name, config=vars(args), reinit=True)
-    
-    training_args = TrainingArguments(
-        output_dir=f"./intermediate_checkpoints/{run_name}",
-        num_train_epochs=args.epochs,
-        per_device_train_batch_size=args.batch_size,
-        per_device_eval_batch_size=args.batch_size,
-        report_to="wandb",
-        logging_steps=10,
-        evaluation_strategy="epoch",
-        save_strategy="epoch",
-        load_best_model_at_end=True,
-        metric_for_best_model="eval_loss",
-        greater_is_better=False,
-        save_total_limit=1,
-        seed=args.seed,
-    )
-    trainer = Trainer(
-        model=model, args=training_args, train_dataset=train_dataset,
-        eval_dataset=val_dataset, tokenizer=tokenizer,
-        data_collator=DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False),
-        callbacks=[EarlyStoppingCallback(early_stopping_patience=2)]
-    )
-    print("--- Starting MAP Fine-tuning for Laplace ---")
-    trainer.train()
-    print("--- MAP Fine-tuning complete ---")
-    
+    run_name = f"Laplace_{args.model_shortcode}_seed-{args.seed}"
+
+    map_save_dir = os.path.join("./adapters", run_name)
+    os.makedirs(map_save_dir, exist_ok=True)
+    map_weights_path = os.path.join(map_save_dir, "map_router_weights.pt")
+
+    if os.path.exists(map_weights_path):
+        print(f"--- Found pre-trained MAP weights at {map_weights_path}. Loading... ---")
+        map_state_dicts = torch.load(map_weights_path, map_location=device)
+        for i, layer in enumerate(causal_model.model.layers):
+            layer.block_sparse_moe.router.load_state_dict(map_state_dicts[f"layer_{i}"])
+    else: 
+        print("--- No pre-trained MAP weights found. Starting fine-tuning... ---")
+        wandb.init(project=project_name, name=run_name, config=vars(args), reinit=True)
+        training_args = TrainingArguments(
+            output_dir=f"./intermediate_checkpoints/{run_name}",
+            num_train_epochs=args.epochs,
+            per_device_train_batch_size=args.batch_size,
+            per_device_eval_batch_size=args.batch_size,
+            report_to="wandb",
+            logging_steps=10,
+            eval_strategy="epoch",
+            save_strategy="epoch",
+            load_best_model_at_end=True,
+            metric_for_best_model="eval_loss",
+            greater_is_better=False,
+            save_total_limit=1,
+            seed=args.seed,
+        )
+        trainer = Trainer(
+            model=model, args=training_args, train_dataset=train_dataset,
+            eval_dataset=val_dataset, tokenizer=tokenizer,
+            data_collator=DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False),
+            callbacks=[EarlyStoppingCallback(early_stopping_patience=2)]
+        )
+        
+        print("--- Starting MAP Fine-tuning for Laplace ---")
+        trainer.train()
+        print("--- MAP Fine-tuning complete ---")
+
+        print(f"--- Saving MAP router weights to {map_weights_path} ---")
+        map_router_states = {
+            f"layer_{i}": layer.block_sparse_moe.router.state_dict()
+            for i, layer in enumerate(causal_model.model.layers)
+        }
+        torch.save(map_router_states, map_weights_path)
+
     # 3. Fit the Laplace approximation on each router
+    from torch.utils.data import DataLoader
+    train_loader_for_laplace = DataLoader(train_dataset, batch_size=args.batch_size)
     print("--- Fitting Laplace Approximation for each router ---")
     laplace_approximations = {}
-    for i, layer in enumerate(model.model.layers):
+    for i, layer in enumerate(causal_model.model.layers):
         print(f"Fitting Laplace for router in layer {i}...")
         # We specify which part of the model to make Bayesian
         la = Laplace(layer.block_sparse_moe.router, 'classification',
@@ -110,12 +133,11 @@ def train_and_fit_laplace(model, tokenizer, train_dataset, val_dataset, train_lo
         laplace_approximations[f"layer_{i}"] = la
     
     # 4. Save the fitted Laplace objects
-    save_dir = os.path.join(args.output_dir, run_name)
+    save_dir = os.path.join("./adapters", run_name)
     os.makedirs(save_dir, exist_ok=True)
     final_save_path = os.path.join(save_dir, "laplace_routers.pkl")
     print(f"Saving the fitted Laplace objects to {final_save_path}")
     torch.save(laplace_approximations, final_save_path)
-
 
 # --- Component 3: The Evaluation Function ---
 def evaluate_laplace_router(model, tokenizer, laplace_objects, dataset, dataset_name, num_samples=10, batch_size=8):
@@ -123,6 +145,8 @@ def evaluate_laplace_router(model, tokenizer, laplace_objects, dataset, dataset_
     print(f"--- Evaluating on {dataset_name} with {num_samples} Laplace samples ---")
     
     model.eval()
+    causal_model = model.base_model.model
+
     all_probs = []
 
     # Get the base predictions and labels once
@@ -132,7 +156,7 @@ def evaluate_laplace_router(model, tokenizer, laplace_objects, dataset, dataset_
     for i in tqdm(range(num_samples), desc="Laplace MC Samples"):
         # For each sample, draw new weights for all routers
         with torch.no_grad():
-            for layer_idx, layer in enumerate(model.model.layers):
+            for layer_idx, layer in enumerate(causal_model.model.layers):
                 la = laplace_objects[f"layer_{layer_idx}"]
                 # Sample and apply weights in-place
                 la.sample_and_apply()

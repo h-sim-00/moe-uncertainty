@@ -15,14 +15,14 @@ source /vol/bitbucket/al1624/.venv/moe_env/bin/activate
 cd /vol/bitbucket/al1624/FIP/albus-bayesian-moe-router/
 echo "Current working directory: $(pwd)"
 
+cp ./scripts/python/eval_mcdropout.py .
+
 # --- Define Parameters ---
 MODELS=("granite")
 SEEDS=(42)
 DROPOUT_RATES=(0.01 0.05 0.1 0.25)
 NUM_SAMPLES=(10 20 30)
 BATCH_SIZE=8
-
-cp ./scripts/python/eval_mcdropout.py .
 
 # --- Run Evaluation for Each Combination ---
 echo "===================================================="
@@ -50,10 +50,6 @@ for MODEL_SHORTCODE in "${MODELS[@]}"; do
         done
     done
 done
-
-# --- Cleanup ---
 rm eval_mcdropout.py
-echo "Temporary files cleaned up."
-
 echo "All evaluation tasks completed successfully."
 # --- End of Script ---

@@ -1,7 +1,8 @@
+from sklearn import base
 import torch
 from torch import nn
-from ...utils import (get_model_predictions,
-                      calculate_accuracy, calculate_ece_mce, calculate_nll)
+from utils import (get_model_predictions,
+                   calculate_accuracy, calculate_ece_mce, calculate_nll)
 
 class GraniteMoeMCDropoutRouter(nn.Module):
     def __init__(self, input_size: int, num_experts: int, top_k: int, dropout_rate: float = 0.1):
@@ -19,7 +20,7 @@ class GraniteMoeMCDropoutRouter(nn.Module):
         self.layer = nn.Linear(input_size, num_experts, bias=False)
         self.dropout = nn.Dropout(dropout_rate)
 
-    def forward(self, hidden_states):
+    def forward(self, hidden_states, mode="top_k", temp=1.0):
         """
         Forward method for the gating mechanism.
         Args:
@@ -63,8 +64,10 @@ def add_mcdropout_routers_to_model(model, dropout_rate):
     
     device = model.device
 
+    causal_model = model.base_model.model
+
     print("Swapping original routers with MCDropoutRouters...")
-    for layer in model.model.layers:
+    for layer in causal_model.model.layers:
         old_router = layer.block_sparse_moe.router
         new_router = GraniteMoeMCDropoutRouter(
             input_size=old_router.input_size,
@@ -77,11 +80,11 @@ def add_mcdropout_routers_to_model(model, dropout_rate):
         layer.block_sparse_moe.router = new_router
 
     print("Unfreezing all new router parameters for training...")
-    for layer in model.model.layers:
+    for layer in causal_model.model.layers:
         for param in layer.block_sparse_moe.router.parameters():
             param.requires_grad = True
     
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    trainable_params = sum(p.numel() for p in causal_model.parameters() if p.requires_grad)
     print(f"Successfully modified model. Trainable parameters: {trainable_params}")
     
     return model
@@ -131,9 +134,11 @@ def train_router(model, tokenizer, train_dataset, val_dataset, args):
     trainer.train()
     print("--- Router Fine-tuning complete ---")
 
+    causal_model = model.base_model.model
+
     final_router_states = {
         f"layer_{i}": layer.block_sparse_moe.router.state_dict()
-        for i, layer in enumerate(model.model.layers)
+        for i, layer in enumerate(causal_model.model.layers)
     }
     
     import os
@@ -152,8 +157,9 @@ def load_router_weights(model, router_weights_path):
 
     print(f"Loading router weights from {router_weights_path}")
     router_state_dicts = torch.load(router_weights_path, map_location=model.device)
+    causal_model = model.base_model.model
     
-    for i, layer in enumerate(model.model.layers):
+    for i, layer in enumerate(causal_model.model.layers):
         state_dict = router_state_dicts[f"layer_{i}"]
         layer.block_sparse_moe.router.load_state_dict(state_dict)
     
@@ -169,7 +175,8 @@ def evaluate_router(model, tokenizer, dataset, dataset_name, num_samples=10, bat
     print(f"--- Evaluating on {dataset_name} with {num_samples} MC samples ---")
     
     model.eval()
-    for layer in model.model.layers:
+    causal_model = model.base_model.model
+    for layer in causal_model.model.layers:
         if hasattr(layer, 'block_sparse_moe'):
             layer.block_sparse_moe.router.dropout.train()
 

@@ -1,7 +1,7 @@
 #!/bin/bash
-#SBATCH --job-name=train_mcdropout
-#SBATCH --output=/vol/bitbucket/al1624/FIP/albus-bayesian-moe-router/logs/slurm/slurm_%j_train_mcdropout.log
-#SBATCH --partition=AMD7-A100-T
+#SBATCH --job-name=eval_laplace
+#SBATCH --output=/vol/bitbucket/al1624/FIP/albus-bayesian-moe-router/logs/slurm/slurm_%j_eval_laplace.log
+#SBATCH --partition=gpgpuB
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=32G
@@ -18,33 +18,34 @@ echo "Current working directory: $(pwd)"
 # --- Define Parameters ---
 MODELS=("granite")
 SEEDS=(42)
-DROPOUT_RATES=(0.01 0.05 0.1 0.25)
-EPOCHS=10
+NUM_SAMPLES=(10 20 30)
 BATCH_SIZE=8
 
-# --- Run Fine-tuning for Each Combination ---
+# --- Run Evaluation for Each Combination ---
 echo "===================================================="
-echo "Starting MCDropout Router Fine-tuning Runs"
+echo "Starting Evaluation of Laplace Routers"
 echo "===================================================="
 
 for MODEL_SHORTCODE in "${MODELS[@]}"; do
     for SEED in "${SEEDS[@]}"; do
-        for DOR in "${DROPOUT_RATES[@]}"; do
+        for N_SAMPLES in "${NUM_SAMPLES[@]}"; do
             echo "----------------------------------------------------"
-            echo "Training: ${MODEL_SHORTCODE} | Seed: ${SEED} | Dropout: ${DOR}"
+            echo "Evaluating: ${MODEL_SHORTCODE} | Seed: ${SEED} | Samples: ${N_SAMPLES}"
             echo "----------------------------------------------------"
 
-            python ./scripts/python/train_mcdropout.py \
+            # Define a unique output file for this specific evaluation run
+            RESULTS_CSV_PATH="./results/eval_${RUN_NAME}_n_samples-${N_SAMPLES}.csv"
+
+            python ./scripts/python/evaluate_laplace_router.py \
                 --model_shortcode "$MODEL_SHORTCODE" \
-                --seed "$SEED" \
-                --dropout_rate "$DOR" \
-                --epochs "$EPOCHS" \
-                --batch_size "$BATCH_SIZE"
+                --num_samples "$N_SAMPLES" \
+                --batch_size "$BATCH_SIZE" \
+                --seed "$SEED" 
 
-            echo "Training completed for ${MODEL_SHORTCODE} | Seed: ${SEED} | Dropout: ${DOR}"
+            echo "Evaluation completed."
         done
     done
 done
 
-echo "All fine-tuning tasks completed successfully."
+echo "All evaluation tasks completed successfully."
 # --- End of Script ---
