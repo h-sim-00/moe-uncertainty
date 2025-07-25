@@ -90,7 +90,7 @@ def train_swag_router(model, tokenizer, train_dataset, val_dataset, args):
         swag_model.update_bn(train_loader)
         
     # 4. Save the fitted SWAG objects
-    run_name = f"swag_{args.model_shortcode}_seed-{args.seed}"
+    run_name = f"swag_{args.mode   l_shortcode}_seed-{args.seed}"
     save_dir = os.path.join("./adapters", run_name)
     os.makedirs(save_dir, exist_ok=True)
     final_save_path = os.path.join(save_dir, "swag_routers.pt")

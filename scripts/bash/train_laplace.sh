@@ -15,6 +15,8 @@ source /vol/bitbucket/al1624/.venv/moe_env/bin/activate
 cd /vol/bitbucket/al1624/FIP/albus-bayesian-moe-router/
 echo "Current working directory: $(pwd)"
 
+cp ./scripts/python/train_laplace.py .
+
 # --- Define Parameters ---
 MODELS=("granite")
 SEEDS=(42)
@@ -32,7 +34,7 @@ for MODEL_SHORTCODE in "${MODELS[@]}"; do
         echo "Running: ${MODEL_SHORTCODE} | Seed: ${SEED}"
         echo "----------------------------------------------------"
 
-        python ./scripts/python/train_laplace_router.py \
+        python train_laplace.py \
             --model_shortcode "$MODEL_SHORTCODE" \
             --seed "$SEED" \
             --epochs "$EPOCHS" \
@@ -41,6 +43,8 @@ for MODEL_SHORTCODE in "${MODELS[@]}"; do
         echo "Training and fitting completed for ${MODEL_SHORTCODE} | Seed: ${SEED}"
     done
 done
+
+rm train_laplace.py
 
 echo "All Laplace tasks completed successfully."
 # --- End of Script ---

@@ -2,7 +2,7 @@ import argparse
 from utils import setup_environment
 from model import load_peft_model_and_adapter, load_tokenizer
 from utils import load_and_prepare_train_and_val_data
-from model.routers.laplace import train_and_fit_laplace
+from model.routers.laplace_kfac import train_and_fit_laplace
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Fine-tune a router and fit a Laplace Approximation.")

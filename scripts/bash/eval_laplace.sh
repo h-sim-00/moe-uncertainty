@@ -15,6 +15,8 @@ source /vol/bitbucket/al1624/.venv/moe_env/bin/activate
 cd /vol/bitbucket/al1624/FIP/albus-bayesian-moe-router/
 echo "Current working directory: $(pwd)"
 
+cp ./scripts/python/eval_laplace.py .
+
 # --- Define Parameters ---
 MODELS=("granite")
 SEEDS=(42)
@@ -36,7 +38,7 @@ for MODEL_SHORTCODE in "${MODELS[@]}"; do
             # Define a unique output file for this specific evaluation run
             RESULTS_CSV_PATH="./results/eval_${RUN_NAME}_n_samples-${N_SAMPLES}.csv"
 
-            python ./scripts/python/evaluate_laplace_router.py \
+            python eval_laplace.py \
                 --model_shortcode "$MODEL_SHORTCODE" \
                 --num_samples "$N_SAMPLES" \
                 --batch_size "$BATCH_SIZE" \
@@ -46,6 +48,8 @@ for MODEL_SHORTCODE in "${MODELS[@]}"; do
         done
     done
 done
+
+rm eval_laplace.py
 
 echo "All evaluation tasks completed successfully."
 # --- End of Script ---

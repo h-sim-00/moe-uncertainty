@@ -1,5 +1,3 @@
-# model/routers/laplace.py
-
 import torch
 import torch.nn as nn
 from transformers import Trainer, TrainingArguments, DataCollatorForLanguageModeling, EarlyStoppingCallback
@@ -10,7 +8,6 @@ from tqdm import tqdm
 
 # Import the user-specified metric calculation utilities
 from utils import get_model_predictions, calculate_accuracy, calculate_ece_mce, calculate_nll
-
 
 # --- Component 1: The Standard Router Class ---
 # For Laplace, we start with a standard, deterministic router.
@@ -41,7 +38,7 @@ class GraniteMoeDeterministicRouter(nn.Module):
         return index_sorted_experts, batch_index, batch_gates, expert_size, logits
 
 # --- Component 2: Function to Modify and Train the Router ---
-def train_and_fit_laplace(model, tokenizer, train_dataset, val_dataset, train_loader_for_laplace, args):
+def train_and_fit_laplace(model, tokenizer, train_dataset, val_dataset, args):
     """
     Full pipeline: Swaps in deterministic routers, trains them to find the MAP estimate,
     and then fits the Laplace approximation.
@@ -115,24 +112,74 @@ def train_and_fit_laplace(model, tokenizer, train_dataset, val_dataset, train_lo
         }
         torch.save(map_router_states, map_weights_path)
 
-    # 3. Fit the Laplace approximation on each router
-    from torch.utils.data import DataLoader
-    train_loader_for_laplace = DataLoader(train_dataset, batch_size=args.batch_size)
+    # 3. Create a synthetic dataset for the Laplace fitting step
+    print("--- Creating synthetic dataset for Laplace fitting ---")
+    
+    data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
+    # Use a new DataLoader for this pre-computation step
+    from torch.utils.data import DataLoader, TensorDataset
+    precomputation_loader = DataLoader(train_dataset, batch_size=args.batch_size, collate_fn=data_collator)
+    
+    all_router_inputs = [[] for _ in causal_model.model.layers]
+    all_router_pseudo_labels = [[] for _ in causal_model.model.layers]
+
+    # We need to register hooks to capture the inputs to each router
+    hooks = []
+    def get_input_hook(layer_idx):
+        def hook(module, input, output):
+            # The input to the router is the hidden_states tuple
+            all_router_inputs[layer_idx].append(input[0].detach().cpu())
+        return hook
+
+    for i, layer in enumerate(causal_model.model.layers):
+        hook_handle = layer.block_sparse_moe.router.register_forward_hook(get_input_hook(i))
+        hooks.append(hook_handle)
+
+    # Perform one pass over the data to collect router inputs
+    model.eval()
+    with torch.no_grad():
+        for batch in tqdm(precomputation_loader, desc="Pre-computing router inputs"):
+            inputs = {k: v.to(device) for k, v in batch.items()}
+            model(**inputs)
+
+    # Remove the hooks
+    for hook in hooks:
+        hook.remove()
+        
+    # Now generate pseudo-labels using the trained MAP routers
+    with torch.no_grad():
+        for i, layer in enumerate(causal_model.model.layers):
+            router_inputs_cat = torch.cat(all_router_inputs[i]).to(device)
+            # Pass the collected inputs through the MAP router to get logits
+            logits = layer.block_sparse_moe.router(router_inputs_cat)[-1] # Get logits
+            # The pseudo-labels are the router's own predictions
+            pseudo_labels = torch.argmax(logits, dim=-1)
+            all_router_pseudo_labels[i] = pseudo_labels.cpu()
+    
+    # 4. Fit the Laplace approximation on each router using the synthetic dataset
     print("--- Fitting Laplace Approximation for each router ---")
     laplace_approximations = {}
     for i, layer in enumerate(causal_model.model.layers):
         print(f"Fitting Laplace for router in layer {i}...")
-        # We specify which part of the model to make Bayesian
-        la = Laplace(layer.block_sparse_moe.router, 'classification',
+        
+        # Create a simple TensorDataset and DataLoader
+        synthetic_dataset = TensorDataset(torch.cat(all_router_inputs[i]), all_router_pseudo_labels[i])
+        synthetic_loader = DataLoader(synthetic_dataset, batch_size=args.batch_size)
+        
+        router_module = layer.block_sparse_moe.router
+        la = Laplace(router_module, 'classification',
                      subset_of_weights='all',
-                     hessian_structure='kfac')
-        # Fit the approximation using the training data
-        la.fit(train_loader_for_laplace)
-        # Optional: Tune the prior precision on a validation set
+                     hessian_structure='kron')
+        
+        # Now we can use the standard, documented fit method
+        la.fit(synthetic_loader)
+        
+        print(f"Optimizing prior precision for layer {i}...")
         la.optimize_prior_precision(method='marglik')
+        
         laplace_approximations[f"layer_{i}"] = la
     
-    # 4. Save the fitted Laplace objects
+    # 5. Save the fitted Laplace objects
     save_dir = os.path.join("./adapters", run_name)
     os.makedirs(save_dir, exist_ok=True)
     final_save_path = os.path.join(save_dir, "laplace_routers.pkl")
