@@ -34,7 +34,6 @@ def main():
     train_dataset_shortcodes = ["hs_us_his", "hs_gp", "hs_psy", "soc"]
     train_dataset, val_dataset = load_and_prepare_train_and_val_data(tokenizer, train_dataset_shortcodes)
     
-    
     # 3. Call the dedicated training and fitting function
     train_swag_router(
         model, tokenizer, train_dataset, val_dataset, args

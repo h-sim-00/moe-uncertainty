@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 from transformers import Trainer, TrainingArguments, DataCollatorForLanguageModeling, EarlyStoppingCallback
+from torch.utils.data import DataLoader, Dataset
 from laplace import Laplace
 import wandb
 import os
@@ -8,6 +9,20 @@ from tqdm import tqdm
 
 # Import the user-specified metric calculation utilities
 from utils import get_model_predictions, calculate_accuracy, calculate_ece_mce, calculate_nll
+
+class FileCacheDataset(Dataset):
+    """A PyTorch Dataset that loads data from a list of saved files."""
+    def __init__(self, file_paths):
+        self.file_paths = file_paths
+        self.data_cache = [torch.load(p) for p in self.file_paths]
+        self.inputs = torch.cat([d['inputs'] for d in self.data_cache])
+        self.labels = torch.cat([d['labels'] for d in self.data_cache])
+
+    def __len__(self):
+        return len(self.inputs)
+
+    def __getitem__(self, idx):
+        return self.inputs[idx], self.labels[idx]
 
 # --- Component 1: The Standard Router Class ---
 # For Laplace, we start with a standard, deterministic router.
@@ -65,7 +80,7 @@ def train_and_fit_laplace(model, tokenizer, train_dataset, val_dataset, args):
 
     # 2. Train the routers to find the MAP estimate using the Trainer
     project_name = "bayesian-router-finetuning"
-    run_name = f"Laplace_{args.model_shortcode}_seed-{args.seed}"
+    run_name = f"laplace_{args.model_shortcode}_seed-{args.seed}"
 
     map_save_dir = os.path.join("./adapters", run_name)
     os.makedirs(map_save_dir, exist_ok=True)
@@ -112,58 +127,62 @@ def train_and_fit_laplace(model, tokenizer, train_dataset, val_dataset, args):
         }
         torch.save(map_router_states, map_weights_path)
 
-    # 3. Create a synthetic dataset for the Laplace fitting step
-    print("--- Creating synthetic dataset for Laplace fitting ---")
+    # --- 3. Create a synthetic dataset for the Laplace fitting step (MEMORY-EFFICIENT) ---
+    print("--- Creating synthetic dataset for Laplace fitting (saving to disk) ---")
+    
+    run_name = f"laplace_{args.model_shortcode}_seed-{args.seed}"
+    
+    # Create a main temporary directory
+    import shutil
+    main_temp_dir = f"./adapters/temp_laplace_data/{run_name}"
+    if os.path.exists(main_temp_dir):
+        shutil.rmtree(main_temp_dir)
+    os.makedirs(main_temp_dir, exist_ok=True)
     
     data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
-    # Use a new DataLoader for this pre-computation step
-    from torch.utils.data import DataLoader, TensorDataset
     precomputation_loader = DataLoader(train_dataset, batch_size=args.batch_size, collate_fn=data_collator)
     
-    all_router_inputs = [[] for _ in causal_model.model.layers]
-    all_router_pseudo_labels = [[] for _ in causal_model.model.layers]
-
-    # We need to register hooks to capture the inputs to each router
-    hooks = []
-    def get_input_hook(layer_idx):
-        def hook(module, input, output):
-            # The input to the router is the hidden_states tuple
-            all_router_inputs[layer_idx].append(input[0].detach().cpu())
-        return hook
-
+    # --- Pre-computation Step (Layer by Layer, Batch by Batch) ---
     for i, layer in enumerate(causal_model.model.layers):
-        hook_handle = layer.block_sparse_moe.router.register_forward_hook(get_input_hook(i))
-        hooks.append(hook_handle)
-
-    # Perform one pass over the data to collect router inputs
-    model.eval()
-    with torch.no_grad():
-        for batch in tqdm(precomputation_loader, desc="Pre-computing router inputs"):
-            inputs = {k: v.to(device) for k, v in batch.items()}
-            model(**inputs)
-
-    # Remove the hooks
-    for hook in hooks:
-        hook.remove()
+        layer_temp_dir = os.path.join(main_temp_dir, f"layer_{i}")
+        os.makedirs(layer_temp_dir, exist_ok=True)
         
-    # Now generate pseudo-labels using the trained MAP routers
-    with torch.no_grad():
-        for i, layer in enumerate(causal_model.model.layers):
-            router_inputs_cat = torch.cat(all_router_inputs[i]).to(device)
-            # Pass the collected inputs through the MAP router to get logits
-            logits = layer.block_sparse_moe.router(router_inputs_cat)[-1] # Get logits
-            # The pseudo-labels are the router's own predictions
-            pseudo_labels = torch.argmax(logits, dim=-1)
-            all_router_pseudo_labels[i] = pseudo_labels.cpu()
-    
-    # 4. Fit the Laplace approximation on each router using the synthetic dataset
+        captured_inputs = []
+        def get_input_hook(module, input, output):
+            captured_inputs.append(input[0].detach().cpu())
+        
+        hook_handle = layer.block_sparse_moe.router.register_forward_hook(get_input_hook)
+
+        model.eval()
+        with torch.no_grad():
+            for batch_idx, batch in enumerate(tqdm(precomputation_loader, desc=f"Pre-computing for layer {i}")):
+                captured_inputs.clear()
+                inputs = {k: v.to(device) for k, v in batch.items()}
+                model(**inputs)
+                
+                # Immediately process and save the captured batch
+                router_inputs_batch = captured_inputs[0].to(device)
+                logits = layer.block_sparse_moe.router(router_inputs_batch)[-1]
+                pseudo_labels = torch.argmax(logits, dim=-1).cpu()
+                
+                torch.save({
+                    'inputs': router_inputs_batch.cpu(),
+                    'labels': pseudo_labels
+                }, f"{layer_temp_dir}/batch_{batch_idx}.pt")
+
+        hook_handle.remove()
+
+    # 4. Fit the Laplace approximation on each router by loading from disk
     print("--- Fitting Laplace Approximation for each router ---")
     laplace_approximations = {}
     for i, layer in enumerate(causal_model.model.layers):
         print(f"Fitting Laplace for router in layer {i}...")
         
-        # Create a simple TensorDataset and DataLoader
-        synthetic_dataset = TensorDataset(torch.cat(all_router_inputs[i]), all_router_pseudo_labels[i])
+        layer_temp_dir = os.path.join(main_temp_dir, f"layer_{i}")
+        batch_files = [os.path.join(layer_temp_dir, f) for f in os.listdir(layer_temp_dir)]
+        
+        # Load data for this layer using our custom dataset
+        synthetic_dataset = FileCacheDataset(batch_files)
         synthetic_loader = DataLoader(synthetic_dataset, batch_size=args.batch_size)
         
         router_module = layer.block_sparse_moe.router
@@ -171,7 +190,6 @@ def train_and_fit_laplace(model, tokenizer, train_dataset, val_dataset, args):
                      subset_of_weights='all',
                      hessian_structure='kron')
         
-        # Now we can use the standard, documented fit method
         la.fit(synthetic_loader)
         
         print(f"Optimizing prior precision for layer {i}...")

@@ -33,7 +33,6 @@ def main():
     swag_path = f"./adapters/swag_{args.model_shortcode}_seed-{args.seed}/swag_routers.pt"
     swag_objects = torch.load(swag_path, map_location=model.device)
     # The SWAG object automatically handles loading its mean weights into the base model
-    
 
     # 3. Run evaluation across all specified datasets
     dataset_shortcodes = ["hs_us_his", "hs_gp", "hs_psy", "soc", "jp", "phi", "pro_law", "abs_alg", "cs", "med_gen"]

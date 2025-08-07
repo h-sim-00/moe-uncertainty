@@ -77,7 +77,7 @@ def train_svgd_router(model, tokenizer, train_loader, args):
     run_name = f"svgd_{args.model_shortcode}_seed-{args.seed}"
     wandb.init(project=project_name, name=run_name, config=vars(args), reinit=True)
 
-    # 1. Initialize Particles
+    # 1. Initialize Particles 
     device = model.device
     map_weights = _get_all_router_weights(model).detach()
     num_params = map_weights.numel()
@@ -90,9 +90,15 @@ def train_svgd_router(model, tokenizer, train_loader, args):
     # 2. Setup Optimizer for the particle tensor
     optimizer = torch.optim.Adam([particles], lr=args.lr)
     
-    # 3. Freeze all non-router parameters in the main model
+    # 3. Freeze all non-router parameters in the main model & Unfreeze ONLY the router parameters
     for param in model.parameters():
         param.requires_grad = False
+
+    print("Unfreezing all router parameters for gradient calculation...")
+    causal_model = model.base_model.model
+    for layer in causal_model.model.layers:
+        for param in layer.block_sparse_moe.router.layer.parameters():
+            param.requires_grad = True
 
     print("--- Starting SVGD Router Fine-tuning (Custom Loop) ---")
     for epoch in range(args.epochs):
@@ -115,7 +121,7 @@ def train_svgd_router(model, tokenizer, train_loader, args):
                 neg_log_posterior.backward()
                 
                 grad_vec = []
-                for layer in model.base_model.model.model.layers:
+                for layer in causal_model.model.layers:
                     for param in layer.block_sparse_moe.router.layer.parameters():
                         grad_vec.append(param.grad.view(-1))
                         param.grad.zero_() # Clear grads for the next particle

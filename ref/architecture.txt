@@ -27,3 +27,79 @@ GraniteMoeForCausalLM(
   )
   (lm_head): Linear(in_features=1536, out_features=49155, bias=False)
 )
+
+PeftModelForCausalLM(
+  (base_model): LoraModel(
+    (model): GraniteMoeForCausalLM(
+      (model): GraniteMoeModel(
+        (embed_tokens): Embedding(49155, 1536, padding_idx=0)
+        (layers): ModuleList(
+          (0-31): 32 x GraniteMoeDecoderLayer(
+            (self_attn): GraniteMoeSdpaAttention(
+              (q_proj): lora.Linear(
+                (base_layer): Linear(in_features=1536, out_features=1536, bias=False)
+                (lora_dropout): ModuleDict(
+                  (default): Dropout(p=0.01, inplace=False)
+                )
+                (lora_A): ModuleDict(
+                  (default): Linear(in_features=1536, out_features=64, bias=False)
+                )
+                (lora_B): ModuleDict(
+                  (default): Linear(in_features=64, out_features=1536, bias=False)
+                )
+                (lora_embedding_A): ParameterDict()
+                (lora_embedding_B): ParameterDict()
+                (lora_magnitude_vector): ModuleDict()
+              )
+              (k_proj): lora.Linear(
+                (base_layer): Linear(in_features=1536, out_features=512, bias=False)
+                (lora_dropout): ModuleDict(
+                  (default): Dropout(p=0.01, inplace=False)
+                )
+                (lora_A): ModuleDict(
+                  (default): Linear(in_features=1536, out_features=64, bias=False)
+                )
+                (lora_B): ModuleDict(
+                  (default): Linear(in_features=64, out_features=512, bias=False)
+                )
+                (lora_embedding_A): ParameterDict()
+                (lora_embedding_B): ParameterDict()
+                (lora_magnitude_vector): ModuleDict()
+              )
+              (v_proj): lora.Linear(
+                (base_layer): Linear(in_features=1536, out_features=512, bias=False)
+                (lora_dropout): ModuleDict(
+                  (default): Dropout(p=0.01, inplace=False)
+                )
+                (lora_A): ModuleDict(
+                  (default): Linear(in_features=1536, out_features=64, bias=False)
+                )
+                (lora_B): ModuleDict(
+                  (default): Linear(in_features=64, out_features=512, bias=False)
+                )
+                (lora_embedding_A): ParameterDict()
+                (lora_embedding_B): ParameterDict()
+                (lora_magnitude_vector): ModuleDict()
+              )
+              (o_proj): Linear(in_features=1536, out_features=1536, bias=False)
+            )
+            (block_sparse_moe): GraniteMoeMoE(
+              (activation): SiLU()
+              (input_linear): GraniteMoeParallelExperts()
+              (output_linear): GraniteMoeParallelExperts()
+              (router): GraniteMoeTopKGating(
+                (layer): Linear(in_features=1536, out_features=40, bias=False)
+                (dropout): Dropout(p=0.1, inplace=False)
+              )
+            )
+            (input_layernorm): GraniteMoeRMSNorm((1536,), eps=1e-06)
+            (post_attention_layernorm): GraniteMoeRMSNorm((1536,), eps=1e-06)
+          )
+        )
+        (norm): GraniteMoeRMSNorm((1536,), eps=1e-06)
+        (rotary_emb): GraniteMoeRotaryEmbedding()
+      )
+      (lm_head): Linear(in_features=1536, out_features=49155, bias=False)
+    )
+  )
+)

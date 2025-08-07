@@ -60,7 +60,6 @@ class VariationalLinear(nn.Module):
         
         # --- KL Divergence Calculation ---
         # This is the complexity penalty part of the ELBO loss: log q(w) - log p(w)
-        # We assume a standard Normal prior N(0,1) for p(w)
         
         # Log probability of the sampled weights under the variational posterior q(w)
         log_q_weight = -0.5 * (self.weight_log_var + (sampled_weight - self.weight_mu)**2 / torch.exp(self.weight_log_var)).sum()

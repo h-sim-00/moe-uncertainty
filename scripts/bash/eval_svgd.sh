@@ -1,6 +1,6 @@
 #!/bin/bash
-#SBATCH --job-name=eval_swag
-#SBATCH --output=/vol/bitbucket/al1624/FIP/albus-bayesian-moe-router/logs/slurm/slurm_%j_eval_swag.log
+#SBATCH --job-name=eval_svgd
+#SBATCH --output=/vol/bitbucket/al1624/FIP/albus-bayesian-moe-router/logs/slurm/slurm_%j_eval_svgd.log
 #SBATCH --partition=gpgpuB
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=4
@@ -15,38 +15,34 @@ source /vol/bitbucket/al1624/.venv/moe_env/bin/activate
 cd /vol/bitbucket/al1624/FIP/albus-bayesian-moe-router/
 echo "Current working directory: $(pwd)"
 
+cp ./scripts/python/eval_svgd.py .
+
 # --- Define Parameters ---
 MODELS=("granite")
 SEEDS=(42)
-NUM_SAMPLES=(10 20 30)
 BATCH_SIZE=8
-
-cp ./scripts/python/eval_swag.py . 
 
 # --- Run Evaluation for Each Combination ---
 echo "===================================================="
-echo "Starting Evaluation of SWAG Routers"
+echo "Starting Evaluation of SVGD Routers"
 echo "===================================================="
 
 for MODEL_SHORTCODE in "${MODELS[@]}"; do
     for SEED in "${SEEDS[@]}"; do
-        for N_SAMPLES in "${NUM_SAMPLES[@]}"; do
-            echo "----------------------------------------------------"
-            echo "Evaluating: ${MODEL_SHORTCODE} | Seed: ${SEED} | Samples: ${N_SAMPLES}"
-            echo "----------------------------------------------------"
+        echo "----------------------------------------------------"
+        echo "Evaluating: ${MODEL_SHORTCODE} | Seed: ${SEED}"
+        echo "----------------------------------------------------"
 
-            python eval_swag.py \
-                --model_shortcode "$MODEL_SHORTCODE" \
-                --num_samples "$N_SAMPLES" \
-                --batch_size "$BATCH_SIZE" \
-                --seed "$SEED" 
+        python eval_svgd.py \
+            --model_shortcode "$MODEL_SHORTCODE" \
+            --batch_size "$BATCH_SIZE" \
+            --seed "$SEED" 
 
-            echo "Evaluation completed."
-        done
+        echo "Evaluation completed."
     done
 done
 
-rm eval_swag.py
+rm eval_svgd.py
 
 echo "All evaluation tasks completed successfully."
 # --- End of Script ---
