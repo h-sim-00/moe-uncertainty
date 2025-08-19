@@ -3,7 +3,7 @@ import torch
 import pandas as pd
 from utils import setup_environment, load_classification_dataset
 from model import load_peft_model_and_adapter, load_tokenizer
-from model.routers.mcdropout import add_mcdropout_routers_to_model, evaluate_router, load_router_weights
+from model.routers.mcdr import add_mcdropout_routers_to_model, evaluate_router, load_router_weights
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Evaluate a fine-tuned MC Dropout MoE router.")

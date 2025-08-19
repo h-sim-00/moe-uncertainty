@@ -98,3 +98,7 @@ intermediate_checkpoints/*
 
 ref/**/*.pt
 ref/**/*.csv
+
+**/*.pt
+**/archives/*
+**/*.json

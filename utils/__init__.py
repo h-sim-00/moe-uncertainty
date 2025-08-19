@@ -29,20 +29,23 @@ def setup_environment():
         os.environ['HF_HUB_CACHE'] = HF_HUB_CACHE
         os.environ['WANDB_DIR'] = WANDB_STORAGE_DIR
 
-    # Login to WandB and HuggingFace
-    print("Logging into WandB and HuggingFace...")
-    WANDB_KEY = "8d44174f1416d56dc5470b57deb50339b19f22e7"
+    # Login to HuggingFace
+    print("Logging into HuggingFace...")
     HF_TOKEN = "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"
-    wandb.login(key=WANDB_KEY)
     hf_login(token=HF_TOKEN)
     print("Login successful.")
+
+    # Login to Wandb
+    WANDB_KEY = "8d44174f1416d56dc5470b57deb50339b19f22e7"
+    wandb.login(key=WANDB_KEY)
 
 from .data import (
     load_generation_dataset,
     load_classification_dataset,
     batchify,
     preprocess_mask_question_for_training,
-    load_and_prepare_train_and_val_data
+    load_and_prepare_train_and_val_data,
+    load_exp_dataset,
 )
 
 from .prompt import (
@@ -50,7 +53,7 @@ from .prompt import (
     multiple_choice_prompt_engineer,
 )
 
-def get_model_predictions(model, tokenizer, dataset, batch_size=4):
+def get_model_predictions(model, tokenizer, dataset, batch_size=8):
     """Performs inference and returns predictions, probabilities, and labels."""
     model.eval()
     all_probs = []

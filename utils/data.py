@@ -324,7 +324,7 @@ def load_and_prepare_train_and_val_data(tokenizer: AutoTokenizer, train_dataset_
     """Loads and preprocesses the dataset for causal language modeling."""
     train_raw, val_raw = [], []
     for dataset_shortcode in train_dataset_shortcodes:
-        train_raw_curr, val_raw_curr, _ = load_classification_dataset(dataset_shortcode, seed=seed)
+        train_raw_curr, val_raw_curr, _ = load_exp_dataset(dataset_shortcode, seed=seed)
         train_raw.extend(train_raw_curr)
         val_raw.extend(val_raw_curr)
     
@@ -346,7 +346,7 @@ def load_exp_dataset(dataset_shortcode, seed=42, split=None):
 
     Args:
         dataset_shortcode (str): One of 'obqa', 'arc_c', 'arc_e', 
-                                 'sciq', 'mmlu_law', 'medmcqa'.
+                                 'sciq', 'mmlu_law', 'medmcqa_med'.
         seed (int): Random seed for shuffling and sampling.
         split (str, optional): If specified, returns only the 'train', 
                                'validation', or 'test' split. 
@@ -360,35 +360,41 @@ def load_exp_dataset(dataset_shortcode, seed=42, split=None):
     
     random.seed(seed)
 
-    # --- Reformatting Helpers from Original Code ---
-    def reformat_arc_obqa(example):
-        question = example.get('question_stem') or example.get('question')
-        choices = example['choices']['text']
+    def reformat_arc(example):
         labels = example['choices']['label']
+        if labels != ['A', 'B', 'C', 'D']: return None
+        question = example.get('question')
+        choices = example['choices']['text']
         answer_key = example['answerKey']
-        
-        # Ensure the answer key corresponds to a valid choice
-        if answer_key not in labels:
-            return None
-            
-        correct_text = choices[labels.index(answer_key)]
+        if answer_key not in labels: return None
         return {
             'question': f"Question: {question}\nChoices:\n" + "\n".join([f"{label}. {text}" for label, text in zip(labels, choices)]) + "\nAnswer:",
-            'answer': answer_key,
+            'answer': answer_key, 
+            'id': example["id"],
+        }
+    
+    def reformat_obqa(example):
+        labels = example['choices']['label']
+        question = example.get('question_stem')
+        choices = example['choices']['text']
+        answer_key = example['answerKey']
+        if answer_key not in labels: return None
+        return {
+            'question': f"Question: {question}\nChoices:\n" + "\n".join([f"{label}. {text}" for label, text in zip(labels, choices)]) + "\nAnswer:",
+            'answer': answer_key, 
             'id': example["id"],
         }
 
     def reformat_sciq(example):
         question = example['question']
         choices = [example['distractor1'], example['distractor2'], example['distractor3'], example['correct_answer']]
-        random.shuffle(choices) # Shuffle choices to not always have answer last
+        random.shuffle(choices)
         labels = ["A", "B", "C", "D"]
         answer_key = labels[choices.index(example['correct_answer'])]
-        
         return {
             'question': f"Question: {question}\nChoices:\n" + "\n".join([f"{label}. {choice}" for label, choice in zip(labels, choices)]) + "\nAnswer:",
-            'answer': answer_key,
-            'id': f"sciq_{random.randint(1000, 9999)}", # Create a pseudo-id
+            'answer': answer_key, 
+            'id': f"sciq_{random.randint(1000, 9999)}",
         }
 
     def reformat_mmlu(example):
@@ -396,100 +402,94 @@ def load_exp_dataset(dataset_shortcode, seed=42, split=None):
         answer_key = labels[example["answer"]]
         return {
             'question': f"Question: {example['question']}\nChoices:\n" + "\n".join([f"{label}. {choice}" for label, choice in zip(labels, example['choices'])]) + "\nAnswer:",
-            'answer': answer_key,
+            'answer': answer_key, 
             'id': f"mmlu_law_{random.randint(1000, 9999)}"
         }
 
     def reformat_medmcqa(example):
-        if example.get("cop") is None or example.get("choice_type") != "single":
+        if example.get("cop") is None or not (0 <= example["cop"] < 4) or example.get("choice_type") != "single":
             return None
-        
         labels = ["A", "B", "C", "D"]
         choices = [example.get("opa"), example.get("opb"), example.get("opc"), example.get("opd")]
-        
-        # Ensure all choices are present
-        if any(c is None for c in choices):
-            return None
-
+        if any(c is None for c in choices): return None
         answer_key = labels[example["cop"]]
         return {
             'question': f"Question: {example['question']}\nChoices:\n" + "\n".join([f"{label}. {choice}" for label, choice in zip(labels, choices)]) + "\nAnswer:",
-            'answer': answer_key,
-            'id': example["id"],
+            'answer': answer_key, 'id': example["id"],
         }
 
     # --- Dataset Loading and Splitting Logic ---
+    train_dataset, validation_dataset, test_dataset = [], [], []
 
     if dataset_shortcode == "obqa":
         dataset = datasets.load_dataset("openbookqa", "main")
-        train_pool = [reformat_arc_obqa(ex) for ex in dataset["train"]] + \
-                     [reformat_arc_obqa(ex) for ex in dataset["validation"]]
+        train_pool = [reformat_obqa(ex) for ex in dataset["train"]] + [reformat_obqa(ex) for ex in dataset["validation"]]
         train_dataset = [ex for ex in train_pool if ex is not None]
-        test_dataset = [reformat_arc_obqa(ex) for ex in dataset["test"] if ex is not None]
-        validation_dataset = [] # No validation set in this scheme
+        test_dataset = [reformat_obqa(ex) for ex in dataset["test"] if ex is not None]
 
     elif dataset_shortcode == "arc_c":
         dataset = datasets.load_dataset("ai2_arc", "ARC-Challenge")
-        test_pool = [reformat_arc_obqa(ex) for ex in dataset["test"] if ex is not None]
+        test_pool = [reformatted for ex in dataset["test"] if (reformatted := reformat_arc(ex)) is not None]
         random.shuffle(test_pool)
-        
         test_dataset = test_pool[:500]
         extra_train_from_test = test_pool[500:]
-        
-        train_pool = [reformat_arc_obqa(ex) for ex in dataset["train"]] + \
-                     [reformat_arc_obqa(ex) for ex in dataset["validation"]]
-        train_dataset = [ex for ex in train_pool if ex is not None] + extra_train_from_test
-        validation_dataset = []
+        train_pool = [reformatted for ex in dataset["train"] if (reformatted := reformat_arc(ex)) is not None] + \
+                     [reformatted for ex in dataset["validation"] if (reformatted := reformat_arc(ex)) is not None]
+        train_dataset = train_pool + extra_train_from_test
 
     elif dataset_shortcode == "arc_e":
         dataset = datasets.load_dataset("ai2_arc", "ARC-Easy")
-        test_pool = [reformat_arc_obqa(ex) for ex in dataset["test"] if ex is not None]
+        test_pool = [reformatted for ex in dataset["test"] if (reformatted := reformat_arc(ex)) is not None]
         random.shuffle(test_pool)
         test_dataset = test_pool[:500]
-        
-        train_pool = [reformat_arc_obqa(ex) for ex in dataset["train"]] + \
-                     [reformat_arc_obqa(ex) for ex in dataset["validation"]]
-        train_dataset = [ex for ex in train_pool if ex is not None]
-        validation_dataset = []
+        train_pool = [reformatted for ex in dataset["train"] if (reformatted := reformat_arc(ex)) is not None] + \
+                     [reformatted for ex in dataset["validation"] if (reformatted := reformat_arc(ex)) is not None]
+        train_dataset = train_pool
 
     elif dataset_shortcode == "sciq":
         dataset = datasets.load_dataset("sciq")
-        train_pool = [reformat_sciq(ex) for ex in dataset["train"]] + \
-                     [reformat_sciq(ex) for ex in dataset["validation"]]
+        train_pool = [reformat_sciq(ex) for ex in dataset["train"]] + [reformat_sciq(ex) for ex in dataset["validation"]]
         train_dataset = [ex for ex in train_pool if ex is not None]
-        test_dataset = [reformat_sciq(ex) for ex in dataset["test"] if ex is not None]
-        validation_dataset = []
+        test_dataset = [reformat_sciq(ex) for ex in dataset["test"] if ex is not None][:500]
 
     elif dataset_shortcode == "mmlu_law":
         dataset = datasets.load_dataset("cais/mmlu", "professional_law")
-        full_pool = [reformat_mmlu(ex) for ex in dataset["validation"]] + \
-                    [reformat_mmlu(ex) for ex in dataset["test"]]
+        full_pool = [reformat_mmlu(ex) for ex in dataset["validation"]] + [reformat_mmlu(ex) for ex in dataset["test"]]
         full_pool = [ex for ex in full_pool if ex is not None]
         random.shuffle(full_pool)
-        
         test_dataset = full_pool[:500]
         train_dataset = full_pool[500:]
-        validation_dataset = []
 
-    elif dataset_shortcode == "medmcqa":
+    elif dataset_shortcode == "medmcqa_med":
         dataset = datasets.load_dataset("medmcqa")
-        # Combine train and validation as the source pool, since test has no labels
-        full_pool = [reformat_medmcqa(ex) for ex in dataset["train"]] + \
-                    [reformat_medmcqa(ex) for ex in dataset["validation"]]
-        full_pool = [ex for ex in full_pool if ex is not None]
-        random.shuffle(full_pool)
+        # Filter for "Medicine" subject and combine train/val splits
+        medicine_pool = []
+        for ex in dataset["train"]:
+            if ex.get('subject_name') == 'Medicine':
+                reformatted = reformat_medmcqa(ex)
+                if reformatted: medicine_pool.append(reformatted)
+        for ex in dataset["validation"]:
+            if ex.get('subject_name') == 'Medicine':
+                reformatted = reformat_medmcqa(ex)
+                if reformatted: medicine_pool.append(reformatted)
         
-        # Sample from the combined pool according to the new scheme
-        train_dataset = full_pool[:10000]
-        validation_dataset = full_pool[10000:14183] # 10000 + 4183
-        test_dataset = full_pool[14183:14683]      # 14183 + 500
+        random.shuffle(medicine_pool)
+        
+        # Create train and test sets from the filtered pool
+        if len(medicine_pool) < 10500:
+            raise ValueError(f"Not enough 'Medicine' samples in MedMCQA. Found {len(medicine_pool)}, need 10500.")
+        
+        train_dataset = medicine_pool[500:10500]
+        test_dataset = medicine_pool[:500]
 
     else:
         raise ValueError(f"Dataset '{dataset_shortcode}' not supported by load_exp_dataset.")
 
+    train_dataset = train_dataset[:-50]
+    validation_dataset = train_dataset[-50:]
+
     print(f"Dataset '{dataset_shortcode}' processed: Train={len(train_dataset)}, Val={len(validation_dataset)}, Test={len(test_dataset)}")
     
-    # --- Return Logic ---
     if split == "train":
         return train_dataset
     elif split == "validation" or split == "val":
