@@ -422,9 +422,10 @@ def load_exp_dataset(dataset_shortcode, seed=42, split=None):
     train_dataset, validation_dataset, test_dataset = [], [], []
 
     if dataset_shortcode == "obqa":
+        # 5000 train, 500 test
         dataset = datasets.load_dataset("openbookqa", "main")
         train_pool = [reformat_obqa(ex) for ex in dataset["train"]] + [reformat_obqa(ex) for ex in dataset["validation"]]
-        train_dataset = [ex for ex in train_pool if ex is not None]
+        train_dataset = [ex for ex in train_pool if ex is not None][:5050]
         test_dataset = [reformat_obqa(ex) for ex in dataset["test"] if ex is not None]
 
     elif dataset_shortcode == "arc_c":
@@ -449,7 +450,7 @@ def load_exp_dataset(dataset_shortcode, seed=42, split=None):
     elif dataset_shortcode == "sciq":
         dataset = datasets.load_dataset("sciq")
         train_pool = [reformat_sciq(ex) for ex in dataset["train"]] + [reformat_sciq(ex) for ex in dataset["validation"]]
-        train_dataset = [ex for ex in train_pool if ex is not None]
+        train_dataset = [ex for ex in train_pool if ex is not None][:5050]
         test_dataset = [reformat_sciq(ex) for ex in dataset["test"] if ex is not None][:500]
 
     elif dataset_shortcode == "mmlu_law":
@@ -479,7 +480,7 @@ def load_exp_dataset(dataset_shortcode, seed=42, split=None):
         if len(medicine_pool) < 10500:
             raise ValueError(f"Not enough 'Medicine' samples in MedMCQA. Found {len(medicine_pool)}, need 10500.")
         
-        train_dataset = medicine_pool[500:10500]
+        train_dataset = medicine_pool[500:5550]
         test_dataset = medicine_pool[:500]
 
     else:

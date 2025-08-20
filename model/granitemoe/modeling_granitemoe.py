@@ -456,7 +456,7 @@ class GraniteMoeMoE(nn.Module):
         """
         bsz, length, emb_size = layer_input.size()
         layer_input = layer_input.reshape(-1, emb_size)
-        _, batch_index, batch_gates, expert_size, router_logits = self.router(layer_input, mode=self.router_mode, temp=self.router_temp)
+        _, batch_index, batch_gates, expert_size, router_logits = self.router(layer_input)
 
         expert_inputs = layer_input[batch_index]
         hidden_states = self.input_linear(expert_inputs, expert_size)

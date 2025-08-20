@@ -10,7 +10,7 @@ class MoERouter(nn.Module):
     to be a drop-in replacement for the original router and a foundation for
     all subsequent Bayesian router implementations.
     """
-    def __init__(self, config, existing_router=None):
+    def __init__(self, config, existing_router=None, mode="top_k", temp=1.0):
         """
         Initializes the MoERouter.
 
@@ -31,35 +31,23 @@ class MoERouter(nn.Module):
         if existing_router is not None:
             print("Initializing MoERouter weights from an existing router.")
             self.layer.load_state_dict(existing_router.layer.state_dict())
+        
+        self.mode = mode
+        self.temp = temp
 
     def forward(self, hidden_states, mode="top_k", temp=1.0):
         """
         The forward pass is identical to the original GraniteMoeTopKGating logic
         to ensure compatibility.
         """
+        mode, temp = self.mode, self.temp
+
         logits = self.layer(hidden_states).float()
         batch_size = hidden_states.shape[0]
 
         if mode == "top_k":
             top_k_logits, top_k_indices = logits.topk(self.top_k, dim=1)
             top_k_gates = torch.softmax(top_k_logits, dim=1).type_as(hidden_states)
-
-        # elif mode == "mc_dropout_original_logits":
-        #     # For MC Dropout, the dropout layer must be active during inference.
-        #     # Using original routing logits now
-        #     self.dropout.train()
-        #     stochastic_hidden_states = self.dropout(hidden_states)
-        #     stochastic_logits = self.layer(stochastic_hidden_states).float()
-        #     top_k_logits, top_k_indices = stochastic_logits.topk(self.top_k, dim=1)
-        #     top_k_gates = torch.softmax(top_k_logits, dim=1).type_as(hidden_states)
-        
-        # elif mode == "mc_dropout_stochastic_logits":
-        #     self.dropout.train()
-        #     stochastic_hidden_states = self.dropout(hidden_states)
-        #     stochastic_logits = self.layer(stochastic_hidden_states).float()
-        #     top_k_logits, top_k_indices = stochastic_logits.topk(self.top_k, dim=1)
-        #     top_k_gates = torch.softmax(top_k_logits, dim=1).type_as(hidden_states)
-        #     logits = stochastic_logits  # Use stochastic logits for logging
 
         elif mode == "random_k":
             top_k_indices = torch.stack([

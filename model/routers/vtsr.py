@@ -4,7 +4,7 @@ import os
 from tqdm import tqdm
 
 from .base import MoERouter # Import the base class
-from ...utils import get_model_predictions, calculate_accuracy, calculate_ece_mce, calculate_nll
+from utils import get_model_predictions, calculate_accuracy, calculate_ece_mce, calculate_nll
 
 class VariationalTemperatureRouter(MoERouter):
     """
@@ -62,8 +62,10 @@ class VariationalTemperatureRouter(MoERouter):
         scaled_logits = logits / temperatures
         
         # 5. The rest of the routing logic uses these new scaled_logits
-        top_k_logits, top_k_indices = scaled_logits.topk(self.top_k, dim=1)
-        top_k_gates = torch.softmax(top_k_logits, dim=1).type_as(hidden_states)
+        probabilities = torch.softmax(scaled_logits.float(), dim=1)
+        top_k_indices = torch.multinomial(probabilities, self.top_k, replacement=False)
+        gathered_logits = logits.gather(1, top_k_indices.long()) 
+        top_k_gates = torch.softmax(gathered_logits, dim=1).type_as(hidden_states)
         
         batch_size = hidden_states.shape[0]
         zeros = torch.zeros((batch_size, self.num_experts), dtype=torch.long, device=logits.device)
@@ -76,7 +78,8 @@ class VariationalTemperatureRouter(MoERouter):
         top_k_gates = top_k_gates.flatten()
         batch_gates = top_k_gates[index_sorted_experts]
         
-        return index_sorted_experts, batch_index, batch_gates, expert_size, scaled_logits
+        # Return original logits instead of scaled logits for consistency
+        return index_sorted_experts, batch_index, batch_gates, expert_size, logits
 
     def save_weights(self, path: str):
         """Saves the state_dict of only the trainable temperature network."""

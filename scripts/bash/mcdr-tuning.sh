@@ -19,7 +19,7 @@ cp ./scripts/python/mcdr-tuning.py .
 
 # --- Define Parameters ---
 MODELS=("granite")
-DATASET_SHORTCODES=("obqa" "sciq" "medmcqa_med")
+DATASETS=("sciq" "medmcqa_med")
 
 # Define training hyperparameters
 EPOCHS=5
@@ -50,6 +50,7 @@ for MODEL_SHORTCODE in "${MODELS[@]}"; do
             
             # Build the list of all layers to be swapped to MCDR
             # This includes the current training layer and all subsequent layers
+            # SWAP_LAYERS=$i
             SWAP_LAYERS=""
             for j in $(seq $i 31); do
                 SWAP_LAYERS+="$j "

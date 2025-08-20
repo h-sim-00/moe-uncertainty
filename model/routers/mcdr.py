@@ -6,7 +6,7 @@ import os
 from tqdm import tqdm
 
 from .base import MoERouter # Import the base class
-from ...utils import get_model_predictions, calculate_accuracy, calculate_ece_mce, calculate_nll
+from utils import get_model_predictions, calculate_accuracy, calculate_ece_mce, calculate_nll
 
 class MCDropoutRouter(MoERouter):
     """
@@ -21,7 +21,7 @@ class MCDropoutRouter(MoERouter):
         
         self.dropout = nn.Dropout(dropout_rate)
         # This will be set externally before evaluation
-        self.num_mc_samples = 1 
+        self.num_mc_samples = 35
 
     def train(self, mode: bool = True):
         """

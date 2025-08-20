@@ -5,7 +5,7 @@
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=32G
-#SBATCH --time=12:00:00
+#SBATCH --time=48:00:00
 #SBATCH --mail-type=END,FAIL
 #SBATCH --mail-user=al1624@ic.ac.uk
 
@@ -20,7 +20,7 @@ cp ./scripts/python/fcvr-tuning.py .
 
 # --- Define Parameters ---
 MODEL_SHORTCODE="granite"
-DATASET_SHORTCODES=("obqa" "arc" "csqa")  # Add your datasets here
+DATASET_SHORTCODES=("obqa" "sciq" "medmcqa_med")
 SEED=42
 EPOCHS=5
 BATCH_SIZE=4
@@ -40,14 +40,14 @@ for DATASET_SHORTCODE in "${DATASET_SHORTCODES[@]}"; do
         TRAIN_LAYER=$i
 
         # Only swap layers to train
-        SWAP_LAYERS=($i)
-        # SWAP_LAYERS=()
-        # for j in $(seq $i 31); do SWAP_LAYERS+=($j); done
+        # SWAP_LAYERS=($i)
+        SWAP_LAYERS=()
+        for j in $(seq $i 31); do SWAP_LAYERS+=($j); done
 
         # Do not load any layers
-        LOAD_LAYERS=($i)
-        # LOAD_LAYERS=()
-        # for j in $(seq $(($i + 1)) 31); do LOAD_LAYERS+=($j); done
+        # LOAD_LAYERS=($i)
+        LOAD_LAYERS=()
+        for j in $(seq $(($i + 1)) 31); do LOAD_LAYERS+=($j); done
 
         echo "----------------------------------------------------"
         echo "Step: Training Layer ${TRAIN_LAYER}"

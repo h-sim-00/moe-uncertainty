@@ -18,7 +18,7 @@ def parse_args():
     
     # New arguments for layer-wise control
     parser.add_argument("--swap_layers", type=int, nargs='+', required=True, help="All layers that should be VTSRs.")
-    parser.add_argument("--load_layers", type=int, nargs='+', default=[], help="Subset of swap_layers to load existing VTSR weights for.")
+    parser.add_argument("--load_layers", type=int, nargs='*', default=[])     
     parser.add_argument("--train_layers", type=int, nargs='+', required=True, help="Subset of swap_layers to unfreeze and train.")
 
     parser.add_argument("--epochs", type=int, default=10)
@@ -48,7 +48,7 @@ def main():
     print("--- Loading base MAP routers ---")
     causal_model = model.base_model.model.model
     map_run_name = f"{args.model_shortcode}_{args.dataset_shortcode}"
-    map_weights_dir = f"./models/routers/base/{map_run_name}"
+    map_weights_dir = f"./router_weights/base/{map_run_name}"
     
     for i, layer in enumerate(causal_model.layers):
         map_router = MoERouter(config=causal_model.config)

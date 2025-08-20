@@ -10,7 +10,7 @@ from tqdm import tqdm
 import wandb
 
 from .base import MoERouter
-from ...utils import get_model_predictions, calculate_accuracy, calculate_ece_mce, calculate_nll
+from utils import get_model_predictions, calculate_accuracy, calculate_ece_mce, calculate_nll
 
 # --- Component 1: The Mean-Field Variational Router Class ---
 class MeanFieldVariationalRouter(MoERouter):
