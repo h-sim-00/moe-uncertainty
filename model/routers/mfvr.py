@@ -110,11 +110,60 @@ class MeanFieldVariationalRouter(MoERouter):
 # --- Component 2: The Custom Training Function ---
 def train_mfvr_router(model, tokenizer, train_loader, val_loader, args):
     """Custom training loop for the MeanFieldVariationalRouter using the ELBO loss."""
-    project_name = "bayesian-router-finetuning"
+    
+    output_root_dir = "./router_weights/mfvr"
     run_name = f"mfvr-{args.model_shortcode}-{args.dataset_shortcode}"
+
+    # === 1. Prepare Model for Training ===
+    # Freeze all parameters in the entire model first
+    print("Freezing all model parameters...")
+    for param in model.parameters():
+        param.requires_grad = False
+    
+    device = model.device
+    causal_model = model.base_model.model.model
+    config = causal_model.config
+
+    # "Lego Swap": Replace original routers with MFVR instances
+    print("Swapping routers and initializing MFVR parameters...")
+    for layer_idx in args.swap_layers:
+        target_layer = causal_model.layers[layer_idx]
+        new_router = MeanFieldVariationalRouter(
+            config=config,
+            existing_router=target_layer.block_sparse_moe.router
+        )
+        if layer_idx in args.load_layers:
+            print(f"Loading pre-trained MFVR for layer {layer_idx}...")
+            weights_path = os.path.join(output_root_dir, run_name, f"layer_{layer_idx}_weights.pt")
+            new_router.load_weights(weights_path, device=model.device)
+
+        target_layer.block_sparse_moe.router = new_router.to(device)
+
+    # Unfreeze only the parameters of the target training layers
+    print(f"Unfreezing routers in layers: {args.train_layers}")
+    for layer_idx in args.train_layers:
+        for param in causal_model.layers[layer_idx].block_sparse_moe.router.parameters():
+            if param.requires_grad:
+                param.requires_grad = True
+
+    # === 2. Create Optimizer ===
+    
+    # Get the list of all currently trainable parameters
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    
+    # Sanity check
+    num_trainable = sum(p.numel() for p in trainable_params)
+    print(f"Found {num_trainable} trainable parameters.")
+    if num_trainable == 0:
+        raise ValueError("FATAL: No trainable parameters were found after model setup. Check freezing/unfreezing logic.")
+        
+    optimizer = torch.optim.Adam(trainable_params, lr=args.lr)
+
+    # === 3. Run Custom Training Loop ===
+
+    project_name = "bayesian-router-finetuning"
     wandb.init(project=project_name, name=run_name, config=vars(args), reinit=True)
     
-    optimizer = torch.optim.Adam([p for p in model.parameters() if p.requires_grad], lr=args.lr)
     num_training_batches = len(train_loader)
     
     print("--- Starting MFVR Fine-tuning (Custom Loop) ---")
@@ -129,9 +178,9 @@ def train_mfvr_router(model, tokenizer, train_loader, val_loader, args):
             reconstruction_loss = outputs.loss
             
             total_kl_div = 0
-            for i, layer in enumerate(model.base_model.model.model.layers):
-                if i in args.train_layers:
-                    total_kl_div += layer.block_sparse_moe.router.kl_divergence()
+            for layer_idx in args.train_layers:
+                router = causal_model.layers[layer_idx].block_sparse_moe.router
+                total_kl_div += router.kl_divergence()
             
             kl_term = (args.beta / num_training_batches) * total_kl_div
             loss = reconstruction_loss + kl_term
@@ -139,14 +188,10 @@ def train_mfvr_router(model, tokenizer, train_loader, val_loader, args):
             loss.backward()
             optimizer.step()
             total_epoch_loss += loss.item()
-            wandb.log({
-                "train_loss": loss.item(), 
-                "reconstruction_loss": reconstruction_loss.item(), 
-                "kl_term": kl_term.item()
-            })
+            wandb.log({"train_loss": loss.item()})
             
         print(f"Epoch {epoch+1} average training loss: {total_epoch_loss / num_training_batches:.4f}")
-        
+
         # Validation Loop
         model.eval()
         total_val_loss = 0
@@ -166,27 +211,3 @@ def train_mfvr_router(model, tokenizer, train_loader, val_loader, args):
         if i in args.swap_layers: # Only save if it's an MFVR router
             save_path = os.path.join(save_dir, f"layer_{i}_weights.pt")
             layer.block_sparse_moe.router.save_weights(save_path)
-
-# --- Component 3: The Evaluation Function ---
-def evaluate_mfvr_router(model, tokenizer, dataset, dataset_name, num_samples, batch_size):
-    """Orchestrates evaluation for the MeanFieldVariationalRouter."""
-    print(f"--- Evaluating on {dataset_name} with {num_samples} internal MC samples ---")
-    
-    causal_model = model.base_model.model.model
-    for layer in causal_model.layers:
-        if isinstance(layer.block_sparse_moe.router, MeanFieldVariationalRouter):
-            layer.block_sparse_moe.router.num_mc_samples_inference = num_samples
-    
-    model.eval()
-    preds, probs, labels = get_model_predictions(model, tokenizer, dataset, batch_size=batch_size)
-    
-    acc = calculate_accuracy(preds, labels)
-    nll = calculate_nll(probs, labels)
-    ece, mce = calculate_ece_mce(probs, labels)
-    
-    results = {
-        'dataset': dataset_name, 'ACC': acc.item(), 'NLL': nll.item(),
-        'ECE': ece.item(), 'MCE': mce.item(),
-    }
-    print(results)
-    return results

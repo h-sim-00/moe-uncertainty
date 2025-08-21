@@ -139,11 +139,59 @@ class FullCovarianceVariationalRouter(MoERouter):
 
 def train_fcvr_router(model, tokenizer, train_loader, val_loader, args):
     """Custom training loop for the FCVR using the ELBO loss."""
-    project_name = "bayesian-router-finetuning"
+    output_root_dir = "./router_weights/fcvr"
     run_name = f"fcvr-{args.model_shortcode}-{args.dataset_shortcode}"
+
+    # === 1. Prepare Model for Training ===
+    # Freeze all parameters in the entire model first
+    print("Freezing all model parameters...")
+    for param in model.parameters():
+        param.requires_grad = False
+    
+    device = model.device
+    causal_model = model.base_model.model.model
+    config = causal_model.config
+
+    # "Lego Swap": Replace original routers with FCVR instances
+    print("Swapping routers and initializing FCVR parameters...")
+    for layer_idx in args.swap_layers:
+        target_layer = causal_model.layers[layer_idx]
+        new_router = FullCovarianceVariationalRouter(
+            config=config,
+            existing_router=target_layer.block_sparse_moe.router
+        )
+        if layer_idx in args.load_layers:
+            print(f"Loading pre-trained FCVR for layer {layer_idx}...")
+            weights_path = os.path.join(output_root_dir, run_name, f"layer_{layer_idx}_weights.pt")
+            new_router.load_weights(weights_path, device=model.device)
+
+        target_layer.block_sparse_moe.router = new_router.to(device)
+
+    # Unfreeze only the parameters of the target training layers
+    print(f"Unfreezing routers in layers: {args.train_layers}")
+    for layer_idx in args.train_layers:
+        for param in causal_model.layers[layer_idx].block_sparse_moe.router.parameters():
+            if param.requires_grad:
+                param.requires_grad = True
+
+    # === 2. Create Optimizer ===
+    
+    # Get the list of all currently trainable parameters
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    
+    # Sanity check
+    num_trainable = sum(p.numel() for p in trainable_params)
+    print(f"Found {num_trainable} trainable parameters.")
+    if num_trainable == 0:
+        raise ValueError("FATAL: No trainable parameters were found after model setup. Check freezing/unfreezing logic.")
+        
+    optimizer = torch.optim.Adam(trainable_params, lr=args.lr)
+
+    # === 3. Run Custom Training Loop ===
+
+    project_name = "bayesian-router-finetuning"
     wandb.init(project=project_name, name=run_name, config=vars(args), reinit=True)
     
-    optimizer = torch.optim.Adam([p for p in model.parameters() if p.requires_grad], lr=args.lr)
     num_training_batches = len(train_loader)
     
     print("--- Starting FCVR Fine-tuning (Custom Loop) ---")
@@ -195,26 +243,3 @@ def train_fcvr_router(model, tokenizer, train_loader, val_loader, args):
         if i in args.swap_layers: # Only save if it's an FCVR router
             save_path = os.path.join(save_dir, f"layer_{i}_weights.pt")
             layer.block_sparse_moe.router.save_weights(save_path)
-
-def evaluate_fcvr_router(model, tokenizer, dataset, dataset_name, num_samples, batch_size):
-    """Orchestrates evaluation for the FCVR."""
-    print(f"--- Evaluating on {dataset_name} with {num_samples} internal MC samples ---")
-    
-    causal_model = model.base_model.model.model
-    for layer in causal_model.layers:
-        if isinstance(layer.block_sparse_moe.router, FullCovarianceVariationalRouter):
-            layer.block_sparse_moe.router.num_mc_samples_inference = num_samples
-    
-    model.eval()
-    preds, probs, labels = get_model_predictions(model, tokenizer, dataset, batch_size=batch_size)
-    
-    acc = calculate_accuracy(preds, labels)
-    nll = calculate_nll(probs, labels)
-    ece, mce = calculate_ece_mce(probs, labels)
-    
-    results = {
-        'dataset': dataset_name, 'ACC': acc.item(), 'NLL': nll.item(),
-        'ECE': ece.item(), 'MCE': mce.item(),
-    }
-    print(results)
-    return results

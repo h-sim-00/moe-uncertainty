@@ -135,7 +135,7 @@ def run_id_calibration(model, tokenizer, args):
     """Runs the In-Distribution Calibration task."""
     print("\n--- Running Task: ID Calibration ---")
     results = {}
-    id_datasets = ["obqa", "medmcqa_med", "sciq"]
+    id_datasets = [args.dataset_shortcode]
     for dataset_code in id_datasets:
         print(f"Evaluating on: {dataset_code}")
         test_dataset = load_exp_dataset(dataset_code, split="test")
