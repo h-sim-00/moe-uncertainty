@@ -99,6 +99,6 @@ class MoERouter(nn.Module):
         if device is None:
             device = next(self.parameters()).device
         
-        state_dict = torch.load(path, map_location=device)
+        state_dict = torch.load(path, map_location=device, weights_only=False)
         self.load_state_dict(state_dict)
         print(f"Loaded router weights from {path}")

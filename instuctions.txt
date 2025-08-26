@@ -1,0 +1,3 @@
+ssh gpucluster2.doc.ic.ac.uk
+cd /vol/bitbucket/al1624/FIP/albus-bayesian-moe-router
+sbatch ./scripts/bash/mcdr-eval.sh 

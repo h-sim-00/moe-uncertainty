@@ -113,8 +113,5 @@ for LAYER_SET in "${LAYER_CONFIGS[@]}"; do
         --seed "$SEED"
 done
 
-rm evaluate.py
-echo "Temporary script file removed."
-
 echo "All MCDR evaluation tasks completed successfully."
 # --- End of Script ---

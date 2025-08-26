@@ -33,7 +33,7 @@ echo "Starting Progressive VTSR Fine-tuning (Mode: ${TEMPERATURE_MODE})"
 echo "===================================================="
 
 for MODEL_SHORTCODE in "${MODELS[@]}"; do
-    for DATASET_SHORTCODE in "${DATASETS[@]}"; do
+    for DATASET_SHORTCODE in "${DATASET_SHORTCODES[@]}"; do
         
         # Path to the Stage 1 adapter for the current model
         BASE_ADAPTER_PATH="./adapters/${MODEL_SHORTCODE}-${DATASET_SHORTCODE}"
@@ -48,12 +48,12 @@ for MODEL_SHORTCODE in "${MODELS[@]}"; do
             TRAIN_LAYER=$i
             
             # Build the list of all layers to be swapped to VTSR
-            SWAP_LAYERS=($i)
-            # for j in $(seq $i 31); do SWAP_LAYERS+=($j); done
+            SWAP_LAYERS=()
+            for j in $(seq $i 31); do SWAP_LAYERS+=($j); done
 
             # Build the list of previously trained layers to load weights for
-            LOAD_LAYERS=($i)
-            # for j in $(seq $(($i + 1)) 31); do LOAD_LAYERS+=($j); done
+            LOAD_LAYERS=()
+            for j in $(seq $(($i + 1)) 31); do LOAD_LAYERS+=($j); done
 
             echo "    Step: Training Layer ${TRAIN_LAYER}"
             echo "    - Swapping Layers: [${SWAP_LAYERS[@]}]"
@@ -78,9 +78,6 @@ for MODEL_SHORTCODE in "${MODELS[@]}"; do
         echo "Progressive training completed for ${MODEL_SHORTCODE} on ${DATASET_SHORTCODE}"
     done
 done
-
-rm vtsr-tuning.py
-echo "Temporary script file removed."
 
 echo "All fine-tuning tasks completed successfully."
 # --- End of Script ---

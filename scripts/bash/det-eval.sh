@@ -85,9 +85,5 @@ python evaluate.py \
 
 echo "OOD Detection completed."
 
-# Clean up the temporary script file
-rm evaluate.py
-echo "Temporary script file removed."
-
 echo "All evaluation tasks completed successfully."
 # --- End of Script ---

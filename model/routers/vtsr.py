@@ -1,5 +1,6 @@
 import torch
 from torch import nn
+import torch.nn.functional as F
 import os
 from tqdm import tqdm
 
@@ -42,31 +43,27 @@ class VariationalTemperatureRouter(MoERouter):
         self.softplus = nn.Softplus()
 
     def forward(self, hidden_states, **kwargs):
-        """
-        Overrides the forward pass to apply the learned temperature.
-        """
-        # 1. Get the deterministic logits from the frozen base layer
         with torch.no_grad():
             logits = self.layer(hidden_states).float()
 
-        # 2. Predict the temperature(s) from the trainable network
-        raw_temp = self.temperature_net(hidden_states)
-        
-        # 3. Apply Softplus and add epsilon for stability
-        temperatures = self.softplus(raw_temp) + 1e-6
-        
-        # If in shared mode, temperatures will have shape [batch, 1],
-        # so it will broadcast correctly during division.
-        
-        # 4. Apply the learned temperature to the logits
+        temperatures = self.softplus(self.temperature_net(hidden_states)) + 1e-6
         scaled_logits = logits / temperatures
         
-        # 5. The rest of the routing logic uses these new scaled_logits
-        probabilities = torch.softmax(scaled_logits.float(), dim=1)
-        top_k_indices = torch.multinomial(probabilities, self.top_k, replacement=False)
-        gathered_logits = logits.gather(1, top_k_indices.long()) 
+        # --- Conditional Logic for Training vs. Evaluation ---
+        if self.training:
+            # Use Gumbel-Softmax for a differentiable sample.
+            # `hard=True` uses a one-hot vector in the forward pass but a soft,
+            # differentiable approximation in the backward pass.
+            gumbel_probs = F.gumbel_softmax(scaled_logits, tau=1.0, hard=True, dim=-1)
+            top_k_indices = torch.topk(gumbel_probs, self.top_k, dim=1).indices
+        else:
+            probabilities = torch.softmax(scaled_logits.float(), dim=1)
+            top_k_indices = torch.multinomial(probabilities, self.top_k, replacement=False)
+
+        gathered_logits = scaled_logits.gather(1, top_k_indices.long())
         top_k_gates = torch.softmax(gathered_logits, dim=1).type_as(hidden_states)
-        
+
+        # --- The rest of the routing logic is now consistent ---
         batch_size = hidden_states.shape[0]
         zeros = torch.zeros((batch_size, self.num_experts), dtype=torch.long, device=logits.device)
         gates = zeros.scatter(1, top_k_indices.long(), 1)
@@ -75,12 +72,12 @@ class VariationalTemperatureRouter(MoERouter):
         top_k_experts = top_k_indices.flatten()
         _, index_sorted_experts = top_k_experts.sort(0)
         batch_index = index_sorted_experts.div(num_selected_experts, rounding_mode="trunc")
-        top_k_gates = top_k_gates.flatten()
-        batch_gates = top_k_gates[index_sorted_experts]
         
-        # Return original logits instead of scaled logits for consistency
-        return index_sorted_experts, batch_index, batch_gates, expert_size, logits
-
+        flat_top_k_gates = top_k_gates.flatten()
+        batch_gates = flat_top_k_gates[index_sorted_experts]
+        
+        return index_sorted_experts, batch_index, batch_gates, expert_size, scaled_logits
+    
     def save_weights(self, path: str):
         """Saves the state_dict of only the trainable temperature network."""
         os.makedirs(os.path.dirname(path), exist_ok=True)

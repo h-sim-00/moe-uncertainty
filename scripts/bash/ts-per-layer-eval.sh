@@ -67,8 +67,5 @@ for DATASET_SHORTCODE in "${ID_DATASETS[@]}"; do
     done
 done
 
-# rm evaluate.py
-# echo "Temporary script file removed."
-
 echo "All temperature sampling evaluation tasks completed successfully."
 # --- End of Script ---

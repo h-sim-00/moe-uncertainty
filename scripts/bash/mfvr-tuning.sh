@@ -4,7 +4,7 @@
 #SBATCH --partition=gpgpu
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=4
-#SBATCH --mem=32G
+#SBATCH --mem=32GW
 #SBATCH --time=48:00:00
 #SBATCH --mail-type=END,FAIL
 #SBATCH --mail-user=al1624@ic.ac.uk
