@@ -20,7 +20,7 @@ cp ./scripts/python/evaluate.py .
 
 # --- Define Parameters ---
 MODEL_SHORTCODE="granite"
-ID_DATASETS=("obqa" "medmcqa_med" "sciq")
+ID_DATASETS=("arc_c")
 SEED=42
 BATCH_SIZE=8
 
@@ -56,34 +56,34 @@ for DATASET_SHORTCODE in "${ID_DATASETS[@]}"; do
     echo "ID Calibration completed."
 done
 
-# ====================================================
-# Task 2: Out-of-Distribution (OOD) Detection
-# ====================================================
-echo "===================================================="
-echo "Starting Task 2: OOD Detection for ${MODEL_SHORTCODE} (ID Model: obqa)"
-echo "===================================================="
+# # ====================================================
+# # Task 2: Out-of-Distribution (OOD) Detection
+# # ====================================================
+# echo "===================================================="
+# echo "Starting Task 2: OOD Detection for ${MODEL_SHORTCODE} (ID Model: obqa)"
+# echo "===================================================="
 
-# For OOD detection, the ID model is always the one trained on 'obqa'
-ID_DATASET_OOD="obqa"
+# # For OOD detection, the ID model is always the one trained on 'obqa'
+# ID_DATASET_OOD="obqa"
 
-# Updated Path Logic
-BASE_ADAPTER_PATH="./adapters/${MODEL_SHORTCODE}-${ID_DATASET_OOD}"
-RUN_NAME="${MODEL_SHORTCODE}_${ID_DATASET_OOD}"
-ROUTER_WEIGHTS_PATH="./models/routers/base/${RUN_NAME}"
-RESULTS_JSON_PATH="./results/ood_detect_det_${RUN_NAME}.json"
+# # Updated Path Logic
+# BASE_ADAPTER_PATH="./adapters/${MODEL_SHORTCODE}-${ID_DATASET_OOD}"
+# RUN_NAME="${MODEL_SHORTCODE}_${ID_DATASET_OOD}"
+# ROUTER_WEIGHTS_PATH="./models/routers/base/${RUN_NAME}"
+# RESULTS_JSON_PATH="./results/ood_detect_det_${RUN_NAME}.json"
 
-python evaluate.py \
-    --method "det" \
-    --task "ood_detection" \
-    --model_shortcode "$MODEL_SHORTCODE" \
-    --dataset_shortcode "$ID_DATASET_OOD" \
-    --kvq_adapter_path "$BASE_ADAPTER_PATH" \
-    --router_weights_path "$ROUTER_WEIGHTS_PATH" \
-    --output_json_path "$RESULTS_JSON_PATH" \
-    --batch_size "$BATCH_SIZE" \
-    --seed "$SEED"
+# python evaluate.py \
+#     --method "det" \
+#     --task "ood_detection" \
+#     --model_shortcode "$MODEL_SHORTCODE" \
+#     --dataset_shortcode "$ID_DATASET_OOD" \
+#     --kvq_adapter_path "$BASE_ADAPTER_PATH" \
+#     --router_weights_path "$ROUTER_WEIGHTS_PATH" \
+#     --output_json_path "$RESULTS_JSON_PATH" \
+#     --batch_size "$BATCH_SIZE" \
+#     --seed "$SEED"
 
-echo "OOD Detection completed."
+# echo "OOD Detection completed."
 
 echo "All evaluation tasks completed successfully."
 # --- End of Script ---

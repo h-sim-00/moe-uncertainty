@@ -21,7 +21,7 @@ cp ./scripts/python/kvq-tuning.py .
 
 # --- Define Parameters ---
 MODEL_SHORTCODE="granite" 
-DATASET_SHORTCODES=("obqa" "sciq" "medmcqa_med")
+DATASET_SHORTCODES=("arc_c")
 
 # Define training hyperparameters
 EPOCHS=3

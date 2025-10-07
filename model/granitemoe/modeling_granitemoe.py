@@ -398,8 +398,8 @@ class GraniteMoeTopKGating(nn.Module):
         zeros = torch.zeros(
             (batch_size, self.num_experts), dtype=torch.long, device=logits.device
         )
-        gates = zeros.scatter(1, top_k_indices.long(), 1)
-        expert_size = gates.long().sum(0).tolist()
+        gates = zeros.scatter(dim=1, index=top_k_indices.long(), src=1)
+        expert_size = gates.long().sum(dim=0).tolist()
 
         num_selected_experts = top_k_indices.shape[1]
         top_k_experts = top_k_indices.flatten()
@@ -425,6 +425,7 @@ class GraniteMoeMoE(nn.Module):
     def __init__(self, config: GraniteMoeConfig):
         super(GraniteMoeMoE, self).__init__()
 
+        self.config = config
         self.input_size = config.hidden_size
         self.hidden_size = config.intermediate_size
         self.activation = ACT2FN[config.hidden_act]
@@ -456,6 +457,7 @@ class GraniteMoeMoE(nn.Module):
         """
         bsz, length, emb_size = layer_input.size()
         layer_input = layer_input.reshape(-1, emb_size)
+        # Rebatch: tokens as units
         _, batch_index, batch_gates, expert_size, router_logits = self.router(layer_input)
 
         expert_inputs = layer_input[batch_index]

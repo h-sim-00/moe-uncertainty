@@ -74,7 +74,9 @@ class MoERouter(nn.Module):
         else:
             raise ValueError(f"Invalid routing mode: {mode}.")
 
-        
+        # Store for Qwen Adapter's external access
+        self.last_top_k_indices = top_k_indices
+
         # This part remains the same for all k-expert modes
         zeros = torch.zeros((batch_size, self.num_experts), dtype=torch.long, device=logits.device)
         gates = zeros.scatter(1, top_k_indices.long(), 1)

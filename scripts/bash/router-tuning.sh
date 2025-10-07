@@ -20,7 +20,7 @@ cp ./scripts/python/router-tuning.py .
 
 # --- Define Parameters ---
 MODEL_SHORTCODE=("granite")
-DATASET_SHORTCODES=("medmcqa_med")
+DATASET_SHORTCODES=("arc_c")
 
 # Define training hyperparameters
 EPOCHS=10

@@ -1,79 +1,74 @@
 import json
-import random
-import pandas as pd
 
-def generate_fake_data(output_path="fake_calibration_data.json"):
+def generate_fake_data(output_path="calibration_data.json"):
     """
-    Generates a structured JSON file with fake data for the calibration plot.
+    Generates a structured JSON file with specific fake data for the calibration plot.
     """
     print("Generating fake data for visualization...")
 
     # --- Configuration ---
-    datasets = ["MMLU-ID-HS", "MMLU-ID-SocialSci", "MMLU-ID-Humanities"]
+    # Only one dataset now
+    datasets = ["OBQA"]
     metrics = ["ACC", "NLL", "ECE", "MCE"]
+    # Updated method names to match your legend
     methods = [
-        "Deterministic", "Temp Sampling", "SWAG", "MC Dropout",
-        "Ensemble", "MFVI", "Full VB", "Variational Temp"
+        "Deterministic", "Temp Sampling", "MCDR", "SWAGR",
+        "DER", "MFVR", "FCVR", "VTSR"
     ]
-    layer_selections = ["Selected Layers", "All Layers"]
 
-    # --- Plausible Value Ranges for Metrics ---
-    # (Method, Layer Selection): (ACC_mean, NLL_mean, ECE_mean, MCE_mean)
-    # We'll make Bayesian methods slightly better on average.
-    plausible_means = {
-        ("Deterministic", "All Layers"):     (0.70, 0.90, 0.15, 0.20),
-        ("Deterministic", "Selected Layers"): (0.71, 0.88, 0.14, 0.19),
-        ("Temp Sampling", "All Layers"):     (0.72, 0.85, 0.12, 0.18),
-        ("Temp Sampling", "Selected Layers"): (0.73, 0.83, 0.11, 0.17),
-        ("SWAG", "All Layers"):              (0.74, 0.80, 0.09, 0.15),
-        ("SWAG", "Selected Layers"):         (0.75, 0.78, 0.08, 0.14),
-        ("MC Dropout", "All Layers"):        (0.73, 0.82, 0.10, 0.16),
-        ("MC Dropout", "Selected Layers"):    (0.74, 0.81, 0.09, 0.15),
-        ("Ensemble", "All Layers"):          (0.76, 0.75, 0.07, 0.12),
-        ("Ensemble", "Selected Layers"):     (0.77, 0.74, 0.06, 0.11),
-        ("MFVI", "All Layers"):              (0.75, 0.77, 0.08, 0.13),
-        ("MFVI", "Selected Layers"):         (0.76, 0.76, 0.07, 0.12),
-        ("Full VB", "All Layers"):           (0.77, 0.73, 0.06, 0.11),
-        ("Full VB", "Selected Layers"):      (0.78, 0.72, 0.05, 0.10),
-        ("Variational Temp", "All Layers"): (0.74, 0.79, 0.09, 0.14),
-        ("Variational Temp", "Selected Layers"): (0.75, 0.78, 0.08, 0.13),
+    # --- New data extracted directly from your image ---
+    # Structure: { method: { metric: (mean, std_dev) } }
+    # For methods with no std_dev, it's set to 0.0
+    specific_data = {
+        "Deterministic": {
+            "ACC": (0.746, 0.0), "NLL": (1.384, 0.0), "ECE": (0.252, 0.0), "MCE": (0.472, 0.0)
+        },
+        "Temp Sampling": {
+            "ACC": (0.716, 0.005), "NLL": (0.773, 0.049), "ECE": (0.107, 0.009), "MCE": (0.201, 0.013)
+        },
+        "MCDR": {
+            "ACC": (0.734, 0.002), "NLL": (0.650, 0.022), "ECE": (0.037, 0.028), "MCE": (0.298, 0.008)
+        },
+        "SWAGR": {
+            "ACC": (0.736, 0.002), "NLL": (0.652, 0.030), "ECE": (0.041, 0.013), "MCE": (0.290, 0.007)
+        },
+        "DER": {
+            "ACC": (0.738, 0.0), "NLL": (0.660, 0.0), "ECE": (0.071, 0.0), "MCE": (0.234, 0.0)
+        },
+        "MFVR": {
+            "ACC": (0.742, 0.001), "NLL": (0.654, 0.019), "ECE": (0.026, 0.009), "MCE": (0.293, 0.004)
+        },
+        "FCVR": {
+            "ACC": (0.740, 0.001), "NLL": (0.652, 0.021), "ECE": (0.015, 0.008), "MCE": (0.152, 0.004)
+        },
+        "VTSR": {
+            "ACC": (0.736, 0.003), "NLL": (0.667, 0.025), "ECE": (0.052, 0.023), "MCE": (0.293, 0.014)
+        }
     }
 
     all_results = []
+    # Loop through the new data structure
     for dataset in datasets:
         for method in methods:
-            for layer_selection in layer_selections:
-                # Get the base mean values for this combination
-                base_acc, base_nll, base_ece, base_mce = plausible_means[(method, layer_selection)]
-                
-                # Add some random noise to simulate variance between datasets
-                acc = base_acc + random.uniform(-0.02, 0.02)
-                nll = base_nll + random.uniform(-0.05, 0.05)
-                ece = base_ece + random.uniform(-0.01, 0.01)
-                mce = base_mce + random.uniform(-0.02, 0.02)
-                
+            for metric in metrics:
+                # Get the mean and std_dev from our specific data
+                mean_val, std_val = specific_data[method][metric]
+
                 # Create a record for each metric
                 all_results.append({
-                    "dataset": dataset, "metric": "ACC", "method": method,
-                    "layer_selection": layer_selection, "mean_value": acc, "std_dev": acc * 0.05
-                })
-                all_results.append({
-                    "dataset": dataset, "metric": "NLL", "method": method,
-                    "layer_selection": layer_selection, "mean_value": nll, "std_dev": nll * 0.08
-                })
-                all_results.append({
-                    "dataset": dataset, "metric": "ECE", "method": method,
-                    "layer_selection": layer_selection, "mean_value": ece, "std_dev": ece * 0.15
-                })
-                all_results.append({
-                    "dataset": dataset, "metric": "MCE", "method": method,
-                    "layer_selection": layer_selection, "mean_value": mce, "std_dev": mce * 0.15
+                    "dataset": dataset,
+                    "metric": metric,
+                    "method": method,
+                    # Hardcode this to maintain compatibility with the plotting script
+                    "layer_selection": "Selected Layers", 
+                    "mean_value": mean_val,
+                    "std_dev": std_val
                 })
 
     with open(output_path, 'w') as f:
         json.dump(all_results, f, indent=4)
         
-    print(f"Successfully generated and saved fake data to '{output_path}'")
+    print(f"Successfully generated and saved specific fake data to '{output_path}'")
 
 if __name__ == "__main__":
     generate_fake_data()

@@ -93,7 +93,6 @@ class FullCovarianceVariationalRouter(MoERouter):
         top_k_logits, top_k_indices = logits.topk(self.top_k, dim=1)
         top_k_gates = torch.softmax(top_k_logits, dim=1).type_as(hidden_states)
         
-        # ... (rest of the routing logic is identical to your MFVR code) ...
         batch_size = hidden_states.shape[0]
         zeros = torch.zeros((batch_size, self.num_experts), dtype=torch.long, device=logits.device)
         gates = zeros.scatter(1, top_k_indices.long(), 1)

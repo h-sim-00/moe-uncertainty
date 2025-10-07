@@ -34,7 +34,6 @@ if is_torch_flex_attn_available():
 
 logger = logging.get_logger(__name__)
 
-
 # Copied from transformers.models.mixtral.modeling_mixtral.load_balancing_loss_func
 def load_balancing_loss_func(
     gate_logits: Union[torch.Tensor, Tuple[torch.Tensor], None],
@@ -787,6 +786,7 @@ class Qwen2MoePreTrainedModel(PreTrainedModel):
 class Qwen2MoeModel(Qwen2MoePreTrainedModel):
     def __init__(self, config: Qwen2MoeConfig):
         super().__init__(config)
+        self.config = config
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
