@@ -3,6 +3,7 @@ import os
 from transformers import Trainer, TrainingArguments, DataCollatorForLanguageModeling, EarlyStoppingCallback
 import wandb
 
+from model.adapters.granite_adapter import save_granite_map_routers, swap_granite_moe_blocks
 from utils import setup_environment
 from model import load_peft_model_and_adapter, load_tokenizer
 from utils import load_and_prepare_train_and_val_data
@@ -23,9 +24,6 @@ def main():
     setup_environment()
     args = parse_args()
 
-    # Define internal paths
-    output_dir = "./router_weights/base"
-
     # 1. Load the base model and attach the Stage 1 fine-tuned adapter
     model = load_peft_model_and_adapter(
         args.model_shortcode,
@@ -35,17 +33,7 @@ def main():
     tokenizer = load_tokenizer(args.model_shortcode)
 
     # 2. Freeze all parameters and perform the "Lego Swap"
-    print("Freezing model and swapping in new MoERouter instances...")
-    for param in model.parameters():
-        param.requires_grad = False
-    
-    causal_model = model.base_model.model.model
-    for layer in causal_model.layers:
-        new_router = MoERouter(config=causal_model.config, existing_router=layer.block_sparse_moe.router)
-        new_router.to(model.device)
-        layer.block_sparse_moe.router = new_router
-        for param in new_router.parameters():
-            param.requires_grad = True
+    model = swap_granite_moe_blocks(model)
 
     # 3. Load data using the specified dataset_shortcode
     train_dataset, val_dataset = load_and_prepare_train_and_val_data(tokenizer, [args.dataset_shortcode])
@@ -83,10 +71,7 @@ def main():
     print("--- MAP Fine-tuning complete ---")
     
     # 5. Save the final router weights using our new API
-    print("--- Saving final MAP router weights ---")
-    for i, layer in enumerate(causal_model.layers):
-        save_path = os.path.join(output_dir, run_name, f"layer_{i}_weights.pt")
-        layer.block_sparse_moe.router.save_weights(save_path)
+    save_granite_map_routers(model, args)
 
 if __name__ == "__main__":
     main()

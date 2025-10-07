@@ -3,11 +3,10 @@ import os
 from transformers import Trainer, TrainingArguments, DataCollatorForLanguageModeling, EarlyStoppingCallback
 import wandb
 
+from model.adapters.granite_adapter import load_granite_map_routers, prepare_granite_bayesian_routers, save_granite_bayesian_routers
 from utils import setup_environment
 from model import load_peft_model_and_adapter, load_tokenizer
 from utils import load_and_prepare_train_and_val_data
-from model.routers.vtsr import VariationalTemperatureRouter
-from model.routers.base import MoERouter
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Fine-tune the Variational Temperature Router (VTSR) layer by layer.")
@@ -32,9 +31,7 @@ def main():
     args = parse_args()
 
     # Define internal paths and run name
-    output_root_dir = f"./router_weights/vtsr_{args.temperature_mode}"
     run_name = f"vtsr_{args.temperature_mode}-{args.model_shortcode}-{args.dataset_shortcode}"
-    output_dir = os.path.join(output_root_dir, run_name)
 
     # 1. Load the base model and attach the Stage 1 fine-tuned adapter
     model = load_peft_model_and_adapter(
@@ -45,46 +42,12 @@ def main():
     tokenizer = load_tokenizer(args.model_shortcode)
 
     # 2. Load the pre-trained MAP routers into the model as a starting point
-    print("--- Loading base MAP routers ---")
-    causal_model = model.base_model.model.model
-    map_run_name = f"{args.model_shortcode}_{args.dataset_shortcode}"
-    map_weights_dir = f"./router_weights/base/{map_run_name}"
-    
-    for i, layer in enumerate(causal_model.layers):
-        map_router = MoERouter(config=causal_model.config)
-        map_weights_path = os.path.join(map_weights_dir, f"layer_{i}_weights.pt")
-        map_router.load_weights(map_weights_path, device=model.device)
-        layer.block_sparse_moe.router = map_router
+    model = load_granite_map_routers(model, args=args)
 
     # 3. Perform the flexible "Lego Swap" for VTSRs
-    print("--- Swapping in VariationalTemperatureRouters ---")
-    for layer_idx in args.swap_layers:
-        target_layer = causal_model.layers[layer_idx]
-        
-        new_router = VariationalTemperatureRouter(
-            config=causal_model.config,
-            existing_router=target_layer.block_sparse_moe.router,
-            temperature_mode=args.temperature_mode
-        )
-        
-        if layer_idx in args.load_layers:
-            print(f"Loading pre-trained VTSR for layer {layer_idx}...")
-            weights_path = os.path.join(output_dir, f"layer_{layer_idx}_weights.pt")
-            new_router.load_weights(weights_path, device=model.device)
-        
-        target_layer.block_sparse_moe.router = new_router.to(model.device)
+    model = prepare_granite_bayesian_routers(model, method="vtsr", args=args)
 
-    # 4. Freeze all parameters, then unfreeze only the target training layers
-    print("--- Setting trainable parameters ---")
-    for param in model.parameters():
-        param.requires_grad = False
-    
-    for layer_idx in args.train_layers:
-        print(f"Unfreezing router in layer {layer_idx} for training.")
-        for param in causal_model.layers[layer_idx].block_sparse_moe.router.temperature_net.parameters():
-            param.requires_grad = True
-
-    # 5. Load data and train
+    # 4. Load data and train
     train_dataset, val_dataset = load_and_prepare_train_and_val_data(tokenizer, [args.dataset_shortcode])
 
     project_name = "bayesian-router-finetuning"
@@ -117,11 +80,8 @@ def main():
     trainer.train()
     print("--- Fine-tuning complete ---")
     
-    # 6. Save the final weights for ALL swapped VTSR layers
-    print("--- Saving final weights for all swapped VTSRs ---")
-    for layer_idx in args.swap_layers:
-        save_path = os.path.join(output_dir, f"layer_{layer_idx}_weights.pt")
-        causal_model.layers[layer_idx].block_sparse_moe.router.save_weights(save_path)
+    # 5. Save the final weights for ALL swapped VTSR layers
+    save_granite_bayesian_routers(model, method="vtsr", args=args)
 
 if __name__ == "__main__":
     main()

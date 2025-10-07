@@ -1,25 +1,74 @@
 # Granite MoE's adapter:
 # Base Router is implemented on top of Granite MoE, so no need for adapter.
 # But include two APIs for replacing routers;
-
+from torch import log_
+from model.routers.mcdr import MCDropoutRouter
+from model.routers.mfvr import MeanFieldVariationalRouter
+from model.routers.fcvr import FullCovarianceVariationalRouter
+from model.routers.vtsr import VariationalTemperatureRouter
 from model.routers.base import MoERouter
 import os
 
-# Initilisation: For MAP det router finetuning
+ROUTER_CONFIG = {
+    "mcdr": {
+        "class": MCDropoutRouter,
+        "get_kwargs": lambda args: {"dropout_rate": args.dropout_rate},
+        "trainable_attrs": None  # None signifies all parameters are trainable
+    },
+    "mfvr": {
+        "class": MeanFieldVariationalRouter,
+        "get_kwargs": lambda args: {},
+        "trainable_attrs": ["mean_residual_net", "log_var_net"]
+    },
+    "fcvr": {
+        "class": FullCovarianceVariationalRouter,
+        "get_kwargs": lambda args: {},
+        "trainable_attrs": ["mean_residual_net", "cholesky_net"]
+    },
+    "vtsr": {
+        "class": VariationalTemperatureRouter,
+        "get_kwargs": lambda args: {"temperature_mode": args.temperature_mode},
+        "trainable_attrs": ["temperature_net"]
+    }
+}
+
+# ====================================================
+# MAP (Deterministic) Router Functions
+# ====================================================
+
+# (1) Initilisation: For MAP det router finetuning
 def swap_granite_moe_blocks(model):
+    """
+    Initializes the model for MAP router fine-tuning.
+    Replaces all original routers with the base MoERouter and unfreezes them.
+    """
+    print("--- Preparing model for MAP router tuning ---")
     for param in model.parameters():
         param.requires_grad = False
+
     causal_model = model.base_model.model.model
     for layer in causal_model.layers:
         new_router = MoERouter(config=causal_model.config, existing_router=layer.block_sparse_moe.router)
-        new_router.to(model.device)
-        layer.block_sparse_moe.router = new_router
+        layer.block_sparse_moe.router = new_router.to(model.device)
         for param in new_router.parameters():
             param.requires_grad = True
+    
     return model
 
-# Loading: load finetuned map weights
+# (2) Saving: save finetuned map weights
+def save_granite_map_routers(model, args):
+    """Saves the fine-tuned MAP router weights."""
+    print("--- Saving MAP router weights ---")
+    output_dir = "./router_weights/base"
+    causal_model = model.base_model.model.model
+    run_name = f"{args.model_shortcode}_{args.dataset_shortcode}"
+    for i, layer in enumerate(causal_model.layers):
+        save_path = os.path.join(output_dir, run_name, f"layer_{i}_weights.pt")
+        layer.block_sparse_moe.router.save_weights(save_path)
+
+# (3) Loading: load finetuned map weights
 def load_granite_map_routers(model, args):
+    """Loads pre-trained MAP router weights into the model."""
     print("--- Loading base MAP routers ---")
     causal_model = model.base_model.model.model
     map_run_name = f"{args.model_shortcode}_{args.dataset_shortcode}"
@@ -28,61 +77,257 @@ def load_granite_map_routers(model, args):
     for i, layer in enumerate(causal_model.layers):
         map_router = MoERouter(config=causal_model.config)
         map_weights_path = os.path.join(map_weights_dir, f"layer_{i}_weights.pt")
-        map_router.load_weights(map_weights_path, device=model.device)
-        map_router.to(model.device)
+        map_router.load_weights(map_weights_path, device=model.device).to(model.device)
         layer.block_sparse_moe.router = map_router
 
     return model
 
+# ====================================================
+# Generic Bayesian Router Functions (New Elegant API)
+# ====================================================
 
-# Bayesianfying: For Bayesian training
-# swap, load, freeze & unfreeze
-def prepare_granite_bayesian_routers(model, args):
-    output_root_dir = "./router_weights/mcdr"
-    run_name = f"mcdr-{args.model_shortcode}-{args.dataset_shortcode}"
-    output_dir = os.path.join(output_root_dir, run_name)
+# (4) Preparing for Bayeisan Tuning
+def prepare_granite_bayesian_routers(model, method, args):
+    """
+    A generic function to prepare the model for Bayesian router training.
+    Handles swapping, loading, freezing, and unfreezing for any specified method.
+    """
+    if method not in ROUTER_CONFIG:
+        raise ValueError(f"Unknown Bayesian method: {method}. Supported methods are {list(ROUTER_CONFIG.keys())}")
+
+    config = ROUTER_CONFIG[method]
+    RouterClass = config["class"]
+    router_kwargs = config["get_kwargs"](args)
+    trainable_attrs = config["trainable_attrs"]
+
+    print(f"--- Preparing model for {method.upper()} router tuning ---")
+    
+    output_root_dir = f"./router_weights/{method}"
+    if method == 'vtsr':
+        output_root_dir += f"_{args.temperature_mode}"
+    run_name = f"{method}-{args.model_shortcode}-{args.dataset_shortcode}"
+    
     causal_model = model.base_model.model.model
 
-    # Swap & Load
+    # 1. Swap & Load
     for layer_idx in args.swap_layers:
         target_layer = causal_model.layers[layer_idx]
-        
+        new_router = RouterClass(
+            config=causal_model.config,
+            existing_router=target_layer.block_sparse_moe.router,
+            **router_kwargs
+        )
         if layer_idx in args.load_layers:
-            # This layer should have an MCDR with pre-trained weights
-            print(f"Loading pre-trained MCDR for layer {layer_idx}...")
-            new_router = MCDropoutRouter(config=causal_model.config, dropout_rate=args.dropout_rate)
-            weights_path = os.path.join(output_dir, f"layer_{layer_idx}_weights.pt")
+            print(f"Loading pre-trained {method.upper()} for layer {layer_idx}...")
+            weights_path = os.path.join(output_root_dir, run_name, f"layer_{layer_idx}_weights.pt")
             new_router.load_weights(weights_path, device=model.device)
-        else:
-            # This layer should have a new MCDR initialized from the MAP router
-            print(f"Initializing new MCDR for layer {layer_idx} from MAP weights...")
-            new_router = MCDropoutRouter(
-                config=causal_model.config,
-                existing_router=target_layer.block_sparse_moe.router,
-                dropout_rate=args.dropout_rate
-            )
-        
-        new_router.to(model.device)
-        target_layer.block_sparse_moe.router = new_router
 
-    # Freeze & Unfreeze
+        target_layer.block_sparse_moe.router = new_router.to(model.device)
+
+    # 2. Freeze & Unfreeze
     for param in model.parameters():
         param.requires_grad = False
     
+    print(f"Unfreezing routers in layers: {args.train_layers}")
     for layer_idx in args.train_layers:
-        print(f"Unfreezing router in layer {layer_idx} for training.")
-        for param in causal_model.layers[layer_idx].block_sparse_moe.router.parameters():
-            param.requires_grad = True
-
+        router = causal_model.layers[layer_idx].block_sparse_moe.router
+        if trainable_attrs is None:
+            for param in router.parameters():
+                param.requires_grad = True
+        else:
+            for attr_name in trainable_attrs:
+                submodule = getattr(router, attr_name)
+                for param in submodule.parameters():
+                    param.requires_grad = True
     return model
 
-def save_granite_routers(model, args):
-    
-    output_root_dir = "./router_weights/mcdr"
-    run_name = f"mcdr-{args.model_shortcode}-{args.dataset_shortcode}"
-    output_dir = os.path.join(output_root_dir, run_name)
-    causal_model = model.base_model.model.model
 
-    for layer_idx in args.train_layers:
-        save_path = os.path.join(output_dir, f"layer_{layer_idx}_weights.pt")
+# # Bayesianfying APIs
+# # (1) swap, load, freeze & unfreeze
+# def prepare_granite_mcdr_routers(model, args):
+#     output_root_dir = "./router_weights/mcdr"
+#     run_name = f"mcdr-{args.model_shortcode}-{args.dataset_shortcode}"
+#     output_dir = os.path.join(output_root_dir, run_name)
+#     causal_model = model.base_model.model.model
+
+#     # Swap & Load
+#     for layer_idx in args.swap_layers:
+#         target_layer = causal_model.layers[layer_idx]
+        
+#         new_router = MCDropoutRouter(
+#             config=causal_model.config,
+#             existing_router=target_layer.block_sparse_moe.router,
+#             dropout_rate=args.dropout_rate
+#         )
+        
+#         if layer_idx in args.load_layers:
+#             print(f"Loading pre-trained MCDR for layer {layer_idx}...")
+#             weights_path = os.path.join(output_dir, f"layer_{layer_idx}_weights.pt")
+#             new_router.load_weights(weights_path, device=model.device)
+
+#         target_layer.block_sparse_moe.router = new_router.to(model.device)
+
+#     # Freeze & Unfreeze
+#     for param in model.parameters():
+#         param.requires_grad = False
+    
+#     for layer_idx in args.train_layers:
+#         for param in causal_model.layers[layer_idx].block_sparse_moe.router.parameters():
+#             param.requires_grad = True
+
+#     return model
+
+# def prepare_granite_mfvr_routers(model, args):
+#     output_root_dir = "./router_weights/mfvr"
+#     run_name = f"mfvr-{args.model_shortcode}-{args.dataset_shortcode}"
+#     causal_model = model.base_model.model.model
+
+#     for layer_idx in args.swap_layers:
+#         target_layer = causal_model.layers[layer_idx]
+#         new_router = MeanFieldVariationalRouter(
+#             config=model.config,
+#             existing_router=target_layer.block_sparse_moe.router
+#         )
+#         if layer_idx in args.load_layers:
+#             print(f"Loading pre-trained MFVR for layer {layer_idx}...")
+#             weights_path = os.path.join(output_root_dir, run_name, f"layer_{layer_idx}_weights.pt")
+#             new_router.load_weights(weights_path, device=model.device)
+
+#         target_layer.block_sparse_moe.router = new_router.to(model.device)
+
+#     # Freeze & Unfreeze
+#     for param in model.parameters():
+#         param.requires_grad = False
+
+#     for layer_idx in args.train_layers:
+#         mean_residual_net, log_var_net = \
+#             causal_model.layers[layer_idx].block_sparse_moe.router.mean_residual_net, \
+#             causal_model.layers[layer_idx].block_sparse_moe.router.log_var_net
+#         for param in mean_residual_net.parameters():
+#             param.requires_grad = True
+#         for param in log_var_net.parameters():
+#             param.requires_grad = True
+    
+#     return model
+
+# def prepare_granite_fcvr_routers(model, args):
+#     output_root_dir = "./router_weights/fcvr"
+#     run_name = f"fcvr-{args.model_shortcode}-{args.dataset_shortcode}"
+#     causal_model = model.base_model.model.model
+
+#     for layer_idx in args.swap_layers:
+#         target_layer = causal_model.layers[layer_idx]
+#         new_router = FullCovarianceVariationalRouter(
+#             config=model.config,
+#             existing_router=target_layer.block_sparse_moe.router
+#         )
+#         if layer_idx in args.load_layers:
+#             print(f"Loading pre-trained MFVR for layer {layer_idx}...")
+#             weights_path = os.path.join(output_root_dir, run_name, f"layer_{layer_idx}_weights.pt")
+#             new_router.load_weights(weights_path, device=model.device)
+
+#         target_layer.block_sparse_moe.router = new_router.to(model.device)
+
+#     # Freeze & Unfreeze
+#     for param in model.parameters():
+#         param.requires_grad = False
+
+#     for layer_idx in args.train_layers:
+#         mean_residual_net, log_var_net = \
+#             causal_model.layers[layer_idx].block_sparse_moe.router.mean_residual_net, \
+#             causal_model.layers[layer_idx].block_sparse_moe.router.log_var_net
+#         for param in mean_residual_net.parameters():
+#             param.requires_grad = True
+#         for param in log_var_net.parameters():
+#             param.requires_grad = True
+    
+#     return model
+
+# def prepare_granite_vtsr_routers(model, args):
+#     output_root_dir = f"./router_weights/vtsr_{args.temperature_mode}"
+#     run_name = f"vtsr_{args.temperature_mode}-{args.model_shortcode}-{args.dataset_shortcode}"
+#     causal_model = model.base_model.model.model
+
+#     for layer_idx in args.swap_layers:
+#         target_layer = causal_model.layers[layer_idx]
+        
+#         new_router = VariationalTemperatureRouter(
+#             config=causal_model.config,
+#             existing_router=target_layer.block_sparse_moe.router,
+#             temperature_mode=args.temperature_mode
+#         )
+        
+#         if layer_idx in args.load_layers:
+#             print(f"Loading pre-trained VTSR for layer {layer_idx}...")
+#             weights_path = os.path.join(output_root_dir, run_name, f"layer_{layer_idx}_weights.pt")
+#             new_router.load_weights(weights_path, device=model.device)
+        
+#         target_layer.block_sparse_moe.router = new_router.to(model.device)
+
+#     # Freeze & Unfreeze
+#     for param in model.parameters():
+#         param.requires_grad = False
+    
+#     for layer_idx in args.train_layers:
+#         temperature_net = causal_model.layers[layer_idx].block_sparse_moe.router.temperature_net
+#         for param in temperature_net.parameters():
+#             param.requires_grad = True
+
+#     return model
+
+# (5) Save Bayesian Parameters
+def save_granite_bayesian_routers(model, method, args):
+    """A generic function to save the weights of trained Bayesian routers."""
+    print(f"--- Saving {method.upper()} router weights ---")
+    output_root_dir = f"./router_weights/{method}"
+    if method == 'vtsr':
+        output_root_dir += f"_{args.temperature_mode}"
+    run_name = f"{method}-{args.model_shortcode}-{args.dataset_shortcode}"
+    save_dir = os.path.join(output_root_dir, run_name)
+    
+    causal_model = model.base_model.model.model
+    
+    # Save all swapped layers to preserve state for progressive training
+    for layer_idx in args.swap_layers:
+        save_path = os.path.join(save_dir, f"layer_{layer_idx}_weights.pt")
         causal_model.layers[layer_idx].block_sparse_moe.router.save_weights(save_path)
+
+# (6) Load Bayesian Parameters
+def load_granite_bayesian_routers(model, method, args):
+    """A generic function to load pre-trained Bayesian routers for evaluation."""
+    if method not in ROUTER_CONFIG:
+        raise ValueError(f"Unknown Bayesian method: {method}. Supported methods are {list(ROUTER_CONFIG.keys())}")
+
+    config = ROUTER_CONFIG[method]
+    RouterClass = config["class"]
+    router_kwargs = config["get_kwargs"](args)
+
+    print(f"--- Loading pre-trained {method.upper()} routers for evaluation ---")
+    
+    output_root_dir = f"./router_weights/{method}"
+    if method == 'vtsr':
+        output_root_dir += f"_{args.temperature_mode}"
+    run_name = f"{method}-{args.model_shortcode}-{args.dataset_shortcode}"
+    weights_dir = os.path.join(output_root_dir, run_name)
+    
+    causal_model = model.base_model.model.model
+    
+    # Swap layers specified in args, or all layers if not specified
+    swap_layers = args.swap_layers if args.swap_layers is not None else range(len(causal_model.layers))
+
+    for layer_idx in swap_layers:
+        target_layer = causal_model.layers[layer_idx]
+        new_router = RouterClass(
+            config=causal_model.config,
+            existing_router=target_layer.block_sparse_moe.router,
+            **router_kwargs
+        )
+        weights_path = os.path.join(weights_dir, f"layer_{layer_idx}_weights.pt")
+        if os.path.exists(weights_path):
+            new_router.load_weights(weights_path, device=model.device)
+        else:
+            print(f"Warning: No weights found for layer {layer_idx} at {weights_path}. Using MAP initialization.")
+
+        target_layer.block_sparse_moe.router = new_router.to(model.device)
+    
+    return model

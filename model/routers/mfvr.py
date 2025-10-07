@@ -9,6 +9,8 @@ import os
 from tqdm import tqdm
 import wandb
 
+from model.adapters.granite_adapter import prepare_granite_bayesian_routers, save_granite_bayesian_routers
+
 from .base import MoERouter
 from utils import get_model_predictions, calculate_accuracy, calculate_ece_mce, calculate_nll
 
@@ -28,8 +30,6 @@ class MeanFieldVariationalRouter(MoERouter):
         # 1. Base Mean Network (Frozen) - Our MAP estimate
         self.mean_base = nn.Linear(self.input_size, self.num_experts, bias=False)
         self.mean_base.load_state_dict(existing_router.layer.state_dict())
-        for param in self.mean_base.parameters():
-            param.requires_grad = False
 
         # 2. Residual Mean Network (Trainable)
         self.mean_residual_net = nn.Linear(self.input_size, self.num_experts, bias=False)
@@ -111,7 +111,6 @@ class MeanFieldVariationalRouter(MoERouter):
 def train_mfvr_router(model, tokenizer, train_loader, val_loader, args):
     """Custom training loop for the MeanFieldVariationalRouter using the ELBO loss."""
     
-    output_root_dir = "./router_weights/mfvr"
     run_name = f"mfvr-{args.model_shortcode}-{args.dataset_shortcode}"
 
     # === 1. Prepare Model for Training ===
@@ -120,43 +119,15 @@ def train_mfvr_router(model, tokenizer, train_loader, val_loader, args):
     for param in model.parameters():
         param.requires_grad = False
     
-    device = model.device
     causal_model = model.base_model.model.model
-    config = causal_model.config
 
-    # "Lego Swap": Replace original routers with MFVR instances
-    print("Swapping routers and initializing MFVR parameters...")
-    for layer_idx in args.swap_layers:
-        target_layer = causal_model.layers[layer_idx]
-        new_router = MeanFieldVariationalRouter(
-            config=config,
-            existing_router=target_layer.block_sparse_moe.router
-        )
-        if layer_idx in args.load_layers:
-            print(f"Loading pre-trained MFVR for layer {layer_idx}...")
-            weights_path = os.path.join(output_root_dir, run_name, f"layer_{layer_idx}_weights.pt")
-            new_router.load_weights(weights_path, device=model.device)
-
-        target_layer.block_sparse_moe.router = new_router.to(device)
-
-    # Unfreeze only the parameters of the target training layers
-    print(f"Unfreezing routers in layers: {args.train_layers}")
-    for layer_idx in args.train_layers:
-        for param in causal_model.layers[layer_idx].block_sparse_moe.router.parameters():
-            if param.requires_grad:
-                param.requires_grad = True
+    model = prepare_granite_bayesian_routers(model, method="mfvr", args=args)
 
     # === 2. Create Optimizer ===
     
     # Get the list of all currently trainable parameters
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     
-    # Sanity check
-    num_trainable = sum(p.numel() for p in trainable_params)
-    print(f"Found {num_trainable} trainable parameters.")
-    if num_trainable == 0:
-        raise ValueError("FATAL: No trainable parameters were found after model setup. Check freezing/unfreezing logic.")
-        
     optimizer = torch.optim.Adam(trainable_params, lr=args.lr)
 
     # === 3. Run Custom Training Loop ===
@@ -206,8 +177,4 @@ def train_mfvr_router(model, tokenizer, train_loader, val_loader, args):
 
     print("--- MFVR Fine-tuning complete ---")
     
-    save_dir = os.path.join("./router_weights/mfvr", run_name)
-    for i, layer in enumerate(model.base_model.model.model.layers):
-        if i in args.swap_layers: # Only save if it's an MFVR router
-            save_path = os.path.join(save_dir, f"layer_{i}_weights.pt")
-            layer.block_sparse_moe.router.save_weights(save_path)
+    save_granite_bayesian_routers(model, method="mfvr", args=args)
