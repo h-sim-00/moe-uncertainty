@@ -4,7 +4,7 @@
 #SBATCH --partition=gpgpu
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=4
-#SBATCH --mem=32GW
+#SBATCH --mem=32G
 #SBATCH --time=48:00:00
 #SBATCH --mail-type=END,FAIL
 #SBATCH --mail-user=al1624@ic.ac.uk
@@ -20,7 +20,7 @@ cp ./scripts/python/mfvr-tuning.py .
 
 # --- Define Parameters ---
 MODEL_SHORTCODE="granite"
-DATASET_SHORTCODES=("obqa" "sciq" "medmcqa_med")
+DATASET_SHORTCODES=("arc_c")
 SEED=42
 EPOCHS=5
 BATCH_SIZE=4

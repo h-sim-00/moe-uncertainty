@@ -19,7 +19,7 @@ cp ./scripts/python/mcdr-tuning.py .
 
 # --- Define Parameters ---
 MODELS=("granite")
-DATASETS=("sciq" "medmcqa_med")
+DATASETS=("arc_c")
 
 # Define training hyperparameters
 EPOCHS=5

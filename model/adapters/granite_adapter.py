@@ -1,7 +1,6 @@
 # Granite MoE's adapter:
 # Base Router is implemented on top of Granite MoE, so no need for adapter.
 # But include two APIs for replacing routers;
-from torch import log_
 from model.routers.mcdr import MCDropoutRouter
 from model.routers.mfvr import MeanFieldVariationalRouter
 from model.routers.fcvr import FullCovarianceVariationalRouter
@@ -77,8 +76,8 @@ def load_granite_map_routers(model, args):
     for i, layer in enumerate(causal_model.layers):
         map_router = MoERouter(config=causal_model.config)
         map_weights_path = os.path.join(map_weights_dir, f"layer_{i}_weights.pt")
-        map_router.load_weights(map_weights_path, device=model.device).to(model.device)
-        layer.block_sparse_moe.router = map_router
+        map_router.load_weights(map_weights_path, device=model.device)
+        layer.block_sparse_moe.router = map_router.to(model.device)
 
     return model
 

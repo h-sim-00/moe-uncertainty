@@ -1,13 +1,81 @@
 import argparse
-import os
+import os, torch, wandb
+from tqdm import tqdm
 from torch.utils.data import DataLoader
 from transformers import DataCollatorForLanguageModeling
 
 from utils import setup_environment
 from model import load_peft_model_and_adapter, load_tokenizer
 from utils import load_and_prepare_train_and_val_data
-from model.routers.fcvr import FullCovarianceVariationalRouter, train_fcvr_router
-from model.routers.base import MoERouter
+
+from model.adapters.granite_adapter import load_granite_map_routers, prepare_granite_bayesian_routers, save_granite_bayesian_routers
+
+def train_fcvr_router(model, tokenizer, train_loader, val_loader, args):
+    """Custom training loop for the FCVR using the ELBO loss."""
+    run_name = f"fcvr-{args.model_shortcode}-{args.dataset_shortcode}"
+
+    # === 1. Prepare Model for Training ===
+    # Freeze all parameters in the entire model first
+    model = load_granite_map_routers(model, args=args)
+    model = prepare_granite_bayesian_routers(model, method="fcvr", args=args)
+
+    # === 2. Create Optimizer ===
+    
+    # Get the list of all currently trainable parameters
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = torch.optim.Adam(trainable_params, lr=args.lr)
+
+    # === 3. Run Custom Training Loop ===
+    project_name = "bayesian-router-finetuning"
+    wandb.init(project=project_name, name=run_name, config=vars(args), reinit=True)
+    
+    num_training_batches = len(train_loader)
+    
+    print("--- Starting FCVR Fine-tuning (Custom Loop) ---")
+    for epoch in range(args.epochs):
+        model.train()
+        total_epoch_loss = 0
+        for batch in tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}"):
+            optimizer.zero_grad()
+            inputs = {k: v.to(model.device) for k, v in batch.items()}
+            outputs = model(**inputs)
+            
+            reconstruction_loss = outputs.loss
+            
+            total_kl_div = 0
+            for i, layer in enumerate(model.base_model.model.model.layers):
+                if i in args.train_layers:
+                    total_kl_div += layer.block_sparse_moe.router.kl_divergence()
+            
+            kl_term = (args.beta / num_training_batches) * total_kl_div
+            loss = reconstruction_loss + kl_term
+            
+            loss.backward()
+            optimizer.step()
+            total_epoch_loss += loss.item()
+            wandb.log({
+                "train_loss": loss.item(), 
+                "reconstruction_loss": reconstruction_loss.item(), 
+                "kl_term": kl_term.item()
+            })
+            
+        print(f"Epoch {epoch+1} average training loss: {total_epoch_loss / num_training_batches:.4f}")
+        
+        # Validation Loop
+        model.eval()
+        total_val_loss = 0
+        with torch.no_grad():
+            for batch in val_loader:
+                inputs = {k: v.to(model.device) for k, v in batch.items()}
+                outputs = model(**inputs)
+                total_val_loss += outputs.loss.item()
+        avg_val_loss = total_val_loss / len(val_loader)
+        print(f"Epoch {epoch+1} validation loss: {avg_val_loss:.4f}")
+        wandb.log({"val_loss": avg_val_loss, "epoch": epoch})
+
+    print("--- FCVR Fine-tuning complete ---")
+    
+    save_granite_bayesian_routers(model, method="fcvr", args=args)
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Fine-tune an MoE router with Full-Covariance VI.")
