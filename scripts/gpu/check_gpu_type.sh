@@ -1,6 +1,6 @@
 #!/bin/bash
 
-OUTPUT_FILE="/vol/bitbucket/al1624/FIP/albus-bayesian-moe-router/scripts/gpu/gpu_info.txt"
+OUTPUT_FILE="/vol/bitbucket/al1624/projects/bayesian-moe-router/scripts/gpu/gpu_info.txt"
 > "$OUTPUT_FILE"  # Clear output file
 
 HOST_PATTERNS=(

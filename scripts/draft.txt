@@ -6,7 +6,7 @@ python exp1-per_layer.py --param_num 3b --mode sample_k --temp 2.0 --dataset_nam
 
 
 ssh gpucluster2
-cd /vol/bitbucket/al1624/FIP/albus-bayesian-moe-router/scripts
+cd /vol/bitbucket/al1624/projects/bayesian-moe-router/scripts
 
 
 Loading MMLU subject: high_school_us_history

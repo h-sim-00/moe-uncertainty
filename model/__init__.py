@@ -27,6 +27,9 @@ def load_model(model_shortcode: str, device_map: str = "cuda:0"):
     elif "deepseek" in model_shortcode:
         from .deepseekmoe.modeling_deepseek import DeepseekForCausalLM
         return DeepseekForCausalLM.from_pretrained(MODEL_SHORTCODE2ID[model_shortcode], device_map=device_map, trust_remote_code=True)
+    elif "qwen" in model_shortcode:
+        from .qwen2_moe.modeling_qwen2_moe import Qwen2MoeForCausalLM
+        return Qwen2MoeForCausalLM.from_pretrained(MODEL_SHORTCODE2ID[model_shortcode], device_map=device_map, trust_remote_code=True)
     else:
         from transformers import AutoModelForCausalLM
         return AutoModelForCausalLM.from_pretrained(MODEL_SHORTCODE2ID[model_shortcode], device_map=device_map)

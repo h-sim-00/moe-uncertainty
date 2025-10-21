@@ -15,7 +15,6 @@ from utils import get_model_predictions, calculate_accuracy, calculate_ece_mce, 
 # --- Import All Router Classes ---
 from model.routers.base import MoERouter
 from model.routers.mcdr import MCDropoutRouter
-# from model.routers.swag import GraniteMoeDeterministicRouter as SwagRouter, SWAGManager # (2) Commented out
 from model.routers.mfvr import MeanFieldVariationalRouter
 from model.routers.fcvr import FullCovarianceVariationalRouter
 from model.routers.vtsr import VariationalTemperatureRouter

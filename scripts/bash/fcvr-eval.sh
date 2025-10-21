@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=fcvr-eval
-#SBATCH --output=/vol/bitbucket/al1624/FIP/albus-bayesian-moe-router/logs/slurm/slurm_%j_fcvr-eval.log
+#SBATCH --output=/vol/bitbucket/al1624/projects/bayesian-moe-router/logs/slurm/slurm_%j_fcvr-eval.log
 #SBATCH --partition=gpgpu
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=4
@@ -12,7 +12,7 @@
 # --- Setup ---
 export HF_HOME="/vol/bitbucket/al1624/.cache/huggingface"
 source /vol/bitbucket/al1624/.venv/moe_env/bin/activate
-cd /vol/bitbucket/al1624/FIP/albus-bayesian-moe-router/
+cd /vol/bitbucket/al1624/projects/bayesian-moe-router/
 echo "Current working directory: $(pwd)"
 
 cp ./scripts/python/evaluate.py .

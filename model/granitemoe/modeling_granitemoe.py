@@ -386,11 +386,11 @@ class GraniteMoeTopKGating(nn.Module):
         else:
             raise ValueError(f"Invalid routing mode: {mode}. Choose from 'top_k', 'sample_k', 'mc_dropout', etc.")
 
-        # This part remains the same for all k-expert modes
         zeros = torch.zeros(
             (batch_size, self.num_experts), dtype=torch.long, device=logits.device
         )
-        gates = zeros.scatter(dim=1, index=top_k_indices.long(), src=1)
+        src_tensor = torch.ones_like(top_k_indices, dtype=torch.long)
+        gates = zeros.scatter(dim=1, index=top_k_indices.long(), src=src_tensor)
         expert_size = gates.long().sum(dim=0).tolist()
 
         num_selected_experts = top_k_indices.shape[1]
