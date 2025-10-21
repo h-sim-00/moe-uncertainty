@@ -271,7 +271,7 @@ def load_generation_dataset(dataset_name, seed=42):
 
     return train_dataset, validation_dataset
 
-def batchify(data, batch_size, tokenizer, device="auto"):
+def batchify(data, batch_size, tokenizer, device="cuda:0"):
     """
     Create batches of data and handle padding.
     """

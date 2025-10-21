@@ -10,11 +10,8 @@ from utils import get_model_predictions, calculate_accuracy, calculate_ece_mce, 
 class VariationalTemperatureRouter(MoERouter):
     """
     Implements a router with a learned, data-dependent temperature.
-    This can operate in two modes:
-    1. 'per_expert': Learns a unique temperature for each expert.
-    2. 'shared': Learns a single temperature applied to all experts.
     """
-    def __init__(self, config, existing_router, temperature_mode='per_expert'):
+    def __init__(self, config, existing_router):
         # Initialize the parent class, which creates self.layer
         super().__init__(config, existing_router)
         
@@ -22,32 +19,27 @@ class VariationalTemperatureRouter(MoERouter):
         for param in self.layer.parameters():
             param.requires_grad = False
 
-        self.temperature_mode = temperature_mode
-        
-        # The output dimension of the network depends on the mode
-        if self.temperature_mode == 'per_expert':
-            output_dim = self.num_experts
-        elif self.temperature_mode == 'shared':
-            output_dim = 1
-        else:
-            raise ValueError(f"Invalid temperature_mode: {temperature_mode}. Choose 'per_expert' or 'shared'.")
-
         # Create a new, trainable network to predict the temperature(s)
         self.temperature_net = nn.Sequential(
             nn.Linear(self.input_size, config.hidden_size // 4),
             nn.ReLU(),
-            nn.Linear(config.hidden_size // 4, output_dim)
+            nn.Linear(config.hidden_size // 4, 1)
         )
         
         # Use Softplus to ensure the temperature is always positive
         self.softplus = nn.Softplus()
 
+        self.last_temperature = None
+
     def forward(self, hidden_states, **kwargs):
         with torch.no_grad():
             logits = self.layer(hidden_states).float()
 
-        temperatures = self.softplus(self.temperature_net(hidden_states)) + 1e-6
-        scaled_logits = logits / temperatures
+        temperature = self.softplus(self.temperature_net(hidden_states)) + 1e-6
+
+        self.last_temperature = temperature
+
+        scaled_logits = logits / temperature
         
         # --- Conditional Logic for Training vs. Evaluation ---
         if self.training:

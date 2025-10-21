@@ -20,7 +20,7 @@ echo "Current working directory: $(pwd)"
 cp ./scripts/python/kvq-tuning.py .
 
 # --- Define Parameters ---
-MODEL_SHORTCODE="granite" 
+MODEL_SHORTCODE="qwen" 
 DATASET_SHORTCODES=("arc_c")
 
 # Define training hyperparameters

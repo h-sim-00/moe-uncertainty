@@ -18,7 +18,7 @@ echo "Current working directory: $(pwd)"
 cp ./scripts/python/mcdr-tuning.py .
 
 # --- Define Parameters ---
-MODELS=("granite")
+MODELS=("qwen")
 DATASETS=("arc_c")
 
 # Define training hyperparameters
@@ -26,6 +26,7 @@ EPOCHS=5
 BATCH_SIZE=8
 SEED=42
 DROPOUT_RATE=0.05
+LR=1e-5
 
 # --- Run Progressive Fine-tuning for Each Combination ---
 echo "===================================================="
@@ -78,7 +79,8 @@ for MODEL_SHORTCODE in "${MODELS[@]}"; do
                 --epochs "$EPOCHS" \
                 --batch_size "$BATCH_SIZE" \
                 --seed "$SEED" \
-                --dropout_rate "$DROPOUT_RATE"
+                --dropout_rate "$DROPOUT_RATE" \
+                --lr "$LR"
             
             echo "    Step for layer ${TRAIN_LAYER} completed."
         done

@@ -95,6 +95,7 @@ adapters/*
 results/*
 archives/*
 intermediate_checkpoints/*
+.archives/*
 
 ref/**/*.pt
 ref/**/*.csv

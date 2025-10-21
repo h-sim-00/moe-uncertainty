@@ -209,7 +209,7 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
     
     # --- Setup ---
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = "cuda:0" if torch.cuda.is_available() else "cpu"
     model = load_peft_model_and_adapter(args.model_shortcode, adapter_path=args.adapter_path, device_map=device)
     model.eval()
     tokenizer = load_tokenizer(args.model_shortcode)

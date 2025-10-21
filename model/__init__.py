@@ -15,7 +15,7 @@ def load_tokenizer(model_shortcode: str):
     from transformers import AutoTokenizer
     return AutoTokenizer.from_pretrained(MODEL_SHORTCODE2ID[model_shortcode])
 
-def load_model(model_shortcode: str, device_map: str = "auto"):
+def load_model(model_shortcode: str, device_map: str = "cuda:0"):
     """
     Load a model basmodel_shortcodee provided model_id.
     """
@@ -31,7 +31,7 @@ def load_model(model_shortcode: str, device_map: str = "auto"):
         from transformers import AutoModelForCausalLM
         return AutoModelForCausalLM.from_pretrained(MODEL_SHORTCODE2ID[model_shortcode], device_map=device_map)
 
-def load_peft_model(model_shortcode: str, finetune_mode: str, r: int = 64, lora_dropout: float = 0.01, target_layer: int | None = None, device_map="auto") -> PreTrainedModel:
+def load_peft_model(model_shortcode: str, finetune_mode: str, r: int = 64, lora_dropout: float = 0.01, target_layer: int | None = None, device_map="cuda:0") -> PreTrainedModel:
     """Loads the base model and applies LoRA configuration."""
     assert model_shortcode in MODEL_SHORTCODE2ID, f"Model shortcode '{model_shortcode}' not defined."
 
@@ -67,7 +67,7 @@ def load_peft_model(model_shortcode: str, finetune_mode: str, r: int = 64, lora_
     
     return peft_model
 
-def load_peft_model_and_adapter(model_shortcode: str, adapter_path: str, eval_mode: bool = True, device_map="auto") -> PeftModel:
+def load_peft_model_and_adapter(model_shortcode: str, adapter_path: str, eval_mode: bool = True, device_map="cuda:0") -> PeftModel:
     """Loads the base model and applies the trained LoRA adapter."""
     assert model_shortcode in MODEL_SHORTCODE2ID, f"Model shortcode '{model_shortcode}' not defined."
     print(f"Loading base model: {model_shortcode}")

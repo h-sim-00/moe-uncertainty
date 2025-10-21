@@ -25,7 +25,7 @@ def main():
     model = load_peft_model_and_adapter(
         args.model_shortcode,
         adapter_path=args.base_adapter_path,
-        device_map="auto"
+        device_map="cuda:0"
     )
     tokenizer = load_tokenizer(args.model_shortcode)
 

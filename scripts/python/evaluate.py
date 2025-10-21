@@ -182,9 +182,9 @@ def main():
     args = parse_args()
 
     if args.method in ['zero_shot']:
-        model = load_peft_model_and_adapter(args.model_shortcode, adapter_path=None, device_map="auto")
+        model = load_peft_model_and_adapter(args.model_shortcode, adapter_path=None, device_map="cuda:0")
     else:
-        model = load_peft_model_and_adapter(args.model_shortcode, adapter_path=args.kvq_adapter_path, device_map="auto")
+        model = load_peft_model_and_adapter(args.model_shortcode, adapter_path=args.kvq_adapter_path, device_map="cuda:0")
     
     tokenizer = load_tokenizer(args.model_shortcode)
 

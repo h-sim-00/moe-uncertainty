@@ -361,10 +361,6 @@ class GraniteMoeTopKGating(nn.Module):
             top_k_gates = torch.softmax(top_k_logits, dim=1).type_as(hidden_states)
             logits = stochastic_logits  # Use stochastic logits for logging
 
-        # elif mode == "equal_top_k":
-        #     _, top_k_indices = logits.topk(self.top_k, dim=1)
-        #     top_k_gates = torch.full((batch_size, self.top_k), fill_value=1.0 / self.top_k, device=logits.device, dtype=hidden_states.dtype)
-
         elif mode == "random_k":
             top_k_indices = torch.stack([
                 torch.randperm(self.num_experts, device=logits.device)[:self.top_k]
@@ -375,10 +371,6 @@ class GraniteMoeTopKGating(nn.Module):
         elif mode == "fixed_k":
             top_k_indices = torch.arange(self.top_k, device=logits.device).unsqueeze(0).expand(batch_size, -1)
             top_k_gates = torch.full((batch_size, self.top_k), fill_value=1.0 / self.top_k, device=logits.device, dtype=hidden_states.dtype)
-
-        # elif mode == "all_equal":
-        #     top_k_indices = torch.arange(self.num_experts, device=logits.device).unsqueeze(0).expand(batch_size, -1)
-        #     top_k_gates = torch.full((batch_size, self.num_experts), fill_value=1.0 / self.num_experts, device=logits.device, dtype=hidden_states.dtype)
 
         elif mode == "all_weighted":
             top_k_indices = torch.arange(self.num_experts, device=logits.device).unsqueeze(0).expand(batch_size, -1)

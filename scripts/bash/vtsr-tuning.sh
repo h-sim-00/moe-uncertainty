@@ -19,17 +19,16 @@ cp ./scripts/python/vtsr-tuning.py .
 
 # --- Define Parameters ---
 MODELS=("granite")
-DATASET_SHORTCODES=("obqa" "sciq" "medmcqa_med")
+DATASET_SHORTCODES=("obqa")
 
 # Define training hyperparameters
 EPOCHS=10
 BATCH_SIZE=8
 SEED=42
-TEMPERATURE_MODE="per_expert" # Options: "shared", "per_expert"
 
 # --- Run Progressive Fine-tuning for Each Combination ---
 echo "===================================================="
-echo "Starting Progressive VTSR Fine-tuning (Mode: ${TEMPERATURE_MODE})"
+echo "Starting Progressive VTSR Fine-tuning"
 echo "===================================================="
 
 for MODEL_SHORTCODE in "${MODELS[@]}"; do
@@ -65,7 +64,6 @@ for MODEL_SHORTCODE in "${MODELS[@]}"; do
                 --model_shortcode "$MODEL_SHORTCODE" \
                 --dataset_shortcode "$DATASET_SHORTCODE" \
                 --base_adapter_path "$BASE_ADAPTER_PATH" \
-                --temperature_mode "$TEMPERATURE_MODE" \
                 --swap_layers "${SWAP_LAYERS[@]}" \
                 --load_layers "${LOAD_LAYERS[@]}" \
                 --train_layers "$TRAIN_LAYER" \

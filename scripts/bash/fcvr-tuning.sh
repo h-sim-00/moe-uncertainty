@@ -20,9 +20,9 @@ cp ./scripts/python/fcvr-tuning.py .
 
 # --- Define Parameters ---
 MODEL_SHORTCODE="granite"
-DATASET_SHORTCODES=("obqa" "sciq" "medmcqa_med")
+DATASET_SHORTCODES=("arc_c")
 SEED=42
-EPOCHS=5
+EPOCHS=10
 BATCH_SIZE=4
 LEARNING_RATE=1e-5
 BETA=0.01

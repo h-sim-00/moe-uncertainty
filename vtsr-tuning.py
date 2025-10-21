@@ -1,20 +1,88 @@
 import argparse
-import os
+import os, torch
+from torch.utils.data import DataLoader
 from transformers import Trainer, TrainingArguments, DataCollatorForLanguageModeling, EarlyStoppingCallback
 import wandb
+from tqdm import tqdm
 
+from model.adapters.granite_adapter import load_granite_map_routers, prepare_granite_bayesian_routers, save_granite_bayesian_routers
 from utils import setup_environment
 from model import load_peft_model_and_adapter, load_tokenizer
 from utils import load_and_prepare_train_and_val_data
-from model.routers.vtsr import VariationalTemperatureRouter
-from model.routers.base import MoERouter
+
+def train(model, tokenizer, train_loader, val_loader, args):
+    run_name = f"vtsr-{args.model_shortcode}-{args.dataset_shortcode}"
+
+    # === 1. Prepare Model for Training ===
+    model = load_granite_map_routers(model, args=args)
+    model = prepare_granite_bayesian_routers(model, method="vtsr", args=args)
+    causal_model = model.base_model.model.model
+
+    # === 2. Create Optimizer ===
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = torch.optim.Adam(trainable_params, lr=args.lr)
+
+    # === 3. Run Custom Training Loop ===
+    project_name = "bayesian-router-finetuning"
+    wandb.init(project=project_name, name=run_name, config=vars(args), reinit=True)
+    
+    num_training_batches = len(train_loader)
+    
+    print("--- Starting VTSR Fine-tuning (Custom Loop) ---")
+    for epoch in range(args.epochs):
+        model.train()
+        total_epoch_loss = 0
+        for batch in tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}"):
+            optimizer.zero_grad()
+            inputs = {k: v.to(model.device) for k, v in batch.items()}
+            outputs = model(**inputs)
+            
+            # 1. Get the standard language modeling loss
+            reconstruction_loss = outputs.loss
+            
+            # 2. Calculate the temperature penalty
+            total_temp_penalty = torch.tensor(0.0, device=model.device)
+            for layer_idx in args.train_layers:
+                router = causal_model.layers[layer_idx].block_sparse_moe.router
+                temperature = router.last_temperature
+                penalty = -torch.log(temperature).sum()
+                total_temp_penalty += penalty
+                
+            # 3. Combine the losses
+            final_loss = reconstruction_loss + args.temp_penalty_weight * total_temp_penalty
+
+            final_loss.backward()
+            optimizer.step()
+            total_epoch_loss += final_loss.item()
+            wandb.log({
+                "train_loss": final_loss.item(),
+                "reconstruction_loss": reconstruction_loss.item(),
+                "temp_penalty": total_temp_penalty.item(),
+            })
+            
+        print(f"Epoch {epoch+1} average training loss: {total_epoch_loss / num_training_batches:.4f}")
+
+        # Validation Loop
+        model.eval()
+        total_val_loss = 0
+        with torch.no_grad():
+            for batch in val_loader:
+                inputs = {k: v.to(model.device) for k, v in batch.items()}
+                outputs = model(**inputs)
+                total_val_loss += outputs.loss.item()
+        avg_val_loss = total_val_loss / len(val_loader)
+        print(f"Epoch {epoch+1} validation loss: {avg_val_loss:.4f}")
+        wandb.log({"val_loss": avg_val_loss, "epoch": epoch})
+
+    print("--- VTSR Fine-tuning complete ---")
+
+    save_granite_bayesian_routers(model, method="vtsr", args=args)
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Fine-tune the Variational Temperature Router (VTSR) layer by layer.")
     parser.add_argument("--model_shortcode", type=str, required=True)
     parser.add_argument("--dataset_shortcode", type=str, required=True)
     parser.add_argument("--base_adapter_path", type=str, required=True)
-    parser.add_argument("--temperature_mode", type=str, required=True, choices=['per_expert', 'shared'])
     
     # New arguments for layer-wise control
     parser.add_argument("--swap_layers", type=int, nargs='+', required=True, help="All layers that should be VTSRs.")
@@ -24,6 +92,8 @@ def parse_args():
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--lr", type=float, default=1e-5, help="Learning rate for the optimizer.")
+    parser.add_argument("--temp_penalty_weight", type=float, default=1e-3, help="Weight for the -log(T) penalty term to prevent temperature collapse.")
     return parser.parse_args()
 
 def main():
@@ -31,97 +101,22 @@ def main():
     setup_environment()
     args = parse_args()
 
-    # Define internal paths and run name
-    output_root_dir = f"./router_weights/vtsr_{args.temperature_mode}"
-    run_name = f"vtsr_{args.temperature_mode}-{args.model_shortcode}-{args.dataset_shortcode}"
-    output_dir = os.path.join(output_root_dir, run_name)
-
     # 1. Load the base model and attach the Stage 1 fine-tuned adapter
     model = load_peft_model_and_adapter(
         args.model_shortcode,
         adapter_path=args.base_adapter_path,
-        device_map="auto"
+        device_map="cuda:1"
     )
     tokenizer = load_tokenizer(args.model_shortcode)
 
-    # 2. Load the pre-trained MAP routers into the model as a starting point
-    print("--- Loading base MAP routers ---")
-    causal_model = model.base_model.model.model
-    map_run_name = f"{args.model_shortcode}_{args.dataset_shortcode}"
-    map_weights_dir = f"./router_weights/base/{map_run_name}"
-    
-    for i, layer in enumerate(causal_model.layers):
-        map_router = MoERouter(config=causal_model.config)
-        map_weights_path = os.path.join(map_weights_dir, f"layer_{i}_weights.pt")
-        map_router.load_weights(map_weights_path, device=model.device)
-        layer.block_sparse_moe.router = map_router
-
-    # 3. Perform the flexible "Lego Swap" for VTSRs
-    print("--- Swapping in VariationalTemperatureRouters ---")
-    for layer_idx in args.swap_layers:
-        target_layer = causal_model.layers[layer_idx]
-        
-        new_router = VariationalTemperatureRouter(
-            config=causal_model.config,
-            existing_router=target_layer.block_sparse_moe.router,
-            temperature_mode=args.temperature_mode
-        )
-        
-        if layer_idx in args.load_layers:
-            print(f"Loading pre-trained VTSR for layer {layer_idx}...")
-            weights_path = os.path.join(output_dir, f"layer_{layer_idx}_weights.pt")
-            new_router.load_weights(weights_path, device=model.device)
-        
-        target_layer.block_sparse_moe.router = new_router.to(model.device)
-
-    # 4. Freeze all parameters, then unfreeze only the target training layers
-    print("--- Setting trainable parameters ---")
-    for param in model.parameters():
-        param.requires_grad = False
-    
-    for layer_idx in args.train_layers:
-        print(f"Unfreezing router in layer {layer_idx} for training.")
-        for param in causal_model.layers[layer_idx].block_sparse_moe.router.temperature_net.parameters():
-            param.requires_grad = True
-
-    # 5. Load data and train
+    # 2. Load data
     train_dataset, val_dataset = load_and_prepare_train_and_val_data(tokenizer, [args.dataset_shortcode])
-
-    project_name = "bayesian-router-finetuning"
-    wandb.init(project=project_name, name=run_name, config=vars(args), reinit=True)
-
-    training_args = TrainingArguments(
-        output_dir=f"./intermediate_checkpoints/{run_name}",
-        num_train_epochs=args.epochs,
-        per_device_train_batch_size=args.batch_size,
-        per_device_eval_batch_size=args.batch_size,
-        report_to="wandb",
-        logging_steps=10,
-        eval_strategy="epoch",
-        save_strategy="epoch",
-        load_best_model_at_end=True,
-        metric_for_best_model="eval_loss",
-        greater_is_better=False,
-        save_total_limit=1,
-        seed=args.seed,
-    )
-    trainer = Trainer(
-        model=model, args=training_args,
-        train_dataset=train_dataset, eval_dataset=val_dataset,
-        tokenizer=tokenizer,
-        data_collator=DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False),
-        callbacks=[EarlyStoppingCallback(early_stopping_patience=2)]
-    )
+    data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, collate_fn=data_collator, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, collate_fn=data_collator)
     
-    print(f"--- Starting Fine-tuning for VTSR layers: {args.train_layers} ---")
-    trainer.train()
-    print("--- Fine-tuning complete ---")
-    
-    # 6. Save the final weights for ALL swapped VTSR layers
-    print("--- Saving final weights for all swapped VTSRs ---")
-    for layer_idx in args.swap_layers:
-        save_path = os.path.join(output_dir, f"layer_{layer_idx}_weights.pt")
-        causal_model.layers[layer_idx].block_sparse_moe.router.save_weights(save_path)
+    # 3. Call the dedicated training function
+    train(model, tokenizer, train_loader, val_loader, args)
 
 if __name__ == "__main__":
     main()

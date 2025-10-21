@@ -3,8 +3,6 @@
 import torch
 import torch.nn as nn
 import os
-from tqdm import tqdm
-import wandb
 
 
 from .base import MoERouter

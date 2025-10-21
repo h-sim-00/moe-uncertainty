@@ -7,7 +7,7 @@
 from utils import setup_environment
 import argparse
 from model import load_model, load_tokenizer
-from utils import (load_exp_dataset, 
+from utils import (load_classification_dataset, 
                    get_model_predictions, 
                    calculate_accuracy, calculate_ece_mce, calculate_nll)
 import torch
@@ -57,13 +57,12 @@ def main():
     tokenizer = load_tokenizer(args.model_shortcode)
 
     # 3. Load the dataset & zero-shot evaluation
-    dataset_shortcodes = ["obqa", "arc_c", "arc_e", "mmlu_law", "medmcqa_med", "sciq"]
-    # dataset_shortcodes = ["medmcqa_med", "sciq"]
+    dataset_shortcodes = ["hs_us_his", "hs_gp", "hs_psy", "soc", "jp", "phi", "pro_law", "abs_alg", "cs", "med_gen"]
     all_results = []
 
     for shortcode in dataset_shortcodes:
         print(f"\nLoading and processing dataset: {shortcode}")
-        test_raw_dataset = load_exp_dataset(shortcode, split="test")
+        test_raw_dataset = load_classification_dataset(shortcode)[2]
         results = evaluate(model, tokenizer, test_raw_dataset, dataset_name=shortcode)
         all_results.append(results)
 
