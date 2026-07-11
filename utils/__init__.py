@@ -6,8 +6,7 @@ from tqdm import tqdm
 import torch.nn.functional as F
 
 def setup_environment():
-    """Configures HuggingFace cache and logs into services."""
-    # These paths are specific to your cluster environment
+    """Configures HuggingFace cache and logs into services using environment variables."""
     try:
         import google.colab
         IN_COLAB = True
@@ -15,29 +14,28 @@ def setup_environment():
         IN_COLAB = False
 
     if not IN_COLAB:
-        print("Setting up new cache paths for huggingface and Wandb...")
-        
-        HF_HOME = "/vol/bitbucket/al1624/.cache/huggingface"
-        HF_DATASETS_CACHE = "/vol/bitbucket/al1624/.cache/huggingface/datasets"
-        HF_HUB_CACHE="/vol/bitbucket/al1624/.cache/huggingface/hub"
-        WANDB_STORAGE_DIR = "/vol/bitbucket/al1624/.cache/wandb"
+        os.environ.setdefault("HF_HOME", os.path.expanduser("~/.cache/huggingface"))
+        os.environ.setdefault("HF_DATASETS_CACHE", os.path.join(os.environ["HF_HOME"], "datasets"))
+        os.environ.setdefault("HF_HUB_CACHE", os.path.join(os.environ["HF_HOME"], "hub"))
+        os.environ.setdefault("WANDB_DIR", os.path.expanduser("~/.cache/wandb"))
+        os.makedirs(os.environ["WANDB_DIR"], exist_ok=True)
+        print(f"Using HF_HOME={os.environ['HF_HOME']}, WANDB_DIR={os.environ['WANDB_DIR']}")
 
-        os.makedirs(WANDB_STORAGE_DIR, exist_ok=True)
+    # Login to HuggingFace using HF_TOKEN from the environment, if set
+    hf_token = os.environ.get("HF_TOKEN")
+    if hf_token:
+        print("Logging into HuggingFace...")
+        hf_login(token=hf_token)
+        print("Login successful.")
+    else:
+        print("HF_TOKEN not set in environment; skipping explicit HuggingFace login.")
 
-        os.environ['HF_HOME'] = HF_HOME
-        os.environ['HF_DATASETS_CACHE'] = HF_DATASETS_CACHE
-        os.environ['HF_HUB_CACHE'] = HF_HUB_CACHE
-        os.environ['WANDB_DIR'] = WANDB_STORAGE_DIR
-
-    # Login to HuggingFace
-    print("Logging into HuggingFace...")
-    HF_TOKEN = "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"
-    hf_login(token=HF_TOKEN)
-    print("Login successful.")
-
-    # Login to Wandb
-    WANDB_KEY = "8d44174f1416d56dc5470b57deb50339b19f22e7"
-    wandb.login(key=WANDB_KEY)
+    # Login to Wandb using WANDB_API_KEY from the environment, if set
+    wandb_key = os.environ.get("WANDB_API_KEY")
+    if wandb_key:
+        wandb.login(key=wandb_key)
+    else:
+        print("WANDB_API_KEY not set in environment; skipping explicit W&B login.")
 
 from .data import (
     load_generation_dataset,
