@@ -132,41 +132,56 @@ def get_predictions(model, tokenizer, dataset, args):
     
     return probs, labels
 
-def compute_gate_entropy(model, tokenizer, dataset, args, gate_layers):
-    """
-    Computes the paper's 'Gate-Ent' OOD signal: the Shannon entropy of the router's
-    expert-gating distribution p = softmax(router_logits) over the N experts, taken at
-    the final predictive token and averaged across the Bayesian-modified layers.
+# Susceptible ("most brittle") MoE layers for Granite-3B identified via the paper's
+# brittleness analysis (Appendix B.1): transition regions 5-8, 19-20, 28-31.
+SUSCEPTIBLE_LAYERS_GRANITE = [5, 6, 7, 8, 19, 20, 28, 29, 30, 31]
 
-    This is distinct from the model's predictive entropy over the A/B/C/D answer choices.
+
+def compute_uncertainty_signals(model, tokenizer, dataset, args):
+    """
+    Runs a single forward pass over `dataset` and extracts, at the final predictive token:
+      - answer_entropy: Shannon entropy of the predictive distribution over the A/B/C/D
+        answer choices (output-level uncertainty).
+      - per_layer_gate_entropy: dict {layer_idx: (num_examples,)} of Gate-Ent (paper Eq. 29),
+        the entropy of each router's expert-gating distribution p = softmax(router_logits)
+        over the N experts. Callers average these over whichever layer set they want.
+
+    Both signals come from the same forward pass, so adding gate layers is nearly free.
     """
     causal_model = model.base_model.model.model
-    if not gate_layers:
-        raise ValueError("compute_gate_entropy requires at least one gate layer to average over.")
+    num_layers = len(causal_model.layers)
 
-    # Register forward hooks that capture each targeted router's full expert logits.
-    # MoERouter.forward returns (..., router_logits); router_logits is (num_tokens, N).
+    # Answer-choice token ids (mirrors get_model_predictions).
+    choices = ['A', 'B', 'C', 'D']
+    choice_ids = torch.tensor(
+        [tokenizer.convert_tokens_to_ids(c) for c in choices], device=model.device
+    )
+
+    # Hook every router so we capture all layers' expert logits in one pass. Both the
+    # original Granite router and the swapped MoERouter return (..., router_logits) with
+    # router_logits of shape (num_tokens, N).
     captured = {}
     handles = []
 
     def make_hook(layer_idx):
         def hook(module, inputs, output):
-            router_logits = output[-1] if isinstance(output, (tuple, list)) else output
-            captured[layer_idx] = router_logits
+            captured[layer_idx] = output[-1] if isinstance(output, (tuple, list)) else output
         return hook
 
-    for i in gate_layers:
-        router = causal_model.layers[i].block_sparse_moe.router
-        handles.append(router.register_forward_hook(make_hook(i)))
+    for i in range(num_layers):
+        router = getattr(getattr(causal_model.layers[i], 'block_sparse_moe', None), 'router', None)
+        if router is not None:
+            handles.append(router.register_forward_hook(make_hook(i)))
 
     processed_dataset = [multiple_choice_prompt_engineer(x, tokenizer=tokenizer) for x in dataset]
     questions = [x['question'] for x in processed_dataset]
 
-    all_entropies = []
+    answer_entropies = []
+    per_layer_gate = {i: [] for i in range(num_layers)}
     model.eval()
     try:
         with torch.no_grad():
-            for start in tqdm(range(0, len(questions), args.batch_size), desc="Gate-Ent"):
+            for start in tqdm(range(0, len(questions), args.batch_size), desc="Uncertainty"):
                 batch_questions = questions[start:start + args.batch_size]
                 inputs = tokenizer(
                     batch_questions,
@@ -177,33 +192,49 @@ def compute_gate_entropy(model, tokenizer, dataset, args, gate_layers):
                 ).to(model.device)
 
                 captured.clear()
-                model(**inputs)
+                outputs = model(**inputs)
 
                 attn = inputs["attention_mask"]  # (B, L)
                 B, L = attn.shape
-                # Last real token per row (works for both left- and right-padding).
+                # Last real token per row (robust to both left- and right-padding).
                 positions = torch.arange(L, device=attn.device)
                 last_pos = (attn * positions).argmax(dim=1)  # (B,)
 
-                layer_entropies = []
-                for i in gate_layers:
+                # --- Answer entropy over A/B/C/D at the final token ---
+                batch_idx = torch.arange(B, device=model.device)
+                final_lm_logits = outputs.logits[batch_idx, last_pos, :]  # (B, vocab)
+                choice_logits = final_lm_logits[:, choice_ids]  # (B, 4)
+                ans_p = torch.softmax(choice_logits.float(), dim=-1)
+                ans_ent = -(ans_p * torch.log(ans_p + 1e-12)).sum(dim=-1)  # (B,)
+                answer_entropies.append(ans_ent.cpu())
+
+                # --- Per-layer Gate-Ent over N experts at the final token ---
+                idx_expand = last_pos.view(B, 1, 1)
+                for i in captured:
                     router_logits = captured[i].float()  # (B*L, N)
                     N = router_logits.shape[-1]
                     gate_logits = router_logits.reshape(B, L, N)  # row-major, matches Granite flatten
-                    idx = last_pos.view(B, 1, 1).expand(B, 1, N)
-                    final_logits = gate_logits.gather(1, idx).squeeze(1)  # (B, N)
-                    p = torch.softmax(final_logits, dim=-1)
+                    final_gate = gate_logits.gather(1, idx_expand.expand(B, 1, N)).squeeze(1)  # (B, N)
+                    p = torch.softmax(final_gate, dim=-1)
                     ent = -(p * torch.log(p + 1e-12)).sum(dim=-1)  # (B,)
-                    layer_entropies.append(ent)
-
-                # Average Gate-Ent across the modified layers.
-                mean_ent = torch.stack(layer_entropies, dim=0).mean(dim=0)  # (B,)
-                all_entropies.append(mean_ent.cpu())
+                    per_layer_gate[i].append(ent.cpu())
     finally:
         for h in handles:
             h.remove()
 
-    return torch.cat(all_entropies).numpy()
+    answer_entropy = torch.cat(answer_entropies).numpy()
+    per_layer_gate_entropy = {
+        i: torch.cat(v).numpy() for i, v in per_layer_gate.items() if v
+    }
+    return answer_entropy, per_layer_gate_entropy
+
+
+def _mean_gate_entropy(per_layer_gate_entropy, layers):
+    """Averages per-layer Gate-Ent over the given layer indices -> (num_examples,)."""
+    available = [i for i in layers if i in per_layer_gate_entropy]
+    if not available:
+        raise ValueError(f"No captured gate entropy for requested layers {layers}.")
+    return np.mean([per_layer_gate_entropy[i] for i in available], axis=0)
 
 
 def run_id_calibration(model, tokenizer, args):
@@ -226,33 +257,50 @@ def run_id_calibration(model, tokenizer, args):
     return results
 
 def run_ood_detection(model, tokenizer, args):
-    """Runs the Out-of-Distribution Detection task."""
+    """Runs the Out-of-Distribution Detection task.
+
+    For every OOD dataset we score three uncertainty signals, all extracted from the same
+    forward pass, and store AUROC/AUPRC for each:
+      - answer_entropy:         predictive entropy over the A/B/C/D answer choices.
+      - gate_ent_all:           Gate-Ent averaged over all MoE layers.
+      - gate_ent_susceptible:   Gate-Ent averaged over the 10 susceptible Granite layers.
+    """
     print("\n--- Running Task: OOD Detection ---")
     results = {}
 
-    # Gate-Ent (paper Eq. 29): entropy of the router's expert-gating distribution at the
-    # final predictive token, averaged across the Bayesian-modified layers. Average over the
-    # same layer set that was swapped (defaults to all layers if --swap_layers is unset).
     num_layers = len(model.base_model.model.model.layers)
-    gate_layers = list(args.swap_layers) if args.swap_layers is not None else list(range(num_layers))
-    print(f"Computing Gate-Ent averaged over modified layers: {gate_layers}")
+    all_layers = list(range(num_layers))
+    susceptible_layers = [i for i in SUSCEPTIBLE_LAYERS_GRANITE if i < num_layers]
+    print(f"Gate-Ent layer sets -> all: {all_layers} | susceptible: {susceptible_layers}")
+
+    # Named signal -> callable mapping the (answer_entropy, per_layer_gate) pair to a score.
+    signal_fns = {
+        'answer_entropy': lambda ans, gate: ans,
+        'gate_ent_all': lambda ans, gate: _mean_gate_entropy(gate, all_layers),
+        'gate_ent_susceptible': lambda ans, gate: _mean_gate_entropy(gate, susceptible_layers),
+    }
 
     id_dataset = load_exp_dataset("obqa", split="test")
-    id_entropy = compute_gate_entropy(model, tokenizer, id_dataset, args, gate_layers)
+    id_ans, id_gate = compute_uncertainty_signals(model, tokenizer, id_dataset, args)
+    id_scores = {name: fn(id_ans, id_gate) for name, fn in signal_fns.items()}
 
     ood_datasets = {"arc_e": "small", "arc_c": "small", "medmcqa_med": "large", "mmlu_law": "large"}
     for ood_code, shift_type in ood_datasets.items():
         print(f"Evaluating OOD against: {ood_code} ({shift_type} shift)")
         ood_dataset = load_exp_dataset(ood_code, split="test")
-        ood_entropy = compute_gate_entropy(model, tokenizer, ood_dataset, args, gate_layers)
+        ood_ans, ood_gate = compute_uncertainty_signals(model, tokenizer, ood_dataset, args)
 
-        scores = np.concatenate([id_entropy, ood_entropy])
-        labels = np.concatenate([np.zeros_like(id_entropy), np.ones_like(ood_entropy)])
-        
-        auroc = roc_auc_score(labels, scores)
-        auprc = average_precision_score(labels, scores)
-        
-        results[ood_code] = {'auroc': auroc, 'auprc': auprc, 'shift_type': shift_type}
+        entry = {'shift_type': shift_type}
+        for name, fn in signal_fns.items():
+            ood_score = fn(ood_ans, ood_gate)
+            scores = np.concatenate([id_scores[name], ood_score])
+            labels = np.concatenate([np.zeros_like(id_scores[name]), np.ones_like(ood_score)])
+            entry[name] = {
+                'auroc': roc_auc_score(labels, scores),
+                'auprc': average_precision_score(labels, scores),
+            }
+
+        results[ood_code] = entry
         print(results[ood_code])
     return results
 
