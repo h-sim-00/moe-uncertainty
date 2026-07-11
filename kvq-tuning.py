@@ -14,7 +14,7 @@ def train(model, tokenizer, train_loader, val_loader, args):
     Fine-tunes a model using the Hugging Face Trainer API.
     """
     project_name = "moe-uncertainty"
-    run_name = f"kvq-{args.model_shortcode}-{args.dataset_shortcode}"
+    run_name = f"{args.model_shortcode}_{args.dataset_shortcode}"
     wandb.init(project=project_name, name=run_name, config=vars(args), reinit=True)
     
     num_training_batches = len(train_loader)
@@ -54,7 +54,7 @@ def train(model, tokenizer, train_loader, val_loader, args):
 
 
     # Updated final save path format
-    final_save_path = f"./adapters/{run_name}"
+    final_save_path = f"./adapters/{args.model_shortcode}-{args.dataset_shortcode}"
     print(f"Saving the best adapter weights to {final_save_path}")
     model.save_pretrained(final_save_path)
 
