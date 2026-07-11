@@ -284,9 +284,16 @@ def run_ood_detection(model, tokenizer, args):
     id_ans, id_gate = compute_uncertainty_signals(model, tokenizer, id_dataset, args)
     id_scores = {name: fn(id_ans, id_gate) for name, fn in signal_fns.items()}
 
+    # --- Diagnostics: mean Gate-Ent for ID (per-layer) to reveal the signal's direction ---
+    print("\n[diag] ID (obqa) mean Gate-Ent per layer:")
+    print("       " + "  ".join(f"L{i}:{np.mean(id_gate[i]):.3f}" for i in sorted(id_gate)))
+    print(f"[diag] ID mean answer_entropy      = {np.mean(id_scores['answer_entropy']):.4f}")
+    print(f"[diag] ID mean gate_ent_all        = {np.mean(id_scores['gate_ent_all']):.4f}")
+    print(f"[diag] ID mean gate_ent_susceptible= {np.mean(id_scores['gate_ent_susceptible']):.4f}")
+
     ood_datasets = {"arc_e": "small", "arc_c": "small", "medmcqa_med": "large", "mmlu_law": "large"}
     for ood_code, shift_type in ood_datasets.items():
-        print(f"Evaluating OOD against: {ood_code} ({shift_type} shift)")
+        print(f"\nEvaluating OOD against: {ood_code} ({shift_type} shift)")
         ood_dataset = load_exp_dataset(ood_code, split="test")
         ood_ans, ood_gate = compute_uncertainty_signals(model, tokenizer, ood_dataset, args)
 
@@ -295,10 +302,14 @@ def run_ood_detection(model, tokenizer, args):
             ood_score = fn(ood_ans, ood_gate)
             scores = np.concatenate([id_scores[name], ood_score])
             labels = np.concatenate([np.zeros_like(id_scores[name]), np.ones_like(ood_score)])
-            entry[name] = {
-                'auroc': roc_auc_score(labels, scores),
-                'auprc': average_precision_score(labels, scores),
-            }
+            auroc = roc_auc_score(labels, scores)
+            entry[name] = {'auroc': auroc, 'auprc': average_precision_score(labels, scores)}
+
+            # Direction check: OoD should score HIGHER than ID for AUROC > 0.5.
+            id_mean, ood_mean = np.mean(id_scores[name]), np.mean(ood_score)
+            direction = "OoD>ID (expected)" if ood_mean > id_mean else "OoD<ID (INVERTED)"
+            print(f"[diag]   {name:20s} ID={id_mean:.4f} OoD={ood_mean:.4f} "
+                  f"-> {direction}, AUROC={auroc:.4f}")
 
         results[ood_code] = entry
         print(results[ood_code])
