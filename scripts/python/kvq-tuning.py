@@ -13,8 +13,8 @@ def train(model, tokenizer, train_loader, val_loader, args):
     """
     Fine-tunes a model using the Hugging Face Trainer API.
     """
-    project_name = "kvq-finetuning"
-    run_name = f"{args.model_shortcode}_{args.dataset_shortcode}"
+    project_name = "moe-uncertainty"
+    run_name = f"kvq-{args.model_shortcode}-{args.dataset_shortcode}"
     wandb.init(project=project_name, name=run_name, config=vars(args), reinit=True)
     
     num_training_batches = len(train_loader)

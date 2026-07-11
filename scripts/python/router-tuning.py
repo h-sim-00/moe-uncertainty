@@ -32,7 +32,7 @@ def train(model, tokenizer, train_loader, val_loader, args):
     prepare_for_tuning_func = adapter["prepare"]
     save_map_routers_func = adapter["save"]
     
-    run_name = f"{args.model_shortcode}_{args.dataset_shortcode}"
+    run_name = f"map-router-{args.model_shortcode}-{args.dataset_shortcode}"
 
     # === 1. Prepare Model for Training ===
     model = prepare_for_tuning_func(model)
@@ -42,7 +42,7 @@ def train(model, tokenizer, train_loader, val_loader, args):
     optimizer = torch.optim.Adam(trainable_params, lr=args.lr)
 
     # === 3. Run Custom Training Loop ===
-    project_name = "router-finetuning"
+    project_name = "moe-uncertainty"
     wandb.init(project=project_name, name=run_name, config=vars(args), reinit=True)
 
     num_training_batches = len(train_loader)

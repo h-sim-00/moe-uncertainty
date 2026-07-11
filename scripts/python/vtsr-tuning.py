@@ -48,7 +48,7 @@ def train(model, tokenizer, train_loader, val_loader, args):
     optimizer = torch.optim.Adam(trainable_params, lr=args.lr)
 
     # === 3. Run Custom Training Loop ===
-    project_name = "bayesian-router-finetuning"
+    project_name = "moe-uncertainty"
     wandb.init(project=project_name, name=run_name, config=vars(args), reinit=True)
     
     num_training_batches = len(train_loader)
