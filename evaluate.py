@@ -11,6 +11,7 @@ import numpy as np
 from utils import setup_environment, load_exp_dataset
 from model import load_peft_model_and_adapter, load_tokenizer
 from utils import get_model_predictions, calculate_accuracy, calculate_ece_mce, calculate_nll
+from utils import multiple_choice_prompt_engineer
 
 # --- Import All Router Classes ---
 from model.routers.base import MoERouter
@@ -131,6 +132,80 @@ def get_predictions(model, tokenizer, dataset, args):
     
     return probs, labels
 
+def compute_gate_entropy(model, tokenizer, dataset, args, gate_layers):
+    """
+    Computes the paper's 'Gate-Ent' OOD signal: the Shannon entropy of the router's
+    expert-gating distribution p = softmax(router_logits) over the N experts, taken at
+    the final predictive token and averaged across the Bayesian-modified layers.
+
+    This is distinct from the model's predictive entropy over the A/B/C/D answer choices.
+    """
+    causal_model = model.base_model.model.model
+    if not gate_layers:
+        raise ValueError("compute_gate_entropy requires at least one gate layer to average over.")
+
+    # Register forward hooks that capture each targeted router's full expert logits.
+    # MoERouter.forward returns (..., router_logits); router_logits is (num_tokens, N).
+    captured = {}
+    handles = []
+
+    def make_hook(layer_idx):
+        def hook(module, inputs, output):
+            router_logits = output[-1] if isinstance(output, (tuple, list)) else output
+            captured[layer_idx] = router_logits
+        return hook
+
+    for i in gate_layers:
+        router = causal_model.layers[i].block_sparse_moe.router
+        handles.append(router.register_forward_hook(make_hook(i)))
+
+    processed_dataset = [multiple_choice_prompt_engineer(x, tokenizer=tokenizer) for x in dataset]
+    questions = [x['question'] for x in processed_dataset]
+
+    all_entropies = []
+    model.eval()
+    try:
+        with torch.no_grad():
+            for start in tqdm(range(0, len(questions), args.batch_size), desc="Gate-Ent"):
+                batch_questions = questions[start:start + args.batch_size]
+                inputs = tokenizer(
+                    batch_questions,
+                    return_tensors="pt",
+                    padding=True,
+                    truncation=True,
+                    max_length=2048,
+                ).to(model.device)
+
+                captured.clear()
+                model(**inputs)
+
+                attn = inputs["attention_mask"]  # (B, L)
+                B, L = attn.shape
+                # Last real token per row (works for both left- and right-padding).
+                positions = torch.arange(L, device=attn.device)
+                last_pos = (attn * positions).argmax(dim=1)  # (B,)
+
+                layer_entropies = []
+                for i in gate_layers:
+                    router_logits = captured[i].float()  # (B*L, N)
+                    N = router_logits.shape[-1]
+                    gate_logits = router_logits.reshape(B, L, N)  # row-major, matches Granite flatten
+                    idx = last_pos.view(B, 1, 1).expand(B, 1, N)
+                    final_logits = gate_logits.gather(1, idx).squeeze(1)  # (B, N)
+                    p = torch.softmax(final_logits, dim=-1)
+                    ent = -(p * torch.log(p + 1e-12)).sum(dim=-1)  # (B,)
+                    layer_entropies.append(ent)
+
+                # Average Gate-Ent across the modified layers.
+                mean_ent = torch.stack(layer_entropies, dim=0).mean(dim=0)  # (B,)
+                all_entropies.append(mean_ent.cpu())
+    finally:
+        for h in handles:
+            h.remove()
+
+    return torch.cat(all_entropies).numpy()
+
+
 def run_id_calibration(model, tokenizer, args):
     """Runs the In-Distribution Calibration task."""
     print("\n--- Running Task: ID Calibration ---")
@@ -154,18 +229,23 @@ def run_ood_detection(model, tokenizer, args):
     """Runs the Out-of-Distribution Detection task."""
     print("\n--- Running Task: OOD Detection ---")
     results = {}
-    
+
+    # Gate-Ent (paper Eq. 29): entropy of the router's expert-gating distribution at the
+    # final predictive token, averaged across the Bayesian-modified layers. Average over the
+    # same layer set that was swapped (defaults to all layers if --swap_layers is unset).
+    num_layers = len(model.base_model.model.model.layers)
+    gate_layers = list(args.swap_layers) if args.swap_layers is not None else list(range(num_layers))
+    print(f"Computing Gate-Ent averaged over modified layers: {gate_layers}")
+
     id_dataset = load_exp_dataset("obqa", split="test")
-    id_probs, _ = get_predictions(model, tokenizer, id_dataset, args)
-    id_entropy = torch.distributions.Categorical(probs=id_probs).entropy().numpy()
-    
-    ood_datasets = {"arc_c": "small", "medmcqa_med": "large", "mmlu_law": "large", "sciq": "large"}
+    id_entropy = compute_gate_entropy(model, tokenizer, id_dataset, args, gate_layers)
+
+    ood_datasets = {"arc_e": "small", "arc_c": "small", "medmcqa_med": "large", "mmlu_law": "large"}
     for ood_code, shift_type in ood_datasets.items():
         print(f"Evaluating OOD against: {ood_code} ({shift_type} shift)")
         ood_dataset = load_exp_dataset(ood_code, split="test")
-        ood_probs, _ = get_predictions(model, tokenizer, ood_dataset, args)
-        ood_entropy = torch.distributions.Categorical(probs=ood_probs).entropy().numpy()
-        
+        ood_entropy = compute_gate_entropy(model, tokenizer, ood_dataset, args, gate_layers)
+
         scores = np.concatenate([id_entropy, ood_entropy])
         labels = np.concatenate([np.zeros_like(id_entropy), np.ones_like(ood_entropy)])
         
