@@ -42,6 +42,11 @@ BATCH_SIZE=4
 LEARNING_RATE=1e-5
 BETA=0.01
 
+# Suffix for the FCVR weights directory so this NON-progressive run does not
+# overwrite the progressive run's weights (they overlap on layers 28-31).
+# Weights -> ./router_weights/fcvr/fcvr-<model>-<dataset>-${RUN_SUFFIX}/
+RUN_SUFFIX="susceptible-nonprog"
+
 # Layers to apply FCVR to (trained jointly in one run).
 # Chosen set: {5,6,7,8, 19,20, 28,29,30,31}  (Susceptible-10 minus layers 0-1)
 LAYERS=(5 6 7 8 19 20 28 29 30 31)
@@ -83,9 +88,10 @@ python scripts/python/fcvr-tuning.py \
     --batch_size "$BATCH_SIZE" \
     --lr "$LEARNING_RATE" \
     --beta "$BETA" \
-    --seed "$SEED"
+    --seed "$SEED" \
+    --run_suffix "$RUN_SUFFIX"
 
 echo "===================================================="
 echo "FCVR training complete."
-echo "Weights saved under ./router_weights/fcvr/fcvr-${MODEL_SHORTCODE}-${DATASET_SHORTCODE}/"
+echo "Weights saved under ./router_weights/fcvr/fcvr-${MODEL_SHORTCODE}-${DATASET_SHORTCODE}-${RUN_SUFFIX}/"
 echo "===================================================="

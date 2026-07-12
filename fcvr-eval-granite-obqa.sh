@@ -38,9 +38,13 @@ NUM_SAMPLES=35
 # FCVR layers (must match fcvr-tuning-granite-obqa.sh)
 LAYERS=(5 6 7 8 19 20 28 29 30 31)
 
+# Must match the training run's RUN_SUFFIX so we load the right weights dir
+# (and never touch the progressive run's fcvr-granite-obqa/ weights).
+RUN_SUFFIX="susceptible-nonprog"
+
 BASE_ADAPTER_PATH="./adapters/${MODEL_SHORTCODE}-${DATASET_SHORTCODE}"
 MAP_WEIGHTS_DIR="./router_weights/base/${MODEL_SHORTCODE}_${DATASET_SHORTCODE}"
-FCVR_WEIGHTS_DIR="./router_weights/fcvr/fcvr-${MODEL_SHORTCODE}-${DATASET_SHORTCODE}"
+FCVR_WEIGHTS_DIR="./router_weights/fcvr/fcvr-${MODEL_SHORTCODE}-${DATASET_SHORTCODE}-${RUN_SUFFIX}"
 RESULTS_DIR="./results/fcvr"
 
 # --- Prerequisite checks (fail fast) ---
@@ -80,7 +84,8 @@ python evaluate_fcvr.py \
     --dataset_shortcode "$DATASET_SHORTCODE" \
     --kvq_adapter_path "$BASE_ADAPTER_PATH" \
     --swap_layers "${LAYERS[@]}" \
-    --output_json_path "${RESULTS_DIR}/id_calib_fcvr-${MODEL_SHORTCODE}-${DATASET_SHORTCODE}_layers-${LAYER_TAG}.json" \
+    --run_suffix "$RUN_SUFFIX" \
+    --output_json_path "${RESULTS_DIR}/id_calib_fcvr-${MODEL_SHORTCODE}-${DATASET_SHORTCODE}-${RUN_SUFFIX}_layers-${LAYER_TAG}.json" \
     --num_samples "$NUM_SAMPLES" \
     --batch_size "$BATCH_SIZE" \
     --seed "$SEED"
@@ -93,7 +98,8 @@ python evaluate_fcvr.py \
     --dataset_shortcode "$DATASET_SHORTCODE" \
     --kvq_adapter_path "$BASE_ADAPTER_PATH" \
     --swap_layers "${LAYERS[@]}" \
-    --output_json_path "${RESULTS_DIR}/ood_detect_fcvr-${MODEL_SHORTCODE}-${DATASET_SHORTCODE}_layers-${LAYER_TAG}.json" \
+    --run_suffix "$RUN_SUFFIX" \
+    --output_json_path "${RESULTS_DIR}/ood_detect_fcvr-${MODEL_SHORTCODE}-${DATASET_SHORTCODE}-${RUN_SUFFIX}_layers-${LAYER_TAG}.json" \
     --num_samples "$NUM_SAMPLES" \
     --batch_size "$BATCH_SIZE" \
     --seed "$SEED"

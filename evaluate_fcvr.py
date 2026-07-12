@@ -50,6 +50,8 @@ def parse_args():
                         help="Path to the Stage-1 fine-tuned KVQ LoRA adapter.")
     parser.add_argument("--swap_layers", type=int, nargs="+", required=True,
                         help="Layers that carry a trained FCVR router.")
+    parser.add_argument("--run_suffix", type=str, default=None,
+                        help="Suffix on the FCVR weights dir; must match the training run's --run_suffix.")
     parser.add_argument("--output_json_path", type=str, required=True)
 
     parser.add_argument("--num_samples", type=int, default=35, help="MC samples for FCVR inference.")

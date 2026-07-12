@@ -146,10 +146,15 @@ def save_granite_bayesian_routers(model, method, args):
     if method == 'vtsr':
         output_root_dir += f"_{args.temperature_mode}"
     run_name = f"{method}-{args.model_shortcode}-{args.dataset_shortcode}"
+    # Optional suffix to keep independent runs (e.g. non-progressive on a
+    # different layer set) from overwriting each other's weights.
+    run_suffix = getattr(args, "run_suffix", None)
+    if run_suffix:
+        run_name = f"{run_name}-{run_suffix}"
     save_dir = os.path.join(output_root_dir, run_name)
-    
+
     causal_model = model.base_model.model.model
-    
+
     # Save all swapped layers to preserve state for progressive training
     for layer_idx in args.swap_layers:
         save_path = os.path.join(save_dir, f"layer_{layer_idx}_weights.pt")
@@ -169,10 +174,14 @@ def load_granite_bayesian_routers(model, method, args):
     
     output_root_dir = f"./router_weights/{method}"
     run_name = f"{method}-{args.model_shortcode}-{args.dataset_shortcode}"
+    # Mirror the optional suffix used at save time.
+    run_suffix = getattr(args, "run_suffix", None)
+    if run_suffix:
+        run_name = f"{run_name}-{run_suffix}"
     weights_dir = os.path.join(output_root_dir, run_name)
-    
+
     causal_model = model.base_model.model.model
-    
+
     # Swap layers specified in args, or all layers if not specified
     swap_layers = args.swap_layers if args.swap_layers is not None else range(len(causal_model.layers))
 
