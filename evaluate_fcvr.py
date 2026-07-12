@@ -52,6 +52,8 @@ def parse_args():
                         help="Layers that carry a trained FCVR router.")
     parser.add_argument("--run_suffix", type=str, default=None,
                         help="Suffix on the FCVR weights dir; must match the training run's --run_suffix.")
+    parser.add_argument("--prior_source", type=str, default="map", choices=["map", "pretrained"],
+                        help="Must match the training run: FCVR mean_base from fine-tuned MAP ('map') or pre-trained Granite ('pretrained').")
     parser.add_argument("--output_json_path", type=str, required=True)
 
     parser.add_argument("--num_samples", type=int, default=35, help="MC samples for FCVR inference.")
@@ -61,13 +63,20 @@ def parse_args():
 
 
 def prepare_model_fcvr(model, args):
-    """Faithful reconstruction: fine-tuned MAP on all layers, FCVR on swap_layers."""
-    print("--- Preparing FCVR model (faithful MAP reconstruction) ---")
-    # 1. Fine-tuned MAP routers into all 32 layers (also seeds FCVR mean_base).
-    model = granite_adapter.load_granite_map_routers(model, args=args)
+    """Reconstruct the trained model. Non-FCVR layers stay as the chosen prior
+    routers; FCVR layers get their trained variational weights (mean_base seeded
+    from the same prior). Must mirror how the run was trained."""
+    print(f"--- Preparing FCVR model (prior_source={args.prior_source}) ---")
+    # 1. Set the deterministic routers on all 32 layers. For prior_source=map,
+    #    load the fine-tuned MAP routers (also seeds FCVR mean_base); for
+    #    prior_source=pretrained, leave the pre-trained Granite routers in place.
+    if args.prior_source == "map":
+        model = granite_adapter.load_granite_map_routers(model, args=args)
+    else:
+        print("--- prior_source=pretrained: keeping pre-trained Granite routers; FCVR mean_base seeds from them ---")
     # 2. Swap the selected layers to FCVR and load their trained weights.
-    #    load_granite_bayesian_routers reads swap_layers and loads
-    #    ./router_weights/fcvr/fcvr-<model>-<dataset>/layer_<i>_weights.pt
+    #    load_granite_bayesian_routers reads swap_layers + run_suffix and loads
+    #    ./router_weights/fcvr/fcvr-<model>-<dataset>-<suffix>/layer_<i>_weights.pt
     model = granite_adapter.load_granite_bayesian_routers(model, method="fcvr", args=args)
 
     # 3. Set the number of MC samples used at inference on each FCVR router.

@@ -1,23 +1,24 @@
 #!/bin/bash
 # ============================================================================
-# Stage 2 (paper: Variational Inference learning) -- FCVR / VGLR-FC training
-# Granite-MoE + FCVR on OBQA. All selected layers trained JOINTLY in a single
-# run (NO progressive per-layer training).
+# OVERNIGHT ORCHESTRATOR -- FCVR (VGLR-FC) Stage 2 on Granite-MoE / OBQA.
 #
-# Plain bash for running inside a tmux session over ssh (NO SLURM).
-# Adapted from scripts/bash/fcvr-tuning.sh but:
-#   - no SLURM header / al1624 cluster paths (env is handled by
-#     utils.setup_environment via os.environ.setdefault)
-#   - layer set = Susceptible layers {5-8, 19-20, 28-31} instead of last-5
-#   - single joint fit: swap all selected layers (init from MAP), train them
-#     all at once, load none -- rather than the repo's deepest-first loop
-#   - runs from the repo root; adds repo root to PYTHONPATH so the python
-#     source under scripts/python/ resolves `model` and `utils`.
+# Trains the Susceptible-10 layers {5-8, 19-20, 28-31} JOINTLY (non-progressive)
+# in TWO variants, then evaluates BOTH. Nothing overwrites anything: each
+# variant writes to its own weights dir and its own results files, and neither
+# touches the progressive run's ./router_weights/fcvr/fcvr-granite-obqa/.
 #
-# Prereq: Stage 1 (KVQ) adapter at ./adapters/granite-obqa AND all 32 MAP
-# router weights at ./router_weights/base/granite_obqa/layer_{0..31}_weights.pt
-# (FCVR loads all 32 MAP routers as the prior even though it only trains a
-# subset). FCVR weights are written to ./router_weights/fcvr/.
+#   Variant A "pretrained-prior"  -> paper-faithful: FCVR mean_base seeded from
+#                                    the PRE-TRAINED Granite router (no MAP load).
+#                                    Non-FCVR layers stay pre-trained deterministic.
+#   Variant B "map-prior"         -> inherited pipeline: FCVR mean_base seeded from
+#                                    the fine-tuned MAP routers (Stage 2a).
+#                                    Non-FCVR layers stay fine-tuned MAP.
+#
+# Plain bash for a tmux session over ssh (NO SLURM). Runs from the repo root.
+#
+# Prereq: Stage-1 (KVQ) adapter at ./adapters/granite-obqa.
+#         Variant B ALSO needs all 32 MAP router weights in
+#         ./router_weights/base/granite_obqa/ ; Variant A does not.
 # ============================================================================
 
 set -eo pipefail
@@ -30,10 +31,10 @@ export PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"
 # source "$(conda info --base)/etc/profile.d/conda.sh"
 # conda activate moe_env
 
-echo "Repo root:      $REPO_ROOT"
-echo "Python:         $(which python)"
+echo "Repo root: $REPO_ROOT"
+echo "Python:    $(which python)"
 
-# --- Parameters (repo defaults) ---
+# --- Common parameters (repo defaults) ---
 MODEL_SHORTCODE="granite"
 DATASET_SHORTCODE="obqa"
 SEED=42
@@ -42,56 +43,76 @@ BATCH_SIZE=4
 LEARNING_RATE=1e-5
 BETA=0.01
 
-# Suffix for the FCVR weights directory so this NON-progressive run does not
-# overwrite the progressive run's weights (they overlap on layers 28-31).
-# Weights -> ./router_weights/fcvr/fcvr-<model>-<dataset>-${RUN_SUFFIX}/
-RUN_SUFFIX="susceptible-nonprog"
-
-# Layers to apply FCVR to (trained jointly in one run).
-# Chosen set: {5,6,7,8, 19,20, 28,29,30,31}  (Susceptible-10 minus layers 0-1)
+# Susceptible-10 layers, trained jointly in one run.
 LAYERS=(5 6 7 8 19 20 28 29 30 31)
+
+# Two variants: parallel arrays indexed together.
+PRIOR_SOURCES=("pretrained" "map")
+RUN_SUFFIXES=("pretrained-prior" "map-prior")
 
 BASE_ADAPTER_PATH="./adapters/${MODEL_SHORTCODE}-${DATASET_SHORTCODE}"
 MAP_WEIGHTS_DIR="./router_weights/base/${MODEL_SHORTCODE}_${DATASET_SHORTCODE}"
 
-# --- Prerequisite checks (fail fast before loading the model) ---
+# --- Prereq: Stage-1 adapter (needed by both variants) ---
 if [ ! -d "$BASE_ADAPTER_PATH" ]; then
     echo "ERROR: Stage-1 adapter not found at $BASE_ADAPTER_PATH" >&2
     exit 1
 fi
-for i in $(seq 0 31); do
-    if [ ! -f "${MAP_WEIGHTS_DIR}/layer_${i}_weights.pt" ]; then
-        echo "ERROR: missing MAP router weights ${MAP_WEIGHTS_DIR}/layer_${i}_weights.pt" >&2
-        echo "       FCVR needs all 32 MAP routers as the prior. Run Stage 2a first." >&2
-        exit 1
-    fi
-done
 
 mkdir -p logs
 
-echo "===================================================="
-echo "Starting Joint FCVR (Stage 2) Fine-tuning"
-echo "Model: ${MODEL_SHORTCODE} | Dataset: ${DATASET_SHORTCODE}"
-echo "Layers (trained jointly): ${LAYERS[*]}"
-echo "epochs=${EPOCHS} batch=${BATCH_SIZE} lr=${LEARNING_RATE} beta=${BETA} seed=${SEED}"
-echo "===================================================="
+echo "############################################################"
+echo "# FCVR Stage 2 -- training BOTH variants, then evaluating   #"
+echo "# Layers: ${LAYERS[*]}"
+echo "# epochs=${EPOCHS} batch=${BATCH_SIZE} lr=${LEARNING_RATE} beta=${BETA} seed=${SEED}"
+echo "############################################################"
 
-# Joint fit: swap = train = all selected layers; load nothing (all init from MAP).
-python scripts/python/fcvr-tuning.py \
-    --model_shortcode "$MODEL_SHORTCODE" \
-    --dataset_shortcode "$DATASET_SHORTCODE" \
-    --base_adapter_path "$BASE_ADAPTER_PATH" \
-    --swap_layers "${LAYERS[@]}" \
-    --load_layers \
-    --train_layers "${LAYERS[@]}" \
-    --epochs "$EPOCHS" \
-    --batch_size "$BATCH_SIZE" \
-    --lr "$LEARNING_RATE" \
-    --beta "$BETA" \
-    --seed "$SEED" \
-    --run_suffix "$RUN_SUFFIX"
+for idx in 0 1; do
+    PRIOR="${PRIOR_SOURCES[$idx]}"
+    SUFFIX="${RUN_SUFFIXES[$idx]}"
 
-echo "===================================================="
-echo "FCVR training complete."
-echo "Weights saved under ./router_weights/fcvr/fcvr-${MODEL_SHORTCODE}-${DATASET_SHORTCODE}-${RUN_SUFFIX}/"
-echo "===================================================="
+    echo ""
+    echo "===================================================="
+    echo "TRAIN variant: prior_source=${PRIOR}  suffix=${SUFFIX}"
+    echo "Weights -> ./router_weights/fcvr/fcvr-${MODEL_SHORTCODE}-${DATASET_SHORTCODE}-${SUFFIX}/"
+    echo "===================================================="
+
+    # Variant B (map prior) needs all 32 MAP router weights.
+    if [ "$PRIOR" = "map" ]; then
+        for i in $(seq 0 31); do
+            if [ ! -f "${MAP_WEIGHTS_DIR}/layer_${i}_weights.pt" ]; then
+                echo "ERROR: missing MAP router weights ${MAP_WEIGHTS_DIR}/layer_${i}_weights.pt" >&2
+                echo "       Variant B (map-prior) needs all 32 MAP routers. Run Stage 2a first." >&2
+                exit 1
+            fi
+        done
+    fi
+
+    python scripts/python/fcvr-tuning.py \
+        --model_shortcode "$MODEL_SHORTCODE" \
+        --dataset_shortcode "$DATASET_SHORTCODE" \
+        --base_adapter_path "$BASE_ADAPTER_PATH" \
+        --swap_layers "${LAYERS[@]}" \
+        --load_layers \
+        --train_layers "${LAYERS[@]}" \
+        --epochs "$EPOCHS" \
+        --batch_size "$BATCH_SIZE" \
+        --lr "$LEARNING_RATE" \
+        --beta "$BETA" \
+        --seed "$SEED" \
+        --run_suffix "$SUFFIX" \
+        --prior_source "$PRIOR"
+done
+
+echo ""
+echo "############################################################"
+echo "# Training of both variants complete. Starting evaluation. #"
+echo "############################################################"
+
+# Evaluate both variants (fcvr-eval-granite-obqa.sh loops the same two variants).
+bash "$REPO_ROOT/fcvr-eval-granite-obqa.sh"
+
+echo ""
+echo "############################################################"
+echo "# ALL DONE. Two sets of results in ./results/fcvr/         #"
+echo "############################################################"
