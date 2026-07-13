@@ -1,8 +1,9 @@
 import argparse
+import math
 import os, torch, wandb
 from tqdm import tqdm
 from torch.utils.data import DataLoader
-from transformers import DataCollatorForLanguageModeling
+from transformers import DataCollatorForLanguageModeling, get_cosine_schedule_with_warmup
 
 from model.adapters import granite_adapter, qwen_adapter, deepseek_adapter
 
@@ -51,27 +52,42 @@ def train_fcvr_router(model, tokenizer, train_loader, val_loader, args):
     model = prepare_bayesian_routers(model, method="fcvr", args=args)
     causal_model = model.base_model.model.model
 
-    # === 2. Create Optimizer ===
+    # === 2. Create Optimizer + Cosine Schedule (paper D.2) ===
+    # AdamW + cosine decay with warmup_ratio warmup. Gradient accumulation lifts
+    # the per-device batch to the paper's effective batch of 16.
     trainable_params = [p for p in model.parameters() if p.requires_grad]
-    optimizer = torch.optim.Adam(trainable_params, lr=args.lr)
+    optimizer = torch.optim.AdamW(trainable_params, lr=args.lr)
+
+    num_training_batches = len(train_loader)
+    grad_accum = max(1, args.grad_accum_steps)
+    steps_per_epoch = math.ceil(num_training_batches / grad_accum)
+    total_optim_steps = steps_per_epoch * args.epochs
+    warmup_steps = int(args.warmup_ratio * total_optim_steps)
+    scheduler = get_cosine_schedule_with_warmup(
+        optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_optim_steps
+    )
+    print(f"--- Optim: AdamW lr={args.lr} cosine warmup={warmup_steps}/{total_optim_steps} steps "
+          f"| per-device batch={args.batch_size} x grad_accum={grad_accum} = eff batch {args.batch_size * grad_accum} ---")
 
     # === 3. Run Custom Training Loop ===
     project_name = "moe-uncertainty"
     wandb.init(project=project_name, name=run_name, config=vars(args), reinit=True)
-    
-    num_training_batches = len(train_loader)
-    
+
+    # Early stopping on validation NLL (the LM reconstruction loss).
+    best_val_loss = float("inf")
+    epochs_no_improve = 0
+
     print("--- Starting FCVR Fine-tuning (Custom Loop) ---")
     for epoch in range(args.epochs):
         model.train()
         total_epoch_loss = 0
-        for batch in tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}"):
-            optimizer.zero_grad()
+        optimizer.zero_grad()
+        for i, batch in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}")):
             inputs = {k: v.to(model.device) for k, v in batch.items()}
             outputs = model(**inputs)
-            
+
             reconstruction_loss = outputs.loss
-            
+
             total_kl_div = 0
             for layer_idx in args.train_layers:
                 if args.model_shortcode == "granite":
@@ -81,21 +97,34 @@ def train_fcvr_router(model, tokenizer, train_loader, val_loader, args):
                 elif args.model_shortcode == "deepseek":
                     router = causal_model.layers[layer_idx].mlp.router
                 total_kl_div += router.kl_divergence()
-            
-            kl_term = (args.beta / num_training_batches) * total_kl_div
+
+            # Paper-faithful ELBO weighting: loss = L_task + beta * sum_layers KL_layer,
+            # where each KL_layer is a per-token mean (see fcvr.py kl_divergence).
+            # No /num_training_batches: that was a global-latent recipe misapplied to
+            # this amortised per-token latent, and it made the effective beta depend
+            # on batch/dataset size.
+            kl_term = args.beta * total_kl_div
             loss = reconstruction_loss + kl_term
-            
-            loss.backward()
-            optimizer.step()
+
+            # Scale for gradient accumulation, then step every grad_accum
+            # micro-batches (and on the final micro-batch of the epoch).
+            (loss / grad_accum).backward()
+            is_step = ((i + 1) % grad_accum == 0) or ((i + 1) == num_training_batches)
+            if is_step:
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad()
+
             total_epoch_loss += loss.item()
             wandb.log({
-                "train_loss": loss.item(), 
-                "reconstruction_loss": reconstruction_loss.item(), 
-                "kl_term": kl_term.item()
+                "train_loss": loss.item(),
+                "reconstruction_loss": reconstruction_loss.item(),
+                "kl_term": kl_term.item(),
+                "lr": scheduler.get_last_lr()[0],
             })
-            
+
         print(f"Epoch {epoch+1} average training loss: {total_epoch_loss / num_training_batches:.4f}")
-        
+
         # Validation Loop
         model.eval()
         total_val_loss = 0
@@ -105,12 +134,29 @@ def train_fcvr_router(model, tokenizer, train_loader, val_loader, args):
                 outputs = model(**inputs)
                 total_val_loss += outputs.loss.item()
         avg_val_loss = total_val_loss / len(val_loader)
-        print(f"Epoch {epoch+1} validation loss: {avg_val_loss:.4f}")
+        print(f"Epoch {epoch+1} validation loss (NLL): {avg_val_loss:.4f}")
         wandb.log({"val_loss": avg_val_loss, "epoch": epoch})
 
-    print("--- FCVR Fine-tuning complete ---")
-    
-    save_bayesian_routers(model, method="fcvr", args=args)
+        # Early stopping on val NLL: keep the best checkpoint on disk.
+        if avg_val_loss < best_val_loss - 1e-4:
+            best_val_loss = avg_val_loss
+            epochs_no_improve = 0
+            print(f"  New best val NLL {best_val_loss:.4f} -> saving FCVR weights.")
+            save_bayesian_routers(model, method="fcvr", args=args)
+        else:
+            epochs_no_improve += 1
+            print(f"  No val-NLL improvement ({epochs_no_improve}/{args.early_stop_patience}).")
+            if epochs_no_improve >= args.early_stop_patience:
+                print(f"--- Early stopping at epoch {epoch+1} (best val NLL {best_val_loss:.4f}) ---")
+                break
+
+    # Safety net: if val NLL never improved (best checkpoint never written),
+    # persist the final state so the weights dir is not empty.
+    if best_val_loss == float("inf"):
+        print("--- Val NLL never improved; saving final state as a fallback ---")
+        save_bayesian_routers(model, method="fcvr", args=args)
+
+    print(f"--- FCVR Fine-tuning complete (best val NLL {best_val_loss:.4f}) ---")
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Fine-tune an MoE router with Full-Covariance VI.")
@@ -122,9 +168,16 @@ def parse_args():
     parser.add_argument("--load_layers", type=int, nargs='*', default=[]) 
     parser.add_argument("--train_layers", type=int, nargs='+', required=True)
 
-    parser.add_argument("--epochs", type=int, default=5)
-    parser.add_argument("--batch_size", type=int, default=4)
-    parser.add_argument("--lr", type=float, default=1e-5)
+    parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--batch_size", type=int, default=4,
+                        help="Per-device micro-batch; paper uses {2,4,8} with grad-accum to eff batch 16.")
+    parser.add_argument("--grad_accum_steps", type=int, default=4,
+                        help="Gradient accumulation steps; batch_size * grad_accum_steps = effective batch (paper: 16).")
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--warmup_ratio", type=float, default=0.05,
+                        help="Fraction of total optimizer steps used for LR warmup (paper D.2: 0.05).")
+    parser.add_argument("--early_stop_patience", type=int, default=3,
+                        help="Stop after this many epochs without val-NLL improvement (paper: early stop on val NLL).")
     parser.add_argument("--beta", type=float, default=0.01)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--run_suffix", type=str, default=None,
@@ -137,6 +190,10 @@ def main():
     print("Setting up the environment...")
     setup_environment()
     args = parse_args()
+
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
 
     model = load_peft_model_and_adapter(
         args.model_shortcode,
