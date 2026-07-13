@@ -22,7 +22,7 @@ ROUTER_CONFIG = {
     "fcvr": {
         "class": FullCovarianceVariationalRouter,
         "get_kwargs": lambda args: {},
-        "trainable_attrs": ["mean_residual_net", "cholesky_net"]
+        "trainable_attrs": ["backbone", "mean_head", "cholesky_head"]
     },
     "vtsr": {
         "class": VariationalTemperatureRouter,

@@ -31,6 +31,8 @@ ADAPTER_MAP = {
 def train_fcvr_router(model, tokenizer, train_loader, val_loader, args):
     """Custom training loop for the FCVR using the ELBO loss."""
     run_name = f"fcvr-{args.model_shortcode}-{args.dataset_shortcode}"
+    if getattr(args, "run_suffix", None):
+        run_name = f"{run_name}-{args.run_suffix}"
 
     # === 0: Make sure we're using the currect swap, save functions ===
     adapter = ADAPTER_MAP[args.model_shortcode]
@@ -39,8 +41,13 @@ def train_fcvr_router(model, tokenizer, train_loader, val_loader, args):
     save_bayesian_routers = adapter["save"]
 
     # === 1. Prepare Model for Training ===
-    # Freeze all parameters in the entire model first
-    model = load_map_routers(model, args=args)
+    # Seed the FCVR prior mean (mean_base) either from the fine-tuned MAP
+    # routers (inherited pipeline) or from the pre-trained Granite routers
+    # (paper-faithful: paper freezes the pre-trained Wr and never MAP-tunes it).
+    if args.prior_source == "map":
+        model = load_map_routers(model, args=args)
+    else:
+        print("--- prior_source=pretrained: skipping MAP load; FCVR mean_base seeds from the pre-trained Granite router ---")
     model = prepare_bayesian_routers(model, method="fcvr", args=args)
     causal_model = model.base_model.model.model
 
@@ -120,6 +127,10 @@ def parse_args():
     parser.add_argument("--lr", type=float, default=1e-5)
     parser.add_argument("--beta", type=float, default=0.01)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--run_suffix", type=str, default=None,
+                        help="Optional suffix on the FCVR weights dir to avoid overwriting other runs.")
+    parser.add_argument("--prior_source", type=str, default="map", choices=["map", "pretrained"],
+                        help="Seed FCVR mean_base from fine-tuned MAP routers ('map') or the pre-trained Granite router ('pretrained', paper-faithful).")
     return parser.parse_args()
 
 def main():
