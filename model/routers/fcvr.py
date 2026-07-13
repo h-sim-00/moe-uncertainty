@@ -18,26 +18,32 @@ class FullCovarianceVariationalRouter(MoERouter):
         self.input_size = config.hidden_size
         self.top_k = config.num_experts_per_tok
         
-        # 1. Base Mean Network (Frozen) - Unchanged
+        # 1. Base Mean Network (Frozen prior mean) - Unchanged
         self.mean_base = nn.Linear(self.input_size, self.num_experts, bias=False)
         self.mean_base.load_state_dict(existing_router.layer.state_dict())
         for param in self.mean_base.parameters():
             param.requires_grad = False
 
-        # 2. Residual Mean Network (Trainable)
-        self.mean_residual_net = nn.Linear(self.input_size, self.num_experts, bias=False)
-
-        # 3. Cholesky Factor Network (Trainable) - MODIFIED
-        # The output dimension changes to represent the lower-triangular matrix
-        num_cholesky_elements = self.num_experts * (self.num_experts + 1) // 2
-        self.cholesky_net = nn.Sequential(
-            nn.Linear(self.input_size, config.hidden_size // 4, bias=False),
-            nn.ReLU(),
-            nn.Linear(config.hidden_size // 4, num_cholesky_elements, bias=False)
+        # 2. Shared Uncertainty Backbone (Trainable) - paper Fig 5 / App C.2.
+        #    A single trunk extracts features feeding BOTH the residual-mean head
+        #    (shift) and the Cholesky head (correlation).
+        self.hidden_size = config.hidden_size // 4
+        self.backbone = nn.Sequential(
+            nn.Linear(self.input_size, self.hidden_size, bias=False),
+            nn.ReLU()
         )
-        
-        # Initialize the last layer weights to small values so the output is near zero
-        nn.init.normal_(self.cholesky_net[2].weight, mean=0.0, std=1e-3)
+
+        # 3. Heads (Trainable)
+        # Head A: Residual Mean (shift)
+        self.mean_head = nn.Linear(self.hidden_size, self.num_experts, bias=False)
+
+        # Head B: Cholesky Factor (correlation). Output is the flattened
+        # lower-triangular matrix.
+        num_cholesky_elements = self.num_experts * (self.num_experts + 1) // 2
+        self.cholesky_head = nn.Linear(self.hidden_size, num_cholesky_elements, bias=False)
+
+        # Init Cholesky head near zero so we start with (near-)identity covariance.
+        nn.init.normal_(self.cholesky_head.weight, mean=0.0, std=1e-3)
         
         self.num_mc_samples_inference = 35
         self.last_mu_residual = None
@@ -60,11 +66,14 @@ class FullCovarianceVariationalRouter(MoERouter):
     def forward(self, hidden_states, **kwargs):
         with torch.no_grad():
             mu_base = self.mean_base(hidden_states)
-        mu_residual = self.mean_residual_net(hidden_states)
+
+        # Shared backbone feeds both heads.
+        features = self.backbone(hidden_states)
+        mu_residual = self.mean_head(features)
         mu_final = mu_base + mu_residual
-        
-        # MODIFIED: Predict and build the Cholesky factor
-        flat_cholesky = self.cholesky_net(hidden_states)
+
+        # Predict and build the Cholesky factor from the same features.
+        flat_cholesky = self.cholesky_head(features)
         cholesky_factor = self._build_cholesky(flat_cholesky)
         
         # MODIFIED: Use a MultivariateNormal distribution
@@ -111,20 +120,24 @@ class FullCovarianceVariationalRouter(MoERouter):
         log_det_term = 2 * torch.log(torch.diagonal(L, dim1=-2, dim2=-1)).sum(-1)
         
         kl = 0.5 * (trace_term + mu_sq_term - E - log_det_term)
-        return kl.sum()
+        # Per-token MEAN (matches the mean reduction of the reconstruction loss),
+        # so the ELBO's two terms share the same normalisation as in the paper.
+        return kl.mean()
 
     def save_weights(self, path: str):
         """MODIFIED: Saves the new trainable components."""
         os.makedirs(os.path.dirname(path), exist_ok=True)
         torch.save({
-            'mean_residual_net': self.mean_residual_net.state_dict(),
-            'cholesky_net': self.cholesky_net.state_dict()
+            'backbone': self.backbone.state_dict(),
+            'mean_head': self.mean_head.state_dict(),
+            'cholesky_head': self.cholesky_head.state_dict()
         }, path)
         print(f"Saved FCVR weights to {path}")
 
     def load_weights(self, path: str, device=None):
-        """MODIFIED: Loads the new trainable components."""
+        """MODIFIED: Loads the new trainable components (shared backbone + heads)."""
         state_dicts = torch.load(path, map_location=device)
-        self.mean_residual_net.load_state_dict(state_dicts['mean_residual_net'])
-        self.cholesky_net.load_state_dict(state_dicts['cholesky_net'])
+        self.backbone.load_state_dict(state_dicts['backbone'])
+        self.mean_head.load_state_dict(state_dicts['mean_head'])
+        self.cholesky_head.load_state_dict(state_dicts['cholesky_head'])
         print(f"Loaded FCVR weights from {path}")
