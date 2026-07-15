@@ -40,14 +40,21 @@ def train(model, tokenizer, train_loader, val_loader, args):
             # 1. Get the standard language modeling loss
             reconstruction_loss = outputs.loss
             
-            # 2. Calculate the temperature penalty
+            # 2. Calculate the temperature penalty.
+            #    Per-token MEAN of -log(T) per layer (NOT .sum()), summed over the trained
+            #    layers. The mean keeps it on the same per-token scale as the mean-reduced
+            #    reconstruction loss so `temp_penalty_weight` (beta) carries its intended
+            #    weight; a per-token .sum() (batch*seq terms) otherwise swamps the task loss
+            #    and drives temperature runaway (loss -> large negative, T explodes).
             total_temp_penalty = torch.tensor(0.0, device=model.device)
+            mean_temp_sum = 0.0
             for layer_idx in args.train_layers:
                 router = causal_model.layers[layer_idx].block_sparse_moe.router
                 temperature = router.last_temperature
-                penalty = -torch.log(temperature).sum()
+                penalty = -torch.log(temperature).mean()
                 total_temp_penalty += penalty
-                
+                mean_temp_sum += temperature.mean().item()
+
             # 3. Combine the losses
             final_loss = reconstruction_loss + args.temp_penalty_weight * total_temp_penalty
 
@@ -58,6 +65,7 @@ def train(model, tokenizer, train_loader, val_loader, args):
                 "train_loss": final_loss.item(),
                 "reconstruction_loss": reconstruction_loss.item(),
                 "temp_penalty": total_temp_penalty.item(),
+                "mean_temperature": mean_temp_sum / len(args.train_layers),
             })
             
         print(f"Epoch {epoch+1} average training loss: {total_epoch_loss / num_training_batches:.4f}")
