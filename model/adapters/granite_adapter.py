@@ -100,9 +100,16 @@ def prepare_granite_bayesian_routers(model, method, args):
     trainable_attrs = config["trainable_attrs"]
 
     print(f"--- Preparing model for {method.upper()} router tuning ---")
-    
+
     output_root_dir = f"./router_weights/{method}"
+    if method == 'vtsr':
+        # Mirror the suffix used by save_granite_bayesian_routers so the
+        # progressive load path matches where the previous step saved.
+        output_root_dir += f"_{args.temperature_mode}"
     run_name = f"{method}-{args.model_shortcode}-{args.dataset_shortcode}"
+    run_suffix = getattr(args, "run_suffix", "")
+    if run_suffix:
+        run_name += f"-{run_suffix}"
     
     causal_model = model.base_model.model.model
 
@@ -146,6 +153,9 @@ def save_granite_bayesian_routers(model, method, args):
     if method == 'vtsr':
         output_root_dir += f"_{args.temperature_mode}"
     run_name = f"{method}-{args.model_shortcode}-{args.dataset_shortcode}"
+    run_suffix = getattr(args, "run_suffix", "")
+    if run_suffix:
+        run_name += f"-{run_suffix}"
     save_dir = os.path.join(output_root_dir, run_name)
     
     causal_model = model.base_model.model.model
@@ -169,6 +179,9 @@ def load_granite_bayesian_routers(model, method, args):
     
     output_root_dir = f"./router_weights/{method}"
     run_name = f"{method}-{args.model_shortcode}-{args.dataset_shortcode}"
+    run_suffix = getattr(args, "run_suffix", "")
+    if run_suffix:
+        run_name += f"-{run_suffix}"
     weights_dir = os.path.join(output_root_dir, run_name)
     
     causal_model = model.base_model.model.model

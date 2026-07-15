@@ -124,6 +124,8 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--lr", type=float, default=1e-5, help="Learning rate for the optimizer.")
     parser.add_argument("--temp_penalty_weight", type=float, default=1e-3, help="Weight for the -log(T) penalty term to prevent temperature collapse.")
+    parser.add_argument("--temperature_mode", type=str, default="shared", help="Names the output weights dir router_weights/vtsr_<mode>/. The router always predicts a scalar T; this is a directory label only.")
+    parser.add_argument("--run_suffix", type=str, default="", help="Optional suffix appended to the run_name (e.g. 'susceptible10') to isolate this run's weights from other layer selections. Empty = no suffix.")
     return parser.parse_args()
 
 def main():
