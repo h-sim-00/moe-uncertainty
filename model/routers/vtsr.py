@@ -29,7 +29,11 @@ class VariationalTemperatureRouter(MoERouter):
         # Use Softplus to ensure the temperature is always positive
         self.softplus = nn.Softplus()
 
+        # Captured on each forward for OoD-signal readout at eval time:
+        #   last_temperature   -> Inf-Temp signal (raw T_phi, paper Eq. 31)
+        #   last_scaled_logits -> Gate-Ent signal (entropy of softmax(l_det / T_phi))
         self.last_temperature = None
+        self.last_scaled_logits = None
 
     def forward(self, hidden_states, **kwargs):
         with torch.no_grad():
@@ -40,6 +44,8 @@ class VariationalTemperatureRouter(MoERouter):
         self.last_temperature = temperature
 
         scaled_logits = logits / temperature
+
+        self.last_scaled_logits = scaled_logits
         
         # --- Conditional Logic for Training vs. Evaluation ---
         if self.training:

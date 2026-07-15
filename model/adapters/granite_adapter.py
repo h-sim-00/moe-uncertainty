@@ -176,8 +176,11 @@ def load_granite_bayesian_routers(model, method, args):
     router_kwargs = config["get_kwargs"](args)
 
     print(f"--- Loading pre-trained {method.upper()} routers for evaluation ---")
-    
+
     output_root_dir = f"./router_weights/{method}"
+    if method == 'vtsr':
+        # Match the vtsr_<mode> dir used by save_granite_bayesian_routers.
+        output_root_dir += f"_{args.temperature_mode}"
     run_name = f"{method}-{args.model_shortcode}-{args.dataset_shortcode}"
     run_suffix = getattr(args, "run_suffix", "")
     if run_suffix:
