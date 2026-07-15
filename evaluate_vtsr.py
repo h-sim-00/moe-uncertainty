@@ -44,6 +44,46 @@ OOD_DATASETS = {
     "mmlu_law": "far",
 }
 
+# One-time padding sanity check (see also standalone debug_padding.py).
+_PADDING_REPORTED = False
+
+
+def report_padding(tokenizer, inputs):
+    """Print ONCE whether the `[:, -1, :]` final-token readout used below grabs the
+    real last token for every row, or a PAD token (right-padding). Works for any
+    padding side: the real last-token index is the last position whose mask == 1."""
+    global _PADDING_REPORTED
+    if _PADDING_REPORTED:
+        return
+    _PADDING_REPORTED = True
+
+    ids = inputs["input_ids"]
+    mask = inputs["attention_mask"]
+    bsz, seq_len = ids.shape
+    idx = torch.arange(seq_len, device=mask.device)
+    last_real = (mask * idx).argmax(dim=1)      # last index with mask==1, per row
+    minus1_idx = seq_len - 1                     # what `[:, -1]` grabs
+    n_ok = int((last_real == minus1_idx).sum().item())
+
+    print("\n" + "=" * 66)
+    print("[PADDING CHECK] (printed once per eval run)")
+    print(f"  tokenizer.padding_side = {tokenizer.padding_side!r}")
+    print(f"  pad_token = {tokenizer.pad_token!r} (id={tokenizer.pad_token_id})")
+    print(f"  batch shape (rows x seq_len) = {bsz} x {seq_len}")
+    print(f"  real last-token index per row = {last_real.tolist()}")
+    print(f"  rows where `-1` == real last token: {n_ok}/{bsz}")
+    for r in range(min(3, bsz)):
+        lr = last_real[r].item()
+        flag = "OK" if lr == minus1_idx else "MISMATCH"
+        print(f"    row {r}: [-1] -> {tokenizer.decode(ids[r, -1:].tolist())!r}   "
+              f"real-last(idx {lr}) -> {tokenizer.decode(ids[r, lr:lr + 1].tolist())!r}   [{flag}]")
+    if n_ok == bsz:
+        print("  VERDICT: `-1` is the real final token for EVERY row -> extraction CORRECT.")
+    else:
+        print("  VERDICT: `-1` hits a PAD token on some rows -> extraction WRONG (right-padded).")
+        print("           Signals for those rows are read at a pad position; use a mask-based readout.")
+    print("=" * 66 + "\n")
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Faithful VTSR evaluation (answer_entropy + gate_ent + inf_temp).")
@@ -105,6 +145,7 @@ def compute_signals(model, tokenizer, dataset, vtsr_layers, args):
                 batch_q, return_tensors="pt", padding=True, truncation=True, max_length=2048
             ).to(model.device)
             bsz, seq_len = inputs["input_ids"].shape
+            report_padding(tokenizer, inputs)  # one-time diagnostic on the first batch
 
             logits = model(**inputs).logits
 
