@@ -75,7 +75,7 @@ done
 mkdir -p logs
 
 for BETA in "${BETAS[@]}"; do
-    RUN_SUFFIX="susceptible10-beta${BETA}"
+    RUN_SUFFIX="susceptible10-beta${BETA}-algo3"
     SAVE_DIR="./router_weights/vtsr_${TEMPERATURE_MODE}/vtsr-${MODEL_SHORTCODE}-${DATASET_SHORTCODE}-${RUN_SUFFIX}"
 
     # --- No-overwrite guard for THIS beta ---

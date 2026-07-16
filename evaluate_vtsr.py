@@ -101,6 +101,10 @@ def parse_args():
                         help="Suffix on the VTSR weights dir; must match the training run's --run_suffix.")
     parser.add_argument("--output_json_path", type=str, required=True)
 
+    parser.add_argument("--deterministic_routing", action="store_true",
+                        help="DIAGNOSTIC: use deterministic Top-K at inference instead of the "
+                             "paper's stochastic Sample-K. If ID accuracy recovers with this on, "
+                             "the collapse is inflated-T + random sampling (not a wiring bug).")
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--seed", type=int, default=42)
     return parser.parse_args()
@@ -118,6 +122,13 @@ def prepare_model_vtsr(model, args):
     #    run_suffix and loads
     #    ./router_weights/vtsr_<mode>/vtsr-<model>-<dataset>-<suffix>/layer_<i>_weights.pt
     model = granite_adapter.load_granite_bayesian_routers(model, method="vtsr", args=args)
+
+    # Optional diagnostic: force deterministic Top-K at inference on every VTSR layer.
+    if getattr(args, "deterministic_routing", False):
+        causal_model = model.base_model.model.model
+        for l in args.swap_layers:
+            causal_model.layers[l].block_sparse_moe.router.deterministic_inference = True
+        print("[DIAGNOSTIC] deterministic_routing=ON -> VTSR inference uses Top-K, not Sample-K.")
 
     model.eval()
     print(f"VTSR layers: {sorted(args.swap_layers)}")

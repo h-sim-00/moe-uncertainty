@@ -35,6 +35,13 @@ class VariationalTemperatureRouter(MoERouter):
         self.last_temperature = None
         self.last_scaled_logits = None
 
+        # Diagnostic toggle (eval only). When True, inference uses DETERMINISTIC Top-K
+        # (the K highest-prob experts) instead of the paper's stochastic Sample-K
+        # (multinomial draw from softmax(l_det/T)). Lets us isolate whether an ID-accuracy
+        # collapse comes from an inflated T + random sampling, or from a wiring bug: if
+        # accuracy recovers with this ON, sampling under a runaway T is the culprit.
+        self.deterministic_inference = False
+
     def forward(self, hidden_states, **kwargs):
         with torch.no_grad():
             logits = self.layer(hidden_states).float()
@@ -48,17 +55,36 @@ class VariationalTemperatureRouter(MoERouter):
         self.last_scaled_logits = scaled_logits
         
         # --- Conditional Logic for Training vs. Evaluation ---
+        # `weight_logits` are the logits whose Top-K softmax becomes the gate weights.
+        # They MUST depend on `temperature` so the reconstruction loss can push back on T.
         if self.training:
-            # Use Gumbel-Softmax for a differentiable sample.
-            # `hard=True` uses a one-hot vector in the forward pass but a soft,
-            # differentiable approximation in the backward pass.
-            gumbel_probs = F.gumbel_softmax(scaled_logits, tau=1.0, hard=True, dim=-1)
-            top_k_indices = torch.topk(gumbel_probs, self.top_k, dim=1).indices
+            # --- Algorithm 3 (paper App. C): Top-K over Gumbel-perturbed, T-scaled logits ---
+            # Add Gumbel(0,1) noise to the RAW logits, THEN divide by T -> softmax((l_det + g)/T),
+            # so the temperature modulates the exploration noise. Then keep the true Top-K experts
+            # and softmax their T-scaled logits as soft gate weights.
+            #
+            # This replaces Listing 2's `gumbel_softmax(l_det/T, hard=True)` + `topk(one_hot)`,
+            # which (a) injected fixed-scale noise T could not modulate [= softmax(l_det/T + g)]
+            # and (b) selected 1 real expert + (K-1) arbitrary index-order residue experts. Under
+            # (b) the chosen experts barely depended on T, so reconstruction gave T almost no
+            # gradient and the unbounded `-log(T)` penalty ran T away (temperature explosion).
+            # Selecting the true Top-K and weighting by their T-scaled logits restores that
+            # counter-gradient. NOTE: this follows Algorithm 3, NOT the paper's own Listing 2.
+            gumbels = -torch.empty_like(logits).exponential_().log()   # ~ Gumbel(0, 1)
+            weight_logits = (logits + gumbels) / temperature
+            top_k_indices = torch.topk(weight_logits, self.top_k, dim=1).indices
+        elif self.deterministic_inference:
+            # Deterministic Top-K: the K highest-prob experts, no sampling. Matches how
+            # the MAP router selects, so accuracy here is the sampling-free ceiling.
+            weight_logits = scaled_logits
+            top_k_indices = torch.topk(scaled_logits.float(), self.top_k, dim=1).indices
         else:
+            # Paper's Sample-K at inference: draw K experts without replacement from softmax(l_det/T).
+            weight_logits = scaled_logits
             probabilities = torch.softmax(scaled_logits.float(), dim=1)
             top_k_indices = torch.multinomial(probabilities, self.top_k, replacement=False)
 
-        gathered_logits = scaled_logits.gather(1, top_k_indices.long())
+        gathered_logits = weight_logits.gather(1, top_k_indices.long())
         top_k_gates = torch.softmax(gathered_logits, dim=1).type_as(hidden_states)
 
         # --- The rest of the routing logic is now consistent ---

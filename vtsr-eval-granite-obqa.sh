@@ -63,7 +63,7 @@ fi
 mkdir -p results/vtsr logs
 
 for BETA in "${BETAS[@]}"; do
-    RUN_SUFFIX="susceptible10-beta${BETA}"
+    RUN_SUFFIX="susceptible10-beta${BETA}-algo3"
     RUN_NAME="vtsr-${MODEL_SHORTCODE}-${DATASET_SHORTCODE}-${RUN_SUFFIX}"
     VTSR_WEIGHTS_DIR="./router_weights/vtsr_${TEMPERATURE_MODE}/${RUN_NAME}"
 
