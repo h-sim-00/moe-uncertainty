@@ -486,8 +486,8 @@ def load_exp_dataset(dataset_shortcode, seed=42, split=None):
     else:
         raise ValueError(f"Dataset '{dataset_shortcode}' not supported by load_exp_dataset.")
 
-    train_dataset = train_dataset[:-50]
     validation_dataset = train_dataset[-50:]
+    train_dataset = train_dataset[:-50]
 
     print(f"Dataset '{dataset_shortcode}' processed: Train={len(train_dataset)}, Val={len(validation_dataset)}, Test={len(test_dataset)}")
     
