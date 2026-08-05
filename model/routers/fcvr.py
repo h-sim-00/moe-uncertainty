@@ -48,6 +48,13 @@ class FullCovarianceVariationalRouter(MoERouter):
         self.num_mc_samples_inference = 35
         self.last_mu_residual = None
         self.last_cholesky_factor = None
+        # When True (eval only), route with the deterministic posterior mean
+        # (mu_final) instead of MC-sampling the logit distribution. The Cholesky
+        # factor is still computed and stored, so the Inf-Logit-Var read-out is
+        # unaffected -- but routing becomes reproducible and ~S times faster.
+        # Used for per-token signal analysis (Step 1); default off so normal
+        # FCVR evaluation is unchanged.
+        self.deterministic_readout = False
 
     def _build_cholesky(self, flat_cholesky_elements):
         """Helper to build a batch of lower-triangular matrices."""
@@ -86,6 +93,10 @@ class FullCovarianceVariationalRouter(MoERouter):
         # The rest of the sampling and routing logic is unchanged
         if self.training:
             logits = logit_dist.rsample()
+        elif self.deterministic_readout:
+            # Deterministic posterior-mean routing (no MC sampling). The
+            # covariance is already stored above for read-out.
+            logits = mu_final
         else:
             logit_samples = logit_dist.rsample(sample_shape=torch.Size([self.num_mc_samples_inference]))
             probs_samples = torch.softmax(logit_samples, dim=-1)
