@@ -4,10 +4,10 @@ import torch
 
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-from transformers import DataCollatorForLanguageModeling
+from transformers import DataCollatorForLanguageModeling, DataCollatorForSeq2Seq
 from utils import setup_environment
 from model import load_peft_model, load_tokenizer
-from utils import load_and_prepare_train_and_val_data
+from utils import load_and_prepare_train_and_val_data, is_generation_dataset
 
 def train(model, tokenizer, train_loader, val_loader, args):
     """
@@ -85,7 +85,12 @@ def main():
 
     # Use the new argument to load a single dataset
     train_dataset, val_dataset = load_and_prepare_train_and_val_data(tokenizer, [args.dataset_shortcode])
-    data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
+    if is_generation_dataset([args.dataset_shortcode]):
+        # Generation: keep the prompt-masked labels so Stage-1 trains only on the
+        # explanation tokens (see fcvr-tuning.py for the same rationale).
+        data_collator = DataCollatorForSeq2Seq(tokenizer, label_pad_token_id=-100, padding=True)
+    else:
+        data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, collate_fn=data_collator, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, collate_fn=data_collator)
 

@@ -3,13 +3,17 @@ import math
 import os, torch, wandb
 from tqdm import tqdm
 from torch.utils.data import DataLoader
-from transformers import DataCollatorForLanguageModeling, get_cosine_schedule_with_warmup
+from transformers import (
+    DataCollatorForLanguageModeling,
+    DataCollatorForSeq2Seq,
+    get_cosine_schedule_with_warmup,
+)
 
 from model.adapters import granite_adapter, qwen_adapter, deepseek_adapter
 
 from utils import setup_environment
 from model import load_peft_model_and_adapter, load_tokenizer
-from utils import load_and_prepare_train_and_val_data
+from utils import load_and_prepare_train_and_val_data, is_generation_dataset
 
 ADAPTER_MAP = {
     "granite": {
@@ -203,7 +207,13 @@ def main():
     tokenizer = load_tokenizer(args.model_shortcode)
 
     train_dataset, val_dataset = load_and_prepare_train_and_val_data(tokenizer, [args.dataset_shortcode])
-    data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
+    if is_generation_dataset([args.dataset_shortcode]):
+        # Generation: preserve the prompt-masked labels (DataCollatorForLanguageModeling
+        # would overwrite them from input_ids and train on the prompt too). Seq2Seq
+        # pads input_ids with pad_token and labels with -100 dynamically per batch.
+        data_collator = DataCollatorForSeq2Seq(tokenizer, label_pad_token_id=-100, padding=True)
+    else:
+        data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, collate_fn=data_collator, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, collate_fn=data_collator)
     

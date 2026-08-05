@@ -44,11 +44,14 @@ from .data import (
     preprocess_mask_question_for_training,
     load_and_prepare_train_and_val_data,
     load_exp_dataset,
+    is_generation_dataset,
+    GENERATION_DATASETS,
 )
 
 from .prompt import (
     multi_shot_prompt_engineer,
     multiple_choice_prompt_engineer,
+    generation_prompt_engineer,
 )
 
 def get_model_predictions(model, tokenizer, dataset, batch_size=8):

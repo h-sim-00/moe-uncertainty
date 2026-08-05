@@ -5,8 +5,20 @@ import hashlib
 from datasets import Dataset
 from typing import List, Tuple
 from transformers import AutoTokenizer
+import re
 import random
-from .prompt import multiple_choice_prompt_engineer
+from .prompt import multiple_choice_prompt_engineer, generation_prompt_engineer
+
+# Datasets whose fine-tuning target is FREE-TEXT GENERATION (not a single MCQA
+# option letter). These route through generation_prompt_engineer, get an EOS
+# appended to the target, and use a label-preserving (Seq2Seq) collator so the
+# prompt is masked out of the loss. Everything else stays multiple-choice.
+GENERATION_DATASETS = {"medexqa"}
+
+
+def is_generation_dataset(shortcodes):
+    """True if any requested dataset is an open-generation dataset."""
+    return any(s in GENERATION_DATASETS for s in shortcodes)
 
 MMLU_SHORTCODE2NAME = {
     # ID
@@ -293,46 +305,86 @@ def batchify(data, batch_size, tokenizer, device="cuda:0"):
 
         yield inputs, answers, ids
 
-def preprocess_mask_question_for_training(dataset_list: List[dict], tokenizer: AutoTokenizer) -> Dataset:
-    """Correctly tokenizes and masks the dataset for supervised fine-tuning."""
+def preprocess_mask_question_for_training(
+    dataset_list: List[dict],
+    tokenizer: AutoTokenizer,
+    append_eos: bool = False,
+    pad: bool = True,
+) -> Dataset:
+    """Tokenizes and masks the dataset for supervised fine-tuning.
+
+    Two modes:
+      * MCQA (append_eos=False, pad=True): unchanged legacy behaviour -- pads to
+        the global longest sequence, masks the prompt prefix. NOTE: the MCQA
+        training scripts use DataCollatorForLanguageModeling, which regenerates
+        labels from input_ids, so this mask is (as before) effectively advisory.
+      * GENERATION (append_eos=True, pad=False): appends EOS to the target so the
+        model learns to stop, tokenizes WITHOUT re-adding special tokens (the
+        chat template already injected them, so prompt-length masking is exact),
+        masks the prompt prefix AND any padding to IGNORE_INDEX, and leaves rows
+        un-padded for a dynamic label-preserving (Seq2Seq) collator.
+    """
     IGNORE_INDEX = -100
     prompts = [item['question'] for item in dataset_list]
-    full_texts = [item['question'] + item['answer'] for item in dataset_list]
-    # Tokenize the full texts to get input_ids
-    model_inputs = tokenizer(full_texts, padding="longest", truncation=False)
-    # Tokenize prompts separately to find their lengths for masking
-    # We don't add special tokens here because we only care about the length of the prompt text itself
-    prompt_lengths = [len(tokenizer(p, add_special_tokens=False).input_ids) for p in prompts]
-    
+
+    if append_eos:
+        eos = tokenizer.eos_token or ""
+        full_texts = [item['question'] + item['answer'] + eos for item in dataset_list]
+        model_inputs = tokenizer(
+            full_texts, padding=("longest" if pad else False),
+            truncation=False, add_special_tokens=False,
+        )
+        prompt_lengths = [len(tokenizer(p, add_special_tokens=False).input_ids) for p in prompts]
+    else:
+        full_texts = [item['question'] + item['answer'] for item in dataset_list]
+        # Tokenize the full texts to get input_ids
+        model_inputs = tokenizer(full_texts, padding="longest", truncation=False)
+        # Tokenize prompts separately to find their lengths for masking
+        # We don't add special tokens here because we only care about the length of the prompt text itself
+        prompt_lengths = [len(tokenizer(p, add_special_tokens=False).input_ids) for p in prompts]
+
+    attn = model_inputs.get("attention_mask")
     labels_list = []
     for i, input_id_row in enumerate(model_inputs['input_ids']):
         prompt_len = prompt_lengths[i]
         # The label is a copy of the input_ids
         label_row = list(input_id_row)
-        
+
         # Mask the prompt part by setting it to IGNORE_INDEX
         # The first token is often BOS, which should also be masked.
         # We mask up to the length of the tokenized prompt.
-        for j in range(prompt_len):
+        for j in range(min(prompt_len, len(label_row))):
             label_row[j] = IGNORE_INDEX
+        # Generation path: also mask padding positions so pad tokens never
+        # contribute to the loss (matters once answers vary in length).
+        if append_eos and attn is not None:
+            for j, m in enumerate(attn[i]):
+                if m == 0:
+                    label_row[j] = IGNORE_INDEX
         labels_list.append(label_row)
-    
+
     model_inputs["labels"] = labels_list
     return Dataset.from_dict(model_inputs)
 
 def load_and_prepare_train_and_val_data(tokenizer: AutoTokenizer, train_dataset_shortcodes: List, seed=42) -> Tuple[Dataset, Dataset]:
     """Loads and preprocesses the dataset for causal language modeling."""
+    generation = is_generation_dataset(train_dataset_shortcodes)
+    engineer = generation_prompt_engineer if generation else multiple_choice_prompt_engineer
+
     train_raw, val_raw = [], []
     for dataset_shortcode in train_dataset_shortcodes:
         train_raw_curr, val_raw_curr, _ = load_exp_dataset(dataset_shortcode, seed=seed)
         train_raw.extend(train_raw_curr)
         val_raw.extend(val_raw_curr)
-    
-    train_engineered = [multiple_choice_prompt_engineer(x, tokenizer=tokenizer) for x in train_raw]
-    val_engineered = [multiple_choice_prompt_engineer(x, tokenizer=tokenizer) for x in val_raw]
-    
-    train_dataset = preprocess_mask_question_for_training(train_engineered, tokenizer)
-    val_dataset = preprocess_mask_question_for_training(val_engineered, tokenizer)
+
+    train_engineered = [engineer(x, tokenizer=tokenizer) for x in train_raw]
+    val_engineered = [engineer(x, tokenizer=tokenizer) for x in val_raw]
+
+    # Generation: append EOS + keep rows un-padded (dynamic Seq2Seq collator).
+    train_dataset = preprocess_mask_question_for_training(
+        train_engineered, tokenizer, append_eos=generation, pad=not generation)
+    val_dataset = preprocess_mask_question_for_training(
+        val_engineered, tokenizer, append_eos=generation, pad=not generation)
 
     print(f"Datasets '{train_dataset_shortcodes}' loaded and preprocessed.")
     print(f"Train samples: {len(train_dataset)}, Eval samples: {len(val_dataset)}")
@@ -482,6 +534,93 @@ def load_exp_dataset(dataset_shortcode, seed=42, split=None):
         
         train_dataset = medicine_pool[500:5550]
         test_dataset = medicine_pool[:500]
+
+    elif dataset_shortcode == "medexqa":
+        # MedExQA (bluesky333/MedExQA): an open-generation medical benchmark, NOT
+        # a train corpus. 5 specialty configs; splits dev(5/specialty)+test(940);
+        # 8 columns: Question, Choice A-D, Explanation 1, Explanation 2, Correct
+        # Answer. We fine-tune OPEN GENERATION with target = the free-text
+        # 'Explanation 1'. There is no native train split, so we pool every row
+        # across all specialties/splits, shuffle (seed), and carve a held-out
+        # test set; the generic tail below then carves 50 val from the remainder.
+        name = "bluesky333/MedExQA"
+        try:
+            from datasets import get_dataset_config_names
+            configs = get_dataset_config_names(name)
+        except Exception as e:
+            print(f"  (MedExQA: could not list configs -- {e!r}; trying default)")
+            configs = [None]
+
+        def _norm(k):
+            return re.sub(r"[^a-z0-9]", "", str(k).lower())
+
+        def _resolve(ex):
+            # Prefer named columns (case/space-insensitive); fall back to
+            # positional order for header-less TSV loads (8 unnamed columns).
+            m = {_norm(k): v for k, v in ex.items()}
+
+            def g(*cands):
+                for c in cands:
+                    if _norm(c) in m:
+                        return m[_norm(c)]
+                return None
+
+            q = g("question")
+            a = g("choicea", "optiona", "opa", "a")
+            b = g("choiceb", "optionb", "opb", "b")
+            c = g("choicec", "optionc", "opc", "c")
+            d = g("choiced", "optiond", "opd", "d")
+            e1 = g("explanation1", "explanation", "explanationa")
+            if q is None or e1 is None:
+                vals = list(ex.values())
+                if len(vals) >= 8:
+                    q, a, b, c, d, e1 = vals[0], vals[1], vals[2], vals[3], vals[4], vals[5]
+            return q, a, b, c, d, e1
+
+        def reformat_medexqa(ex):
+            q, a, b, c, d, e1 = _resolve(ex)
+            if not q or not e1 or not str(e1).strip():
+                return None
+            opts = "\n".join(
+                f"{lab}. {txt}" for lab, txt in zip(["A", "B", "C", "D"], [a, b, c, d]) if txt is not None
+            )
+            return {
+                "question": f"Question: {q}\nOptions:\n{opts}\n\nExplain the reasoning for the correct answer.",
+                # Free-text generation target = the gold explanation. Leading
+                # space for a clean sub-word split at the prompt/answer boundary.
+                "answer": " " + str(e1).strip(),
+                "id": f"medexqa_{random.randint(100000, 999999)}",
+            }
+
+        pool = []
+        for cfg in (configs or [None]):
+            for sp in ("dev", "validation", "val", "test", "train"):
+                try:
+                    d_split = datasets.load_dataset(name, cfg, split=sp) if cfg else datasets.load_dataset(name, split=sp)
+                except Exception:
+                    continue
+                pool.extend(reformat_medexqa(ex) for ex in d_split)
+
+        pool = [ex for ex in pool if ex is not None]
+        # Dedup (guards against the same rows appearing under dev/validation aliases).
+        seen, deduped = set(), []
+        for ex in pool:
+            key = (ex["question"], ex["answer"])
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(ex)
+        pool = deduped
+        random.shuffle(pool)
+
+        if len(pool) < 200:
+            raise ValueError(
+                f"MedExQA: expected ~965 rows but resolved {len(pool)}. "
+                "Check the config/column names printed above (see reformat_medexqa)."
+            )
+
+        test_dataset = pool[:175]
+        train_dataset = pool[175:]   # generic tail carves 50 val from this -> ~740 train
 
     else:
         raise ValueError(f"Dataset '{dataset_shortcode}' not supported by load_exp_dataset.")
