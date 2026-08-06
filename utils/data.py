@@ -5,7 +5,6 @@ import hashlib
 from datasets import Dataset
 from typing import List, Tuple
 from transformers import AutoTokenizer
-import re
 import random
 from .prompt import multiple_choice_prompt_engineer, generation_prompt_engineer
 
@@ -537,72 +536,64 @@ def load_exp_dataset(dataset_shortcode, seed=42, split=None):
 
     elif dataset_shortcode == "medexqa":
         # MedExQA (bluesky333/MedExQA): an open-generation medical benchmark, NOT
-        # a train corpus. 5 specialty configs; splits dev(5/specialty)+test(940);
-        # 8 columns: Question, Choice A-D, Explanation 1, Explanation 2, Correct
-        # Answer. We fine-tune OPEN GENERATION with target = the free-text
-        # 'Explanation 1'. There is no native train split, so we pool every row
-        # across all specialties/splits, shuffle (seed), and carve a held-out
-        # test set; the generic tail below then carves 50 val from the remainder.
-        name = "bluesky333/MedExQA"
-        try:
-            from datasets import get_dataset_config_names
-            configs = get_dataset_config_names(name)
-        except Exception as e:
-            print(f"  (MedExQA: could not list configs -- {e!r}; trying default)")
-            configs = [None]
+        # a train corpus. 5 specialty configs, splits dev(5/specialty)+test(940).
+        # The TSVs are HEADER-LESS with columns:
+        #   [0] Question  [1..4] Choice A-D  [5] Explanation 1  [6] Explanation 2
+        #   [7] Correct Answer
+        # We download the raw TSVs directly (hf_hub_download) and parse them with
+        # csv.reader(delimiter='\t') -- load_dataset()'s CSV builder assumes a
+        # header row and a comma sep, which mangles these files (0 rows). We
+        # fine-tune OPEN GENERATION with target = the free-text 'Explanation 1'.
+        # No native train split -> pool every row across all specialties/splits,
+        # shuffle (seed), carve a held-out test set; the generic tail below then
+        # carves 50 val from the remainder.
+        import csv as _csv
+        from huggingface_hub import hf_hub_download
 
-        def _norm(k):
-            return re.sub(r"[^a-z0-9]", "", str(k).lower())
+        repo = "bluesky333/MedExQA"
+        specialties = [
+            "biomedical_engineer", "clinical_laboratory_scientist",
+            "clinical_psychologist", "occupational_therapist", "speech_pathologist",
+        ]
+        rel_paths = []
+        for sp in specialties:
+            rel_paths.append(f"dev/{sp}_dev.tsv")
+            rel_paths.append(f"test/{sp}_test.tsv")
 
-        def _resolve(ex):
-            # Prefer named columns (case/space-insensitive); fall back to
-            # positional order for header-less TSV loads (8 unnamed columns).
-            m = {_norm(k): v for k, v in ex.items()}
-
-            def g(*cands):
-                for c in cands:
-                    if _norm(c) in m:
-                        return m[_norm(c)]
+        def reformat_medexqa(cols):
+            # Header-less row: at least [question, A, B, C, D, explanation1].
+            if len(cols) < 6:
                 return None
-
-            q = g("question")
-            a = g("choicea", "optiona", "opa", "a")
-            b = g("choiceb", "optionb", "opb", "b")
-            c = g("choicec", "optionc", "opc", "c")
-            d = g("choiced", "optiond", "opd", "d")
-            e1 = g("explanation1", "explanation", "explanationa")
-            if q is None or e1 is None:
-                vals = list(ex.values())
-                if len(vals) >= 8:
-                    q, a, b, c, d, e1 = vals[0], vals[1], vals[2], vals[3], vals[4], vals[5]
-            return q, a, b, c, d, e1
-
-        def reformat_medexqa(ex):
-            q, a, b, c, d, e1 = _resolve(ex)
-            if not q or not e1 or not str(e1).strip():
+            q = str(cols[0]).strip()
+            choices = [str(c).strip() for c in cols[1:5]]
+            e1 = str(cols[5]).strip()
+            if not q or not e1:
                 return None
-            opts = "\n".join(
-                f"{lab}. {txt}" for lab, txt in zip(["A", "B", "C", "D"], [a, b, c, d]) if txt is not None
-            )
+            opts = "\n".join(f"{lab}. {txt}" for lab, txt in zip(["A", "B", "C", "D"], choices) if txt)
             return {
                 "question": f"Question: {q}\nOptions:\n{opts}\n\nExplain the reasoning for the correct answer.",
                 # Free-text generation target = the gold explanation. Leading
                 # space for a clean sub-word split at the prompt/answer boundary.
-                "answer": " " + str(e1).strip(),
+                "answer": " " + e1,
                 "id": f"medexqa_{random.randint(100000, 999999)}",
             }
 
         pool = []
-        for cfg in (configs or [None]):
-            for sp in ("dev", "validation", "val", "test", "train"):
-                try:
-                    d_split = datasets.load_dataset(name, cfg, split=sp) if cfg else datasets.load_dataset(name, split=sp)
-                except Exception:
-                    continue
-                pool.extend(reformat_medexqa(ex) for ex in d_split)
+        for rel in rel_paths:
+            try:
+                local = hf_hub_download(repo_id=repo, filename=rel, repo_type="dataset")
+            except Exception as e:
+                print(f"  (MedExQA: could not fetch {rel} -- {e!r})")
+                continue
+            with open(local, newline="", encoding="utf-8") as f:
+                for row in _csv.reader(f, delimiter="\t"):
+                    if not row:
+                        continue
+                    ex = reformat_medexqa(row)
+                    if ex is not None:
+                        pool.append(ex)
 
-        pool = [ex for ex in pool if ex is not None]
-        # Dedup (guards against the same rows appearing under dev/validation aliases).
+        # Dedup defensively (the same question shouldn't appear twice).
         seen, deduped = set(), []
         for ex in pool:
             key = (ex["question"], ex["answer"])
@@ -616,8 +607,9 @@ def load_exp_dataset(dataset_shortcode, seed=42, split=None):
         if len(pool) < 200:
             raise ValueError(
                 f"MedExQA: expected ~965 rows but resolved {len(pool)}. "
-                "Check the config/column names printed above (see reformat_medexqa)."
+                "Check that the TSVs downloaded and are tab-separated (see reformat_medexqa)."
             )
+        print(f"  MedExQA: resolved {len(pool)} rows from {len(rel_paths)} TSVs.")
 
         test_dataset = pool[:175]
         train_dataset = pool[175:]   # generic tail carves 50 val from this -> ~740 train
