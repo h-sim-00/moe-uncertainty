@@ -22,6 +22,12 @@ def train(model, tokenizer, train_loader, val_loader, args):
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.Adam(trainable_params, lr=args.lr)
 
+    # Save the BEST adapter (lowest val loss) to this path; early-stop on val loss.
+    # Mirrors fcvr-tuning.py so Stage-1 no longer keeps only the (overfit) final epoch.
+    final_save_path = f"./adapters/{args.model_shortcode}-{args.dataset_shortcode}"
+    best_val_loss = float("inf")
+    epochs_no_improve = 0
+
     print("--- Starting MAP Fine-tuning (Custom Loop) ---")
     for epoch in range(args.epochs):
         model.train()
@@ -37,7 +43,7 @@ def train(model, tokenizer, train_loader, val_loader, args):
             wandb.log({
                 "train_loss": loss.item()
             })
-            
+
         print(f"Epoch {epoch+1} average training loss: {total_epoch_loss / num_training_batches:.4f}")
 
         # Validation Loop
@@ -52,11 +58,26 @@ def train(model, tokenizer, train_loader, val_loader, args):
         print(f"Epoch {epoch+1} validation loss: {avg_val_loss:.4f}")
         wandb.log({"val_loss": avg_val_loss, "epoch": epoch})
 
+        # Early stopping on val loss: keep only the best adapter on disk (re-save
+        # overwrites the previous best, so final_save_path is always the best epoch).
+        if avg_val_loss < best_val_loss - 1e-4:
+            best_val_loss = avg_val_loss
+            epochs_no_improve = 0
+            print(f"  New best val loss {best_val_loss:.4f} -> saving adapter to {final_save_path}")
+            model.save_pretrained(final_save_path)
+        else:
+            epochs_no_improve += 1
+            print(f"  No val-loss improvement ({epochs_no_improve}/{args.early_stop_patience}).")
+            if epochs_no_improve >= args.early_stop_patience:
+                print(f"--- Early stopping at epoch {epoch+1} (best val loss {best_val_loss:.4f}) ---")
+                break
 
-    # Updated final save path format
-    final_save_path = f"./adapters/{args.model_shortcode}-{args.dataset_shortcode}"
-    print(f"Saving the best adapter weights to {final_save_path}")
-    model.save_pretrained(final_save_path)
+    # Safety net: if val loss never improved, persist final state so the dir isn't empty.
+    if best_val_loss == float("inf"):
+        print(f"--- Val loss never improved; saving final state to {final_save_path} as fallback ---")
+        model.save_pretrained(final_save_path)
+
+    print(f"--- KVQ Fine-tuning complete (best val loss {best_val_loss:.4f}); best adapter at {final_save_path} ---")
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Fine-tune a model with LoRA on a specific MMLU subject.")
@@ -66,6 +87,7 @@ def parse_args():
     parser.add_argument("--batch_size", type=int, default=8, help="Training and evaluation batch size.")
     parser.add_argument("--lr", type=float, default=5e-5, help="Learning rate for the optimizer.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility.")
+    parser.add_argument("--early_stop_patience", type=int, default=2, help="Epochs of no val-loss improvement before early stopping (best checkpoint kept).")
     return parser.parse_args()
 
 

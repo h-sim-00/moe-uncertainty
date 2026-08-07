@@ -24,10 +24,11 @@ export PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"
 
 MODEL_SHORTCODE="granite"
 DATASET_SHORTCODE="medexqa"
-EPOCHS=4                 # small dataset -> few epochs
-BATCH_SIZE=4             # explanations are multi-token; keep the micro-batch modest
+EPOCHS=10                    # ceiling; early stopping ends sooner (val bottomed ~epoch 2)
+BATCH_SIZE=4                 # explanations are multi-token; keep the micro-batch modest
 LEARNING_RATE=5e-5
 SEED=42
+EARLY_STOP_PATIENCE=2       # epochs of no val-loss improvement before stopping; best checkpoint kept
 
 echo "Repo root: $REPO_ROOT"
 echo "Python:    $(which python)"
@@ -35,8 +36,8 @@ mkdir -p logs
 
 echo "############################################################"
 echo "# Stage-1 KVQ (generation) -- granite / medexqa"
-echo "# epochs=${EPOCHS} batch=${BATCH_SIZE} lr=${LEARNING_RATE} seed=${SEED}"
-echo "# -> ./adapters/${MODEL_SHORTCODE}-${DATASET_SHORTCODE}"
+echo "# epochs<=${EPOCHS} (early-stop patience ${EARLY_STOP_PATIENCE}) batch=${BATCH_SIZE} lr=${LEARNING_RATE} seed=${SEED}"
+echo "# -> ./adapters/${MODEL_SHORTCODE}-${DATASET_SHORTCODE} (best val-loss checkpoint)"
 echo "############################################################"
 
 python scripts/python/kvq-tuning.py \
@@ -45,7 +46,8 @@ python scripts/python/kvq-tuning.py \
     --epochs "$EPOCHS" \
     --batch_size "$BATCH_SIZE" \
     --lr "$LEARNING_RATE" \
-    --seed "$SEED"
+    --seed "$SEED" \
+    --early_stop_patience "$EARLY_STOP_PATIENCE"
 
 echo ""
 echo "Stage-1 adapter saved to ./adapters/${MODEL_SHORTCODE}-${DATASET_SHORTCODE}"
