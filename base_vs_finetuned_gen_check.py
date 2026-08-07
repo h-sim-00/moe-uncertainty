@@ -70,7 +70,7 @@ def main():
 
     # Same test split the training carved out (first 175 pooled rows, seed 42).
     print(f"[data] loading {args.dataset_shortcode} test split ...", flush=True)
-    test_dataset, _ = load_exp_dataset(args.dataset_shortcode, seed=args.seed)
+    test_dataset = load_exp_dataset(args.dataset_shortcode, seed=args.seed, split="test")
     examples = list(test_dataset)[: args.n]
     print(f"[data] using {len(examples)} test examples", flush=True)
 
