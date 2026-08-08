@@ -193,10 +193,16 @@ def load_granite_bayesian_routers(model, method, args):
             **router_kwargs
         )
         weights_path = os.path.join(weights_dir, f"layer_{layer_idx}_weights.pt")
-        if os.path.exists(weights_path):
-            new_router.load_weights(weights_path, device=model.device)
-        else:
-            print(f"Warning: No weights found for layer {layer_idx} at {weights_path}. Using MAP initialization.")
+        if not os.path.exists(weights_path):
+            # Hard error (was a print warning): a freshly-initialised router
+            # emits a near-constant uncertainty signal, so a silent fallback
+            # here produces a full, plausible-looking eval run with no trained
+            # signal in it. Fail loudly instead.
+            raise FileNotFoundError(
+                f"No trained {method.upper()} weights for layer {layer_idx} at {weights_path}. "
+                f"Check --run_suffix / --swap_layers / --dataset_shortcode against the training run."
+            )
+        new_router.load_weights(weights_path, device=model.device)
 
         target_layer.block_sparse_moe.router = new_router.to(model.device)
     

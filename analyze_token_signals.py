@@ -48,6 +48,7 @@ import json
 import os
 import re
 import string
+from collections import Counter
 
 import numpy as np
 import torch
@@ -133,6 +134,8 @@ def parse_args():
                         "(which always use their own template).")
     # --- analysis knobs ---
     p.add_argument("--spike_pct", type=float, default=0.15, help="Top/bottom fraction defining a 'spike'.")
+    p.add_argument("--seq_last_k", type=int, default=10,
+                   help="[--generate] Window for the last-k sequence-level aggregates in the abstention readout.")
     p.add_argument("--max_html_examples", type=int, default=10)
     p.add_argument("--output_dir", type=str, default="results/token_analysis")
     p.add_argument("--tag", type=str, default=None, help="Extra tag appended to output filenames.")
@@ -219,15 +222,39 @@ def collect_per_token(model, tokenizer, text_string, fcvr_layers, causal_model, 
     return records_from_ids(model, tokenizer, ids, fcvr_layers, causal_model, device, answer_start=0)
 
 
+def _unigram_f1(pred, ref):
+    """Whitespace-unigram F1 (dependency-free ROUGE-1 stand-in) between a
+    generated explanation and a gold reference."""
+    tok = lambda s: [w.strip(string.punctuation).lower() for w in s.split()]
+    p = [w for w in tok(pred) if w]
+    r = [w for w in tok(ref) if w]
+    if not p or not r:
+        return 0.0
+    overlap = sum((Counter(p) & Counter(r)).values())
+    if overlap == 0:
+        return 0.0
+    prec, rec = overlap / len(p), overlap / len(r)
+    return 2 * prec * rec / (prec + rec)
+
+
 def collect_medexqa(model, tokenizer, args, fcvr_layers, causal_model, device):
     """MedExQA generation source. Teacher-forced over the gold explanation, or
     (with --generate) over the model's own greedily-generated explanation. Only
-    the answer (explanation) region is analysed."""
+    the answer (explanation) region is analysed.
+
+    In --generate mode each example additionally gets a sequence-level meta
+    record: the generated text, a unigram-F1 quality score against the (up to
+    two) gold explanations, and a LETTER-PROBE correctness label -- the model
+    is asked the same question in MCQA form and its argmax choice over
+    {A,B,C,D} is compared with the dataset's gold answer letter. These labels
+    feed the abstention readout (see abstention_analysis)."""
     ds = load_exp_dataset("medexqa", split="test")[: args.num_examples]
     pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
     eos = tokenizer.eos_token or ""
+    choices = ["A", "B", "C", "D"]
+    choice_ids = torch.tensor([tokenizer.convert_tokens_to_ids(c) for c in choices], device=device)
 
-    per_example, raw_texts = [], []
+    per_example, raw_texts, metas = [], [], []
     for ex in tqdm(ds, desc="generate" if args.generate else "teacher-force"):
         prompt = generation_prompt_engineer(ex, tokenizer=tokenizer)["question"]
         prompt_ids = tokenizer(
@@ -249,9 +276,32 @@ def collect_medexqa(model, tokenizer, args, fcvr_layers, causal_model, device):
         recs = records_from_ids(
             model, tokenizer, full_ids, fcvr_layers, causal_model, device, answer_start=answer_start
         )
+
+        meta = {"id": ex.get("id", ""), "gold_letter": ex.get("gold_letter", "")}
+        if args.generate:
+            gen_ids = full_ids[answer_start:]
+            gen_text = tokenizer.decode(gen_ids, skip_special_tokens=True)
+            meta["n_gen_tokens"] = int(gen_ids.shape[0])
+            meta["gen_text"] = gen_text[:400]
+            refs = [str(ex["answer"])] + ([str(ex["explanation_2"])] if ex.get("explanation_2") else [])
+            meta["expl_f1"] = max(_unigram_f1(gen_text, r) for r in refs)
+            if ex.get("gold_letter") and ex.get("letter_question"):
+                probe = multiple_choice_prompt_engineer(
+                    {"question": ex["letter_question"], "answer": ex["gold_letter"], "id": meta["id"]},
+                    tokenizer=tokenizer,
+                )["question"]
+                probe_ids = tokenizer(
+                    probe, return_tensors="pt", add_special_tokens=False, truncation=True, max_length=2048
+                ).input_ids.to(device)
+                with torch.no_grad():
+                    letter_logits = model(input_ids=probe_ids).logits[0, -1, :][choice_ids]
+                meta["pred_letter"] = choices[int(letter_logits.argmax().item())]
+                meta["correct"] = bool(meta["pred_letter"] == ex["gold_letter"])
+
         per_example.append(recs)
         raw_texts.append(ex["question"][:160])
-    return per_example, raw_texts
+        metas.append(meta)
+    return per_example, raw_texts, metas
 
 
 def build_prose_texts(args, tokenizer):
@@ -348,6 +398,28 @@ def analyze(all_records, per_example_records, spike_pct):
         "frac_positive": float(np.mean([x > 0 for x in per_ex_spearman])) if per_ex_spearman else float("nan"),
     }
 
+    # Permutation null for the headline statistic: shuffle ilv WITHIN each
+    # example, recompute the per-example-mean Spearman, repeat. This replaces
+    # the arbitrary +-0.20 rules of thumb with an empirical reference.
+    rng = np.random.default_rng(0)
+    pairs = [([r["inf_log_var"] for r in recs], [r["entropy"] for r in recs])
+             for recs in per_example_records if len(recs) >= 3]
+    null_means = []
+    for _ in range(200):
+        vals = []
+        for ilv_l, ent_l in pairs:
+            vals.append(_spearman(rng.permutation(ilv_l), ent_l)[0])
+        vals = [v for v in vals if not np.isnan(v)]
+        if vals:
+            null_means.append(float(np.mean(vals)))
+    obs = corr["per_example_spearman_ilv_entropy"]["mean"]
+    if null_means and not np.isnan(obs):
+        null_arr = np.asarray(null_means)
+        corr["per_example_spearman_ilv_entropy"]["null_mean"] = float(null_arr.mean())
+        corr["per_example_spearman_ilv_entropy"]["null_std"] = float(null_arr.std())
+        corr["per_example_spearman_ilv_entropy"]["perm_p_two_sided"] = float(
+            np.mean(np.abs(null_arr) >= abs(obs)))
+
     cat_z = {}
     for recs in per_example_records:
         if len(recs) < 3:
@@ -401,6 +473,10 @@ def verdict(summary):
     sp = summary["spikes"]
     lines = []
     lines.append(f"per-example mean Spearman(inf_log_var, entropy) = {r:+.3f}")
+    ne = summary["correlation"]["per_example_spearman_ilv_entropy"]
+    if "null_mean" in ne:
+        lines.append(f"  vs within-example permutation null {ne['null_mean']:+.3f} "
+                     f"± {ne['null_std']:.3f}  (two-sided p ≈ {ne['perm_p_two_sided']:.3f})")
     lines.append(f"pooled z-scored Spearman(inf_log_var, entropy)  = {zr:+.3f}")
     lines.append(f"spike Jaccard  (entropy-top vs ilv-top)   = {sp['jaccard_entropySpike_vs_ilvSpike']:.3f}")
     lines.append(f"spike Jaccard  (entropy-top vs ilv-BOTTOM) = {sp['jaccard_entropySpike_vs_ilvTrough']:.3f}  "
@@ -419,6 +495,73 @@ def verdict(summary):
                "uncertainty even after generation fine-tuning. A valid finding.")
     lines.append("VERDICT: " + tag)
     return "\n".join(lines)
+
+
+def abstention_analysis(per_example_records, metas, last_k=10):
+    """Sequence-level abstention readout (--generate mode only).
+
+    Aggregates the per-token Inf-Logit-Var over each generated explanation
+    (mean / max / last / mean & max over the last k tokens) and tests whether
+    any aggregate predicts that the model answered the underlying question
+    WRONG (letter-probe label). Every ILV aggregate is benchmarked against the
+    signals a decoder gets for free: mean/max predictive entropy and
+    per-token NLL of the generated sequence. AUROC < 0.5 means the INVERTED
+    score is the informative direction (flipped AUROC = 1 - AUROC)."""
+    rows = []
+    for recs, m in zip(per_example_records, metas):
+        if not recs or m.get("correct") is None:
+            continue
+        ilv = [r["inf_log_var"] for r in recs]
+        ent = [r["entropy"] for r in recs]
+        sur = [r["surprisal"] for r in recs]
+        k = min(last_k, len(ilv))
+        rows.append({
+            "id": m.get("id", ""),
+            "wrong": 0 if m["correct"] else 1,
+            "pred_letter": m.get("pred_letter"),
+            "gold_letter": m.get("gold_letter"),
+            "expl_f1": m.get("expl_f1"),
+            "n_gen_tokens": m.get("n_gen_tokens"),
+            "scores": {
+                "ilv_mean": float(np.mean(ilv)),
+                "ilv_max": float(np.max(ilv)),
+                "ilv_last": float(ilv[-1]),
+                f"ilv_mean_last{last_k}": float(np.mean(ilv[-k:])),
+                f"ilv_max_last{last_k}": float(np.max(ilv[-k:])),
+                "entropy_mean_BASELINE": float(np.mean(ent)),
+                "entropy_max_BASELINE": float(np.max(ent)),
+                "nll_per_token_BASELINE": float(np.mean(sur)),
+            },
+        })
+    if not rows:
+        return None, []
+
+    labels = [r["wrong"] for r in rows]
+    f1s = [r["expl_f1"] for r in rows]
+    result = {
+        "n": len(rows),
+        "n_wrong": int(np.sum(labels)),
+        "letter_probe_accuracy": float(1.0 - np.mean(labels)),
+        "auroc_predict_wrong": {},
+        "spearman_vs_expl_f1": {},
+        "note": ("auroc_predict_wrong: score-high should flag WRONG answers; AUROC < 0.5 "
+                 "means the inverted score works (flipped = 1 - AUROC). An ILV aggregate "
+                 "must beat the *_BASELINE rows to add value at decode time. "
+                 "spearman_vs_expl_f1: negative = high score tracks LOW explanation quality."),
+    }
+    try:
+        from sklearn.metrics import roc_auc_score
+        have_sklearn = True
+    except Exception:
+        have_sklearn = False
+    for name in rows[0]["scores"]:
+        s = [r["scores"][name] for r in rows]
+        if have_sklearn and len(set(labels)) == 2:
+            result["auroc_predict_wrong"][name] = float(roc_auc_score(labels, s))
+        else:
+            result["auroc_predict_wrong"][name] = float("nan")
+        result["spearman_vs_expl_f1"][name] = _spearman(s, f1s)[0]
+    return result, rows
 
 
 # ---------------------------------------------------------------------------
@@ -507,13 +650,13 @@ def main():
     if args.source == "medexqa":
         mode = "generate" if args.generate else "teacher_forced"
         print(f"MedExQA source | mode={mode} | answer-region only | {args.num_examples} examples")
-        per_example, raw_texts = collect_medexqa(model, tokenizer, args, fcvr_layers, causal_model, model.device)
+        per_example, raw_texts, metas = collect_medexqa(model, tokenizer, args, fcvr_layers, causal_model, model.device)
     else:
         mode = args.source
         texts = build_prose_texts(args, tokenizer)
         print(f"Analysing {len(texts)} examples from source='{args.source}' "
               f"(chat_template={'yes' if (args.chat_template or args.source == 'obqa') else 'no'})")
-        per_example, raw_texts = [], []
+        per_example, raw_texts, metas = [], [], None
         for raw, tokstr in tqdm(texts, desc="forward"):
             per_example.append(collect_per_token(model, tokenizer, tokstr, fcvr_layers, causal_model, model.device))
             raw_texts.append(raw)
@@ -532,6 +675,14 @@ def main():
     v = verdict(summary)
     summary["verdict"] = v
 
+    # Sequence-level abstention readout (generate mode only): does an
+    # aggregate of the per-token signal predict a WRONG letter-probe answer?
+    seq_rows = []
+    if args.source == "medexqa" and args.generate and metas is not None:
+        abst, seq_rows = abstention_analysis(per_example, metas, last_k=args.seq_last_k)
+        if abst is not None:
+            summary["abstention"] = abst
+
     os.makedirs(args.output_dir, exist_ok=True)
     tag = f"_{args.tag}" if args.tag else ""
     base = os.path.join(args.output_dir, f"step1_{args.source}_{mode}{tag}")
@@ -543,6 +694,10 @@ def main():
                 rr = {k: val for k, val in r.items() if k != "inf_log_var_per_layer"}
                 rr["example"] = ex_i
                 f.write(json.dumps(rr) + "\n")
+    if seq_rows:
+        with open(base + "_seqlevel.jsonl", "w") as f:
+            for r in seq_rows:
+                f.write(json.dumps(r) + "\n")
     write_html(per_example, raw_texts, base + ".html", args.max_html_examples)
     write_plots(all_records, summary, base + ".png")
 
@@ -552,7 +707,17 @@ def main():
     print("\nPer-category (z-scored within example; >0 = elevated):")
     for c, d in summary["category"].items():
         print(f"  {c:11s} n={d['n']:5d}  ilv_z={d['inf_log_var_z_mean']:+.3f}  ent_z={d['entropy_z_mean']:+.3f}")
-    print(f"\nSaved: {base}.json / _pertoken.jsonl / .html / .png")
+    if summary.get("abstention"):
+        a = summary["abstention"]
+        print(f"\nSequence-level abstention readout "
+              f"(n={a['n']}, wrong={a['n_wrong']}, letter-probe acc={a['letter_probe_accuracy']:.3f}):")
+        for name, auc in a["auroc_predict_wrong"].items():
+            flip = (1.0 - auc) if not np.isnan(auc) else float("nan")
+            print(f"  AUROC(wrong)[{name:26s}] = {auc:.3f}   flipped = {flip:.3f}   "
+                  f"spearman_vs_f1 = {a['spearman_vs_expl_f1'][name]:+.3f}")
+        print("  (ILV aggregates must beat the *_BASELINE rows to matter.)")
+    print(f"\nSaved: {base}.json / _pertoken.jsonl / .html / .png"
+          + (" / _seqlevel.jsonl" if seq_rows else ""))
 
 
 if __name__ == "__main__":

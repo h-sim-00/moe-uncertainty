@@ -562,6 +562,14 @@ def load_exp_dataset(dataset_shortcode, seed=42, split=None):
 
         def reformat_medexqa(cols):
             # Header-less row: at least [question, A, B, C, D, explanation1].
+            # Cols 6/7 (Explanation 2, correct answer letter) are now kept when
+            # present: the letter gives a cheap per-example correctness label
+            # for the abstention readout, and the second explanation gives a
+            # two-reference quality target. Training consumes only
+            # question/answer, so these extra fields change nothing upstream.
+            # NOTE: this function must consume the global RNG exactly once per
+            # row (the id) -- the shuffle below depends on it, so adding RNG
+            # calls here would silently change the train/val/test split.
             if len(cols) < 6:
                 return None
             q = str(cols[0]).strip()
@@ -569,6 +577,10 @@ def load_exp_dataset(dataset_shortcode, seed=42, split=None):
             e1 = str(cols[5]).strip()
             if not q or not e1:
                 return None
+            e2 = str(cols[6]).strip() if len(cols) > 6 else ""
+            gold = str(cols[7]).strip().upper() if len(cols) > 7 else ""
+            if gold not in {"A", "B", "C", "D"}:
+                gold = ""
             opts = "\n".join(f"{lab}. {txt}" for lab, txt in zip(["A", "B", "C", "D"], choices) if txt)
             return {
                 "question": f"Question: {q}\nOptions:\n{opts}\n\nExplain the reasoning for the correct answer.",
@@ -576,6 +588,10 @@ def load_exp_dataset(dataset_shortcode, seed=42, split=None):
                 # space for a clean sub-word split at the prompt/answer boundary.
                 "answer": " " + e1,
                 "id": f"medexqa_{random.randint(100000, 999999)}",
+                "explanation_2": e2,
+                "gold_letter": gold,
+                # MCQA-style prompt for the letter-probe correctness label.
+                "letter_question": f"Question: {q}\nChoices:\n{opts}\nAnswer:",
             }
 
         pool = []
