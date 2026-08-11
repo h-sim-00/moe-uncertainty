@@ -60,10 +60,15 @@ def main():
     idx = torch.device(device).index or 0
     props = torch.cuda.get_device_properties(idx)
     total = props.total_memory / GiB
-    free_now = torch.cuda.mem_get_info(idx)[0] / GiB
+    try:
+        # On unified-memory parts (e.g. GB10) nvidia-smi reports "Not Supported";
+        # this may also be unavailable or report the shared CPU+GPU pool.
+        free_now = f"{torch.cuda.mem_get_info(idx)[0] / GiB:.1f} GiB"
+    except Exception as e:  # noqa: BLE001 - informational only
+        free_now = f"unavailable ({type(e).__name__})"
 
     print("=" * 70)
-    print(f"GPU {idx}: {props.name} | total {total:.1f} GiB | free right now {free_now:.1f} GiB")
+    print(f"GPU {idx}: {props.name} | total {total:.1f} GiB | free right now {free_now}")
     print(f"torch {torch.__version__} | mode={args.finetune_mode} r={args.expert_lora_r} "
           f"batch={args.batch_size} lr={args.lr}")
     print("=" * 70)
