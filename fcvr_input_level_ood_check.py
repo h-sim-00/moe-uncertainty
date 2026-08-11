@@ -107,10 +107,24 @@ def _auc(id_scores, ood_scores):
     return float(roc_auc_score(labels, scores)), float(average_precision_score(labels, scores))
 
 
+# Datasets sharing the medical-exam domain: none of these may serve as an OoD
+# set when the ID anchor (the training dataset) is one of them.
+MEDICAL_DATASETS = {"medexqa", "medmcqa_med"}
+
+
 def main():
     setup_environment()
     args = parse_args()
     torch.manual_seed(args.seed)
+
+    invalid = [c for c in args.ood_datasets
+               if c == args.dataset_shortcode
+               or (args.dataset_shortcode in MEDICAL_DATASETS and c in MEDICAL_DATASETS)]
+    if invalid:
+        print(f"SKIP {invalid}: same domain as ID anchor '{args.dataset_shortcode}' -- not valid OoD sets")
+        args.ood_datasets = [c for c in args.ood_datasets if c not in invalid]
+    if not args.ood_datasets:
+        raise SystemExit("No valid OoD datasets left after same-domain filtering.")
 
     model = load_peft_model_and_adapter(
         args.model_shortcode, adapter_path=args.kvq_adapter_path, device_map="cuda:0"
