@@ -1,3 +1,13 @@
+"""
+Stage 1: deterministic MAP adaptation with LoRA (paper Appendix D.2).
+
+The paper applies LoRA to "the attention modules (Q/K/V projections) and the
+Expert networks". `--finetune_mode qkv_experts` (the default on this branch)
+does both: PEFT adapts Q/K/V, and model.expert_lora adapts every expert matrix
+of every MoE layer. `--finetune_mode qkv` reproduces the original Q/K/V-only
+behaviour.
+"""
+
 import argparse
 import wandb
 import torch
@@ -7,6 +17,7 @@ from tqdm import tqdm
 from transformers import DataCollatorForLanguageModeling
 from utils import setup_environment
 from model import load_peft_model, load_tokenizer
+from model.expert_lora import save_expert_lora, expert_lora_path
 from utils import load_and_prepare_train_and_val_data
 
 def train(model, tokenizer, train_loader, val_loader, args):
@@ -15,6 +26,8 @@ def train(model, tokenizer, train_loader, val_loader, args):
     """
     project_name = "moe-uncertainty"
     run_name = f"{args.model_shortcode}_{args.dataset_shortcode}"
+    if args.adapter_suffix:
+        run_name = f"{run_name}_{args.adapter_suffix}"
     wandb.init(project=project_name, name=run_name, config=vars(args), reinit=True)
     
     num_training_batches = len(train_loader)
@@ -55,13 +68,25 @@ def train(model, tokenizer, train_loader, val_loader, args):
 
     # Updated final save path format
     final_save_path = f"./adapters/{args.model_shortcode}-{args.dataset_shortcode}"
+    if args.adapter_suffix:
+        final_save_path = f"{final_save_path}-{args.adapter_suffix}"
     print(f"Saving the best adapter weights to {final_save_path}")
     model.save_pretrained(final_save_path)
+    # PEFT only serialises the Q/K/V adapters; the expert-LoRA factors live in
+    # a custom module and are written next to them inside the same directory.
+    if args.finetune_mode == "qkv_experts":
+        save_expert_lora(model, expert_lora_path(final_save_path))
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Fine-tune a model with LoRA on a specific MMLU subject.")
     parser.add_argument("--model_shortcode", type=str, default="granite", help="Shortcode for the model to use.")
     parser.add_argument("--dataset_shortcode", type=str, required=True, help="Shortcode for the MMLU subject to fine-tune on.")
+    parser.add_argument("--finetune_mode", type=str, default="qkv_experts", choices=["qkv", "qkv_experts"],
+                        help="'qkv_experts' (paper D.2): LoRA on Q/K/V AND the expert networks. 'qkv': Q/K/V only.")
+    parser.add_argument("--expert_lora_r", type=int, default=64,
+                        help="LoRA rank for the expert matrices (the paper does not state a rank; 64 matches the Q/K/V rank used here). Lower it if the run OOMs.")
+    parser.add_argument("--adapter_suffix", type=str, default=None,
+                        help="Suffix on ./adapters/<model>-<dataset>; keeps this run from overwriting an existing adapter.")
     parser.add_argument("--epochs", type=int, default=5, help="Number of training epochs.")
     parser.add_argument("--batch_size", type=int, default=8, help="Training and evaluation batch size.")
     parser.add_argument("--lr", type=float, default=5e-5, help="Learning rate for the optimizer.")
@@ -74,11 +99,16 @@ def main():
     setup_environment()
     args = parse_args()
 
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+
     device = "cuda:0"
 
     model = load_peft_model(
-        args.model_shortcode, 
-        finetune_mode="qkv", 
+        args.model_shortcode,
+        finetune_mode=args.finetune_mode,
+        expert_lora_r=args.expert_lora_r,
         device_map=device
     )
     tokenizer = load_tokenizer(args.model_shortcode)

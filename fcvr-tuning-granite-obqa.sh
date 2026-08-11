@@ -12,14 +12,20 @@
 #   4 = effective batch 16, up to 10 epochs with early stopping on val NLL,
 #   S=1 train reparameterisation sample.
 #
+# Stage 1 on this branch adapts Q/K/V AND the expert networks (paper D.2), so
+# this reads the ./adapters/granite-obqa-experts adapter and tags every run
+# with "experts-" to keep it separate from exp-3's Q/K/V-only results.
+#
 # Nothing overwrites anything: each beta writes to its own weights dir
-#   ./router_weights/fcvr/fcvr-granite-obqa-pretrained-prior-beta<b>/
-# via --run_suffix, and neither touches the progressive run's
-#   ./router_weights/fcvr/fcvr-granite-obqa/.
+#   ./router_weights/fcvr/fcvr-granite-obqa-experts-pretrained-prior-beta<b>/
+# via --run_suffix, and none of them touch exp-3's
+#   ./router_weights/fcvr/fcvr-granite-obqa-pretrained-prior-beta<b>/ or the
+#   progressive run's ./router_weights/fcvr/fcvr-granite-obqa/.
 #
 # Plain bash for a tmux session over ssh (NO SLURM). Runs from the repo root.
 #
-# Prereq: Stage-1 (KVQ) adapter at ./adapters/granite-obqa.
+# Prereq: Stage-1 (KVQ+experts) adapter at ./adapters/granite-obqa-experts,
+#         produced by kvq-tuning-granite-obqa-experts.sh.
 #         (pretrained-prior does NOT need the Stage-2a MAP router weights.)
 # ============================================================================
 
@@ -47,6 +53,7 @@ LEARNING_RATE=1e-4
 WARMUP_RATIO=0.05
 EARLY_STOP_PATIENCE=3
 PRIOR_SOURCE="pretrained"
+ADAPTER_SUFFIX="experts"   # Stage-1 adapter with LoRA on Q/K/V + expert networks
 
 # Susceptible-10 layers, trained jointly in one run.
 LAYERS=(5 6 7 8 19 20 28 29 30 31)
@@ -54,11 +61,18 @@ LAYERS=(5 6 7 8 19 20 28 29 30 31)
 # Paper's VGLR beta grid.
 BETAS=(0.01 0.1)
 
-BASE_ADAPTER_PATH="./adapters/${MODEL_SHORTCODE}-${DATASET_SHORTCODE}"
+BASE_ADAPTER_PATH="./adapters/${MODEL_SHORTCODE}-${DATASET_SHORTCODE}-${ADAPTER_SUFFIX}"
 
-# --- Prereq: Stage-1 adapter ---
+# --- Prereq: Stage-1 adapter (Q/K/V + experts) ---
 if [ ! -d "$BASE_ADAPTER_PATH" ]; then
     echo "ERROR: Stage-1 adapter not found at $BASE_ADAPTER_PATH" >&2
+    echo "       Run: bash kvq-tuning-granite-obqa-experts.sh" >&2
+    exit 1
+fi
+if [ ! -f "$BASE_ADAPTER_PATH/expert_lora.pt" ]; then
+    echo "ERROR: $BASE_ADAPTER_PATH has no expert_lora.pt -- that adapter was" >&2
+    echo "       trained WITHOUT the expert networks. Re-run Stage 1 with" >&2
+    echo "       --finetune_mode qkv_experts." >&2
     exit 1
 fi
 
@@ -72,7 +86,7 @@ echo "# epochs<=${EPOCHS} early-stop patience=${EARLY_STOP_PATIENCE} seed=${SEED
 echo "############################################################"
 
 for BETA in "${BETAS[@]}"; do
-    SUFFIX="pretrained-prior-beta${BETA}"
+    SUFFIX="${ADAPTER_SUFFIX}-pretrained-prior-beta${BETA}"
 
     echo ""
     echo "===================================================="

@@ -11,8 +11,9 @@
 # overwrites anything. Can be run standalone to re-evaluate without retraining
 # (it is also invoked at the end of the training script).
 #
-# Prereq: Stage-1 adapter ./adapters/granite-obqa, and per beta the FCVR weights
-# in ./router_weights/fcvr/fcvr-granite-obqa-pretrained-prior-beta<b>/ .
+# Prereq: Stage-1 adapter ./adapters/granite-obqa-experts (LoRA on Q/K/V AND the
+# expert networks, paper D.2), and per beta the FCVR weights in
+# ./router_weights/fcvr/fcvr-granite-obqa-experts-pretrained-prior-beta<b>/ .
 # (pretrained-prior does NOT need the Stage-2a MAP router weights.)
 # ============================================================================
 
@@ -36,14 +37,21 @@ SEED=42
 BATCH_SIZE=8
 NUM_SAMPLES=35
 PRIOR_SOURCE="pretrained"
+ADAPTER_SUFFIX="experts"   # Stage-1 adapter with LoRA on Q/K/V + expert networks
 LAYERS=(5 6 7 8 19 20 28 29 30 31)
 BETAS=(0.01 0.1)
 
-BASE_ADAPTER_PATH="./adapters/${MODEL_SHORTCODE}-${DATASET_SHORTCODE}"
+BASE_ADAPTER_PATH="./adapters/${MODEL_SHORTCODE}-${DATASET_SHORTCODE}-${ADAPTER_SUFFIX}"
 RESULTS_DIR="./results/fcvr"
 
 if [ ! -d "$BASE_ADAPTER_PATH" ]; then
     echo "ERROR: Stage-1 adapter not found at $BASE_ADAPTER_PATH" >&2
+    echo "       Run: bash kvq-tuning-granite-obqa-experts.sh" >&2
+    exit 1
+fi
+if [ ! -f "$BASE_ADAPTER_PATH/expert_lora.pt" ]; then
+    echo "ERROR: $BASE_ADAPTER_PATH has no expert_lora.pt -- that adapter was" >&2
+    echo "       trained WITHOUT the expert networks." >&2
     exit 1
 fi
 mkdir -p "$RESULTS_DIR"
@@ -51,7 +59,7 @@ mkdir -p "$RESULTS_DIR"
 LAYER_TAG=$(printf '%s-' "${LAYERS[@]}"); LAYER_TAG=${LAYER_TAG%-}
 
 for BETA in "${BETAS[@]}"; do
-    SUFFIX="pretrained-prior-beta${BETA}"
+    SUFFIX="${ADAPTER_SUFFIX}-pretrained-prior-beta${BETA}"
     FCVR_WEIGHTS_DIR="./router_weights/fcvr/fcvr-${MODEL_SHORTCODE}-${DATASET_SHORTCODE}-${SUFFIX}"
 
     echo ""
@@ -103,5 +111,5 @@ done
 echo ""
 echo "===================================================="
 echo "FCVR evaluation complete for beta in {${BETAS[*]}}."
-echo "Results in ${RESULTS_DIR}/  (files tagged -pretrained-prior-beta<b>)"
+echo "Results in ${RESULTS_DIR}/  (files tagged -${ADAPTER_SUFFIX}-pretrained-prior-beta<b>)"
 echo "===================================================="

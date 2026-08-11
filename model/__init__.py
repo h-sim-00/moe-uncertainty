@@ -34,8 +34,15 @@ def load_model(model_shortcode: str, device_map: str = "cuda:0"):
         from transformers import AutoModelForCausalLM
         return AutoModelForCausalLM.from_pretrained(MODEL_SHORTCODE2ID[model_shortcode], device_map=device_map)
 
-def load_peft_model(model_shortcode: str, finetune_mode: str, r: int = 64, lora_dropout: float = 0.01, target_layer: int | None = None, device_map="cuda:0") -> PreTrainedModel:
-    """Loads the base model and applies LoRA configuration."""
+def load_peft_model(model_shortcode: str, finetune_mode: str, r: int = 64, lora_dropout: float = 0.01, target_layer: int | None = None, device_map="cuda:0", expert_lora_r: int | None = None) -> PreTrainedModel:
+    """Loads the base model and applies LoRA configuration.
+
+    finetune_mode='qkv_experts' is the paper-faithful Stage-1 setting (App. D.2:
+    "LoRA adapters are applied to the attention modules (Q/K/V projections) and
+    the Expert networks"). PEFT handles Q/K/V; the experts live in a custom
+    3-D-parameter module that PEFT cannot wrap, so they are adapted by
+    model.expert_lora after the PEFT wrap.
+    """
     assert model_shortcode in MODEL_SHORTCODE2ID, f"Model shortcode '{model_shortcode}' not defined."
 
     base_model = load_model(model_shortcode, device_map=device_map)
@@ -50,7 +57,7 @@ def load_peft_model(model_shortcode: str, finetune_mode: str, r: int = 64, lora_
         else:
             print("Applying LoRA to routers of ALL layers.")
             target_modules = ["router.layer"] # This uses regex-like matching for module names
-    elif finetune_mode == 'qkv':
+    elif finetune_mode in ('qkv', 'qkv_experts'):
         # Your existing logic for targeting attention layers
         target_modules = ["q_proj", "k_proj", "v_proj"]
     else:
@@ -66,19 +73,45 @@ def load_peft_model(model_shortcode: str, finetune_mode: str, r: int = 64, lora_
     )
 
     peft_model = get_peft_model(base_model, peft_config)
+
+    if finetune_mode == 'qkv_experts':
+        assert "granite" in model_shortcode, \
+            "finetune_mode='qkv_experts' is only implemented for Granite MoE."
+        from .expert_lora import inject_expert_lora
+        # Injected after get_peft_model, which freezes every base parameter;
+        # the newly created expert-LoRA factors are trainable by default.
+        inject_expert_lora(
+            peft_model,
+            r=expert_lora_r if expert_lora_r is not None else r,
+            lora_alpha=16,
+            lora_dropout=lora_dropout,
+        )
+
     peft_model.print_trainable_parameters()
-    
+
     return peft_model
 
 def load_peft_model_and_adapter(model_shortcode: str, adapter_path: str, eval_mode: bool = True, device_map="cuda:0") -> PeftModel:
-    """Loads the base model and applies the trained LoRA adapter."""
+    """Loads the base model and applies the trained LoRA adapter.
+
+    If the adapter directory also contains expert-LoRA weights (Stage 1 trained
+    with finetune_mode='qkv_experts'), they are injected and loaded too, so
+    every downstream stage sees the same Stage-1 model.
+    """
     assert model_shortcode in MODEL_SHORTCODE2ID, f"Model shortcode '{model_shortcode}' not defined."
     print(f"Loading base model: {model_shortcode}")
     base_model = load_model(model_shortcode, device_map=device_map)
-    
+
     print(f"Loading PEFT adapter from: {adapter_path}")
     peft_model = PeftModel.from_pretrained(base_model, adapter_path, is_trainable=True)
-    
+
+    from .expert_lora import EXPERT_LORA_FILENAME, has_expert_lora, expert_lora_path, load_expert_lora
+    if has_expert_lora(adapter_path):
+        print(f"Found expert-LoRA weights in {adapter_path}; loading them.")
+        load_expert_lora(peft_model, expert_lora_path(adapter_path))
+    else:
+        print(f"No {EXPERT_LORA_FILENAME} in {adapter_path}; experts stay at their pre-trained weights.")
+
     if eval_mode:
         peft_model.eval()
 
