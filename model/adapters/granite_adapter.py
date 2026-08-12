@@ -21,8 +21,14 @@ ROUTER_CONFIG = {
     },
     "fcvr": {
         "class": FullCovarianceVariationalRouter,
-        "get_kwargs": lambda args: {},
-        "trainable_attrs": ["backbone", "mean_head", "cholesky_head"]
+        # getattr defaults keep callers without these args (mfvr etc. share this
+        # code path) working unchanged.
+        "get_kwargs": lambda args: {
+            "prior_std": getattr(args, "prior_std", 1.0),
+            "input_layernorm": getattr(args, "input_layernorm", False),
+            "separate_trunks": getattr(args, "separate_trunks", False),
+        },
+        "trainable_attrs": ["backbone", "mean_head", "cholesky_head", "cholesky_backbone"]
     },
     "vtsr": {
         "class": VariationalTemperatureRouter,
@@ -133,7 +139,10 @@ def prepare_granite_bayesian_routers(model, method, args):
                 param.requires_grad = True
         else:
             for attr_name in trainable_attrs:
-                submodule = getattr(router, attr_name)
+                # Optional attrs (e.g. fcvr's cholesky_backbone) may be absent/None.
+                submodule = getattr(router, attr_name, None)
+                if submodule is None:
+                    continue
                 for param in submodule.parameters():
                     param.requires_grad = True
     return model
@@ -161,8 +170,14 @@ def save_granite_bayesian_routers(model, method, args):
         causal_model.layers[layer_idx].block_sparse_moe.router.save_weights(save_path)
 
 # (6) Load Bayesian Parameters
-def load_granite_bayesian_routers(model, method, args):
-    """A generic function to load pre-trained Bayesian routers for evaluation."""
+def load_granite_bayesian_routers(model, method, args, load_weights=True, strict=True):
+    """A generic function to load pre-trained Bayesian routers for evaluation.
+
+    load_weights=False leaves every swapped router at its (seed-governed) random
+    initialization - the explicit path for untrained-control evaluations.
+    strict=True raises if a weight file is missing instead of silently falling
+    back to random init (so a run_suffix typo cannot evaluate a random model).
+    """
     if method not in ROUTER_CONFIG:
         raise ValueError(f"Unknown Bayesian method: {method}. Supported methods are {list(ROUTER_CONFIG.keys())}")
 
@@ -192,11 +207,20 @@ def load_granite_bayesian_routers(model, method, args):
             existing_router=target_layer.block_sparse_moe.router,
             **router_kwargs
         )
-        weights_path = os.path.join(weights_dir, f"layer_{layer_idx}_weights.pt")
-        if os.path.exists(weights_path):
-            new_router.load_weights(weights_path, device=model.device)
+        if load_weights:
+            weights_path = os.path.join(weights_dir, f"layer_{layer_idx}_weights.pt")
+            if os.path.exists(weights_path):
+                new_router.load_weights(weights_path, device=model.device)
+            elif strict:
+                raise FileNotFoundError(
+                    f"{method.upper()} weights missing for layer {layer_idx}: {weights_path}. "
+                    f"Refusing silent random-init fallback (pass load_weights=False for an "
+                    f"untrained control)."
+                )
+            else:
+                print(f"Warning: No weights found for layer {layer_idx} at {weights_path}. Using MAP initialization.")
         else:
-            print(f"Warning: No weights found for layer {layer_idx} at {weights_path}. Using MAP initialization.")
+            print(f"UNTRAINED CONTROL: layer {layer_idx} router left at random init.")
 
         target_layer.block_sparse_moe.router = new_router.to(model.device)
     

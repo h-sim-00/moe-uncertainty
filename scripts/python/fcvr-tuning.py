@@ -70,8 +70,8 @@ def train_fcvr_router(model, tokenizer, train_loader, val_loader, args):
           f"| per-device batch={args.batch_size} x grad_accum={grad_accum} = eff batch {args.batch_size * grad_accum} ---")
 
     # === 3. Run Custom Training Loop ===
-    project_name = "moe-uncertainty"
-    wandb.init(project=project_name, name=run_name, config=vars(args), reinit=True)
+    wandb.init(project=args.wandb_project, name=run_name, config=vars(args),
+               tags=args.wandb_tags, reinit=True)
 
     # Early stopping on validation NLL (the LM reconstruction loss).
     best_val_loss = float("inf")
@@ -120,6 +120,9 @@ def train_fcvr_router(model, tokenizer, train_loader, val_loader, args):
                 "train_loss": loss.item(),
                 "reconstruction_loss": reconstruction_loss.item(),
                 "kl_term": kl_term.item(),
+                # Beta-independent KL (sum over layers) so the raw KL trajectory
+                # is visible even at beta=0.
+                "kl_raw": total_kl_div.item(),
                 "lr": scheduler.get_last_lr()[0],
             })
 
@@ -135,7 +138,21 @@ def train_fcvr_router(model, tokenizer, train_loader, val_loader, args):
                 total_val_loss += outputs.loss.item()
         avg_val_loss = total_val_loss / len(val_loader)
         print(f"Epoch {epoch+1} validation loss (NLL): {avg_val_loss:.4f}")
-        wandb.log({"val_loss": avg_val_loss, "epoch": epoch})
+
+        # Per-layer posterior-covariance trace ||L||_F^2 (mean over the last val
+        # batch's tokens) - shows whether/when the traces leave the prior value E.
+        epoch_log = {"val_loss": avg_val_loss, "epoch": epoch}
+        for layer_idx in args.train_layers:
+            if args.model_shortcode == "granite":
+                router = causal_model.layers[layer_idx].block_sparse_moe.router
+            else:
+                router = causal_model.layers[layer_idx].mlp.router
+            L = router.last_cholesky_factor
+            if L is not None:
+                trace = (L ** 2).sum(dim=(-1, -2)).mean().item()
+                epoch_log[f"trace/layer_{layer_idx}"] = trace
+                print(f"  trace/layer_{layer_idx}: {trace:.4f}")
+        wandb.log(epoch_log)
 
         # Early stopping on val NLL: keep the best checkpoint on disk.
         if avg_val_loss < best_val_loss - 1e-4:
@@ -184,6 +201,18 @@ def parse_args():
                         help="Optional suffix on the FCVR weights dir to avoid overwriting other runs.")
     parser.add_argument("--prior_source", type=str, default="map", choices=["map", "pretrained"],
                         help="Seed FCVR mean_base from fine-tuned MAP routers ('map') or the pre-trained Granite router ('pretrained', paper-faithful).")
+
+    # --- token-debug ablation knobs (defaults reproduce exp-3 exactly) ---
+    parser.add_argument("--prior_std", type=float, default=1.0,
+                        help="Std of the isotropic KL prior N(0, prior_std^2 I) on the residual. 1.0 = exp-3 behaviour.")
+    parser.add_argument("--input_layernorm", action="store_true",
+                        help="Apply a parameter-free LayerNorm to the FCVR trunk input only (mean_base path untouched).")
+    parser.add_argument("--separate_trunks", action="store_true",
+                        help="Give the Cholesky head its own trunk instead of sharing the mean head's backbone (thesis' original two-trunk design).")
+    parser.add_argument("--wandb_project", type=str, default="moe-uncertainty-debug",
+                        help="Weights & Biases project name.")
+    parser.add_argument("--wandb_tags", type=str, nargs="*", default=None,
+                        help="Optional wandb tags (e.g. arm1 train).")
     return parser.parse_args()
 
 def main():
