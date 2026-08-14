@@ -100,10 +100,15 @@ def prepare_granite_bayesian_routers(model, method, args):
     trainable_attrs = config["trainable_attrs"]
 
     print(f"--- Preparing model for {method.upper()} router tuning ---")
-    
+
     output_root_dir = f"./router_weights/{method}"
     run_name = f"{method}-{args.model_shortcode}-{args.dataset_shortcode}"
-    
+    # Mirror the optional suffix used at save time, so --load_layers resumes
+    # from THIS run's weights dir instead of the unsuffixed one.
+    run_suffix = getattr(args, "run_suffix", None)
+    if run_suffix:
+        run_name = f"{run_name}-{run_suffix}"
+
     causal_model = model.base_model.model.model
 
     # 1. Swap & Load

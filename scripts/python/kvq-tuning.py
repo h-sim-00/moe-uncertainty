@@ -14,7 +14,7 @@ import torch
 
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-from transformers import DataCollatorForLanguageModeling
+from transformers import DataCollatorForLanguageModeling, get_cosine_schedule_with_warmup
 from utils import setup_environment
 from model import load_peft_model, load_tokenizer
 from model.expert_lora import save_expert_lora, expert_lora_path
@@ -33,7 +33,28 @@ def train(model, tokenizer, train_loader, val_loader, args):
     num_training_batches = len(train_loader)
 
     trainable_params = [p for p in model.parameters() if p.requires_grad]
-    optimizer = torch.optim.Adam(trainable_params, lr=args.lr)
+    # Paper D.2: "All models were trained using the AdamW optimiser", lr with
+    # cosine decay and warmup_ratio warmup.
+    optimizer = torch.optim.AdamW(trainable_params, lr=args.lr)
+    total_optim_steps = num_training_batches * args.epochs
+    warmup_steps = int(args.warmup_ratio * total_optim_steps)
+    scheduler = get_cosine_schedule_with_warmup(
+        optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_optim_steps
+    )
+    print(f"--- Optim: AdamW lr={args.lr} cosine warmup={warmup_steps}/{total_optim_steps} steps ---")
+
+    final_save_path = f"./adapters/{args.model_shortcode}-{args.dataset_shortcode}"
+    if args.adapter_suffix:
+        final_save_path = f"{final_save_path}-{args.adapter_suffix}"
+
+    def save_adapter():
+        model.save_pretrained(final_save_path)
+        # PEFT only serialises the Q/K/V adapters; the expert-LoRA factors live in
+        # a custom module and are written next to them inside the same directory.
+        if args.finetune_mode == "qkv_experts":
+            save_expert_lora(model, expert_lora_path(final_save_path))
+
+    best_val_loss = float("inf")
 
     print("--- Starting MAP Fine-tuning (Custom Loop) ---")
     for epoch in range(args.epochs):
@@ -46,9 +67,11 @@ def train(model, tokenizer, train_loader, val_loader, args):
             loss = outputs.loss
             loss.backward()
             optimizer.step()
+            scheduler.step()
             total_epoch_loss += loss.item()
             wandb.log({
-                "train_loss": loss.item()
+                "train_loss": loss.item(),
+                "lr": scheduler.get_last_lr()[0],
             })
             
         print(f"Epoch {epoch+1} average training loss: {total_epoch_loss / num_training_batches:.4f}")
@@ -65,17 +88,22 @@ def train(model, tokenizer, train_loader, val_loader, args):
         print(f"Epoch {epoch+1} validation loss: {avg_val_loss:.4f}")
         wandb.log({"val_loss": avg_val_loss, "epoch": epoch})
 
+        # Best-val checkpointing: only persist the adapter when validation
+        # improves, so the saved weights are the best epoch, not the last one.
+        if avg_val_loss < best_val_loss - 1e-4:
+            best_val_loss = avg_val_loss
+            print(f"  New best val loss {best_val_loss:.4f} -> saving adapter to {final_save_path}")
+            save_adapter()
+        else:
+            print(f"  No val-loss improvement; keeping best checkpoint (val {best_val_loss:.4f}).")
 
-    # Updated final save path format
-    final_save_path = f"./adapters/{args.model_shortcode}-{args.dataset_shortcode}"
-    if args.adapter_suffix:
-        final_save_path = f"{final_save_path}-{args.adapter_suffix}"
-    print(f"Saving the best adapter weights to {final_save_path}")
-    model.save_pretrained(final_save_path)
-    # PEFT only serialises the Q/K/V adapters; the expert-LoRA factors live in
-    # a custom module and are written next to them inside the same directory.
-    if args.finetune_mode == "qkv_experts":
-        save_expert_lora(model, expert_lora_path(final_save_path))
+    # Safety net: if val loss never improved (best checkpoint never written),
+    # persist the final state so the adapter dir is not empty.
+    if best_val_loss == float("inf"):
+        print("--- Val loss never improved; saving final state as a fallback ---")
+        save_adapter()
+
+    print(f"--- MAP Fine-tuning complete (best val loss {best_val_loss:.4f}) ---")
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Fine-tune a model with LoRA on a specific MMLU subject.")
@@ -90,6 +118,8 @@ def parse_args():
     parser.add_argument("--epochs", type=int, default=5, help="Number of training epochs.")
     parser.add_argument("--batch_size", type=int, default=8, help="Training and evaluation batch size.")
     parser.add_argument("--lr", type=float, default=5e-5, help="Learning rate for the optimizer.")
+    parser.add_argument("--warmup_ratio", type=float, default=0.05,
+                        help="Fraction of total optimizer steps used for LR warmup (paper D.2: 0.05).")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility.")
     return parser.parse_args()
 

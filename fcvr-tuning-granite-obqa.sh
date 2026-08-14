@@ -99,7 +99,6 @@ for BETA in "${BETAS[@]}"; do
         --dataset_shortcode "$DATASET_SHORTCODE" \
         --base_adapter_path "$BASE_ADAPTER_PATH" \
         --swap_layers "${LAYERS[@]}" \
-        --load_layers \
         --train_layers "${LAYERS[@]}" \
         --epochs "$EPOCHS" \
         --batch_size "$BATCH_SIZE" \
