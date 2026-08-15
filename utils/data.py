@@ -320,19 +320,43 @@ def preprocess_mask_question_for_training(dataset_list: List[dict], tokenizer: A
     model_inputs["labels"] = labels_list
     return Dataset.from_dict(model_inputs)
 
-def load_and_prepare_train_and_val_data(tokenizer: AutoTokenizer, train_dataset_shortcodes: List, seed=42) -> Tuple[Dataset, Dataset]:
+def preprocess_answer_only_for_training(dataset_list: List[dict], tokenizer: AutoTokenizer) -> Dataset:
+    """Tokenizes for supervised fine-tuning with loss on the answer tokens only.
+
+    Prompt and answer are tokenized separately and concatenated, so the prompt
+    mask cannot be knocked out of alignment by padding side, model-specific
+    special tokens, or BPE merges at the prompt/answer boundary. Rows are left
+    unpadded; use a labels-aware collator (e.g. DataCollatorForSeq2Seq with
+    label_pad_token_id=-100) to pad per batch.
+    """
+    IGNORE_INDEX = -100
+    input_ids_list, attention_mask_list, labels_list = [], [], []
+    for item in dataset_list:
+        prompt_ids = tokenizer(item['question']).input_ids
+        answer_ids = tokenizer(item['answer'], add_special_tokens=False).input_ids
+        input_ids_list.append(prompt_ids + answer_ids)
+        attention_mask_list.append([1] * (len(prompt_ids) + len(answer_ids)))
+        labels_list.append([IGNORE_INDEX] * len(prompt_ids) + answer_ids)
+    return Dataset.from_dict({
+        "input_ids": input_ids_list,
+        "attention_mask": attention_mask_list,
+        "labels": labels_list,
+    })
+
+def load_and_prepare_train_and_val_data(tokenizer: AutoTokenizer, train_dataset_shortcodes: List, seed=42, answer_only=False) -> Tuple[Dataset, Dataset]:
     """Loads and preprocesses the dataset for causal language modeling."""
     train_raw, val_raw = [], []
     for dataset_shortcode in train_dataset_shortcodes:
         train_raw_curr, val_raw_curr, _ = load_exp_dataset(dataset_shortcode, seed=seed)
         train_raw.extend(train_raw_curr)
         val_raw.extend(val_raw_curr)
-    
+
     train_engineered = [multiple_choice_prompt_engineer(x, tokenizer=tokenizer) for x in train_raw]
     val_engineered = [multiple_choice_prompt_engineer(x, tokenizer=tokenizer) for x in val_raw]
-    
-    train_dataset = preprocess_mask_question_for_training(train_engineered, tokenizer)
-    val_dataset = preprocess_mask_question_for_training(val_engineered, tokenizer)
+
+    preprocess = preprocess_answer_only_for_training if answer_only else preprocess_mask_question_for_training
+    train_dataset = preprocess(train_engineered, tokenizer)
+    val_dataset = preprocess(val_engineered, tokenizer)
 
     print(f"Datasets '{train_dataset_shortcodes}' loaded and preprocessed.")
     print(f"Train samples: {len(train_dataset)}, Eval samples: {len(val_dataset)}")

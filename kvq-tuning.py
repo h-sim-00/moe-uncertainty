@@ -14,7 +14,7 @@ import torch
 
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-from transformers import DataCollatorForLanguageModeling, get_cosine_schedule_with_warmup
+from transformers import DataCollatorForSeq2Seq, get_cosine_schedule_with_warmup
 from utils import setup_environment
 from model import load_peft_model, load_tokenizer
 from model.expert_lora import save_expert_lora, expert_lora_path
@@ -144,8 +144,12 @@ def main():
     tokenizer = load_tokenizer(args.model_shortcode)
 
     # Use the new argument to load a single dataset
-    train_dataset, val_dataset = load_and_prepare_train_and_val_data(tokenizer, [args.dataset_shortcode])
-    data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
+    # Answer-only loss: labels mask the prompt (-100), so the collator must
+    # preserve them instead of rebuilding labels from input_ids. Right padding
+    # keeps real-token positions correct during training (eval keeps left).
+    train_dataset, val_dataset = load_and_prepare_train_and_val_data(tokenizer, [args.dataset_shortcode], answer_only=True)
+    tokenizer.padding_side = "right"
+    data_collator = DataCollatorForSeq2Seq(tokenizer=tokenizer, padding=True, label_pad_token_id=-100)
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, collate_fn=data_collator, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, collate_fn=data_collator)
 
