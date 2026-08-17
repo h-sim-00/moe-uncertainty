@@ -119,21 +119,42 @@ class FullCovarianceVariationalRouter(MoERouter):
         
         return index_sorted_experts, batch_index, batch_gates, expert_size, logits
 
-    def kl_divergence(self):
-        """MODIFIED: KL divergence for the multivariate case."""
+    def kl_divergence_per_token(self):
+        """Per-position KL[N(mu, LL^T) || N(0, I)] over the last forward's tokens.
+        Shape [B*T] (the router sees hidden states flattened row-major over
+        (batch, position), see modeling_granitemoe.GraniteMoeMoE.forward)."""
         mu = self.last_mu_residual
         L = self.last_cholesky_factor
         E = self.num_experts
-        
+
         # KL[N(mu, LL^T) || N(0, I)] = 0.5 * (Tr(LL^T) + mu^T mu - E - log_det(LL^T))
         trace_term = (L**2).sum(dim=(-1, -2))
         mu_sq_term = (mu**2).sum(-1)
         log_det_term = 2 * torch.log(torch.diagonal(L, dim1=-2, dim2=-1)).sum(-1)
-        
-        kl = 0.5 * (trace_term + mu_sq_term - E - log_det_term)
-        # Per-token MEAN (matches the mean reduction of the reconstruction loss),
-        # so the ELBO's two terms share the same normalisation as in the paper.
-        return kl.mean()
+        return 0.5 * (trace_term + mu_sq_term - E - log_det_term)
+
+    def kl_divergence(self, mask=None):
+        """MODIFIED: KL divergence for the multivariate case, per-token MEAN
+        (matches the mean reduction of the reconstruction loss, so the ELBO's two
+        terms share the same normalisation as in the paper).
+
+        mask: optional [B*T] {0,1} tensor (flattened row-major like the router
+        input). With `attention_mask.flatten()` the mean runs over REAL tokens only
+        -- padding positions are not part of the model and must not be
+        regularised (they made the effective beta depend on batch composition).
+        With `(labels != -100).flatten()` the KL is restricted to answer/target
+        positions (an ablation of the weighting; the router latent does exist at
+        prompt positions, so prompt-KL is part of the ELBO proper).
+        mask=None keeps the previous behaviour (mean over every position, pads
+        included) for backward comparability."""
+        kl = self.kl_divergence_per_token()
+        if mask is None:
+            return kl.mean()
+        mask = mask.to(kl.dtype).reshape(-1)
+        if mask.shape[0] != kl.shape[0]:
+            raise ValueError(f"kl mask has {mask.shape[0]} positions but the router saw {kl.shape[0]}")
+        denom = mask.sum().clamp(min=1.0)
+        return (kl * mask).sum() / denom
 
     def save_weights(self, path: str):
         """MODIFIED: Saves the new trainable components."""

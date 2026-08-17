@@ -88,6 +88,15 @@ def train_fcvr_router(model, tokenizer, train_loader, val_loader, args):
 
             reconstruction_loss = outputs.loss
 
+            # KL position mask (supervisor point 4): 'attention' = real tokens only
+            # (padding excluded -- bug fix, default); 'answer' = target tokens only
+            # (weighting ablation); 'none' = every position incl. pads (legacy).
+            if args.kl_mask == "attention":
+                kl_mask = inputs["attention_mask"].reshape(-1)
+            elif args.kl_mask == "answer":
+                kl_mask = (inputs["labels"] != -100).reshape(-1)
+            else:
+                kl_mask = None
             total_kl_div = 0
             for layer_idx in args.train_layers:
                 if args.model_shortcode == "granite":
@@ -96,7 +105,7 @@ def train_fcvr_router(model, tokenizer, train_loader, val_loader, args):
                     router = causal_model.layers[layer_idx].mlp.router
                 elif args.model_shortcode == "deepseek":
                     router = causal_model.layers[layer_idx].mlp.router
-                total_kl_div += router.kl_divergence()
+                total_kl_div += router.kl_divergence(mask=kl_mask)
 
             # Paper-faithful ELBO weighting: loss = L_task + beta * sum_layers KL_layer,
             # where each KL_layer is a per-token mean (see fcvr.py kl_divergence).
@@ -120,6 +129,7 @@ def train_fcvr_router(model, tokenizer, train_loader, val_loader, args):
                 "train_loss": loss.item(),
                 "reconstruction_loss": reconstruction_loss.item(),
                 "kl_term": kl_term.item(),
+                "kl_tokens_in_batch": int(kl_mask.sum().item()) if kl_mask is not None else int(inputs["input_ids"].numel()),
                 "lr": scheduler.get_last_lr()[0],
             })
 
@@ -179,6 +189,10 @@ def parse_args():
     parser.add_argument("--early_stop_patience", type=int, default=3,
                         help="Stop after this many epochs without val-NLL improvement (paper: early stop on val NLL).")
     parser.add_argument("--beta", type=float, default=0.01)
+    parser.add_argument("--kl_mask", type=str, default="attention", choices=["none", "attention", "answer"],
+                        help="Positions the per-token KL is averaged over: attention = real tokens only "
+                             "(padding excluded; default), answer = target tokens only (ablation), "
+                             "none = every position incl. padding (legacy; what the existing weights used).")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--run_suffix", type=str, default=None,
                         help="Optional suffix on the FCVR weights dir to avoid overwriting other runs.")
