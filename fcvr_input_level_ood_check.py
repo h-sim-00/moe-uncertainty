@@ -49,7 +49,7 @@ from tqdm import tqdm
 
 from utils import setup_environment, load_exp_dataset, generation_prompt_engineer
 from model import load_peft_model_and_adapter, load_tokenizer
-from evaluate_fcvr import prepare_model_fcvr  # same faithful reconstruction as analyze_token_signals
+from evaluate_fcvr import prepare_model_by_arm  # same faithful reconstruction as analyze_token_signals (+ arms)
 
 
 def parse_args():
@@ -58,7 +58,9 @@ def parse_args():
     p.add_argument("--dataset_shortcode", type=str, default="medexqa",
                    help="ID dataset the FCVR was trained on (drives weight paths AND is the ID anchor).")
     p.add_argument("--kvq_adapter_path", type=str, required=True)
-    p.add_argument("--swap_layers", type=int, nargs="+", required=True)
+    p.add_argument("--arm", type=str, default="fcvr", choices=["fcvr", "untrained", "det"],
+                   help="Baseline ladder: fcvr (trained), untrained (fresh FCVR heads), det (stock routers; entropy only).")
+    p.add_argument("--swap_layers", type=int, nargs="+", default=[], help="Required unless --arm det.")
     p.add_argument("--run_suffix", type=str, default=None,
                    help="Must match the training run's --run_suffix.")
     p.add_argument("--prior_source", type=str, default="pretrained", choices=["map", "pretrained"],
@@ -84,7 +86,7 @@ def parse_args():
 def collect_signals(model, tokenizer, dataset_code, num_examples, fcvr_layers, causal_model, device, split="val"):
     """One prompt-only forward per example (batch 1) -> dict of np arrays."""
     ds = load_exp_dataset(dataset_code, split=split)[:num_examples]
-    out = {"ilv_last": [], "ilv_mean": [], "entropy_last": []}
+    out = {"ilv_last": [], "ilv_mean": [], "entropy_last": []} if fcvr_layers else {"entropy_last": []}
     for ex in tqdm(ds, desc=dataset_code):
         prompt = generation_prompt_engineer(ex, tokenizer=tokenizer)["question"]
         ids = tokenizer(
@@ -103,8 +105,9 @@ def collect_signals(model, tokenizer, dataset_code, num_examples, fcvr_layers, c
             tr = (L.view(seq_len, E, E).float() ** 2).sum(dim=(-1, -2))  # [seq] = tr(LL^T)
             per_layer_last.append(tr[-1])
             per_layer_mean.append(tr.mean())
-        out["ilv_last"].append(float(torch.stack(per_layer_last).mean().item()))
-        out["ilv_mean"].append(float(torch.stack(per_layer_mean).mean().item()))
+        if fcvr_layers:
+            out["ilv_last"].append(float(torch.stack(per_layer_last).mean().item()))
+            out["ilv_mean"].append(float(torch.stack(per_layer_mean).mean().item()))
     return {k: np.asarray(v) for k, v in out.items()}
 
 
@@ -138,9 +141,11 @@ def main():
         args.model_shortcode, adapter_path=args.kvq_adapter_path, device_map="cuda:0"
     )
     tokenizer = load_tokenizer(args.model_shortcode)
-    model = prepare_model_fcvr(model, args)
+    if args.arm != "det" and not args.swap_layers:
+        raise SystemExit("--swap_layers is required unless --arm det")
+    model, fcvr_layers = prepare_model_by_arm(model, args)
+    print(f"Arm: {args.arm}")
 
-    fcvr_layers = sorted(args.swap_layers)
     causal_model = model.base_model.model.model
     for l in fcvr_layers:
         causal_model.layers[l].block_sparse_moe.router.deterministic_readout = (args.routing == "deterministic")
@@ -154,6 +159,7 @@ def main():
 
     results = {
         "config": {
+            "arm": args.arm,
             "id_dataset": args.dataset_shortcode, "ood_datasets": args.ood_datasets,
             "num_examples": args.num_examples, "split": args.split, "fcvr_layers": fcvr_layers,
             "run_suffix": args.run_suffix, "prior_source": args.prior_source,
@@ -170,7 +176,7 @@ def main():
         ood_sig = collect_signals(model, tokenizer, code, args.num_examples,
                                   fcvr_layers, causal_model, model.device, split=args.split)
         results["ood"][code] = {}
-        for sig in ("ilv_last", "ilv_mean", "entropy_last"):
+        for sig in [k for k in ("ilv_last", "ilv_mean", "entropy_last") if k in id_sig]:
             auroc, auprc = _auc(id_sig[sig], ood_sig[sig])
             results["ood"][code][sig] = {
                 "auroc": auroc, "auprc": auprc, "ood_mean": float(ood_sig[sig].mean()),
@@ -179,6 +185,19 @@ def main():
     # ---- verdict ----
     print("\n" + "=" * 70)
     id_m = results["id_means"]
+    if "ilv_last" not in id_m:   # arm=det: entropy-only baseline, no ILV verdict
+        for code in args.ood_datasets:
+            print(f"OoD {code:12s} entropy_last AUROC={results['ood'][code]['entropy_last']['auroc']:.3f}")
+        results["verdict"] = "arm=det: entropy-only baseline (no ILV)"
+        os.makedirs(args.output_dir, exist_ok=True)
+        suffix = args.run_suffix or "nosuffix"
+        tag_str = f"_{args.tag}" if args.tag else ""
+        split_str = f"_{args.split}" if args.split != "test" else ""
+        out_path = os.path.join(args.output_dir, f"input_ood_{args.dataset_shortcode}{split_str}_{suffix}{tag_str}.json")
+        with open(out_path, "w") as f:
+            json.dump(results, f, indent=2)
+        print(f"\nSaved: {out_path}")
+        return
     print(f"ID ({args.dataset_shortcode}):  ilv_last={id_m['ilv_last']:.4f}  "
           f"ilv_mean={id_m['ilv_mean']:.4f}  entropy_last={id_m['entropy_last']:.4f}")
     best_dev = 0.0

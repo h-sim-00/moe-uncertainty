@@ -77,7 +77,7 @@ from utils import (
     generation_prompt_engineer,
 )
 from model import load_peft_model_and_adapter, load_tokenizer
-from evaluate_fcvr import prepare_model_fcvr  # reuse faithful reconstruction
+from evaluate_fcvr import prepare_model_by_arm  # reuse faithful reconstruction (+ baseline arms)
 
 # ---------------------------------------------------------------------------
 # Free-form prose probes (the "does it transfer to generation" test). Chosen to
@@ -121,8 +121,12 @@ def parse_args():
                    help="ID dataset the FCVR model was trained on (drives weight paths).")
     p.add_argument("--kvq_adapter_path", type=str, required=True,
                    help="Stage-1 KVQ LoRA adapter path.")
-    p.add_argument("--swap_layers", type=int, nargs="+", required=True,
-                   help="FCVR layers to load (e.g. the Susceptible-10 set).")
+    p.add_argument("--swap_layers", type=int, nargs="+", default=[],
+                   help="FCVR layers to load (e.g. the Susceptible-10 set). Required unless --arm det.")
+    p.add_argument("--arm", type=str, default="fcvr", choices=["fcvr", "untrained", "det"],
+                   help="Baseline ladder: fcvr = trained FCVR weights (default); untrained = fresh FCVR "
+                        "heads on the swap layers (no Stage-2 training); det = Stage-1 model with stock "
+                        "deterministic routers (no ILV; entropy/NLL/length baselines + generation quality only).")
     p.add_argument("--run_suffix", type=str, default=None,
                    help="Must match the training run's --run_suffix (FCVR weight dir).")
     p.add_argument("--prior_source", type=str, default="pretrained", choices=["map", "pretrained"],
@@ -212,8 +216,12 @@ def records_from_ids(model, tokenizer, input_ids, fcvr_layers, causal_model, dev
         E = L.shape[-1]
         L = L.view(1, seq_len, E, E)[0].float()          # [seq, E, E]
         per_layer.append((L ** 2).sum(dim=(-1, -2)))      # [seq] = ||L||_F^2 = tr(LL^T)
-    ilv_layers = torch.stack(per_layer, dim=0)            # [n_layers, seq]
-    ilv = ilv_layers.mean(dim=0)                          # [seq]
+    if per_layer:
+        ilv_layers = torch.stack(per_layer, dim=0)        # [n_layers, seq]
+        ilv = ilv_layers.mean(dim=0)                      # [seq]
+    else:                                                 # arm=det: no FCVR layers -> no ILV
+        ilv_layers = torch.full((0, seq_len), float("nan"), device=device)
+        ilv = torch.full((seq_len,), float("nan"), device=device)
 
     tok_strs = [tokenizer.decode([i]) for i in input_ids.tolist()]
 
@@ -692,10 +700,12 @@ def abstention_analysis(per_example_records, metas, last_k=10):
                     f"{prefix}_last": float(v[-1]), f"{prefix}_mean_last{last_k}": float(np.mean(v[-k:])),
                     f"{prefix}_max_last{last_k}": float(np.max(v[-k:]))}
         scores = {}
+        has_ilv = not np.all(np.isnan(ilv))
         # PRIMARY: decoding-time ILV (online) when captured; else the post-hoc series only.
-        scores.update(_aggs("ilv_online" if online else "ilv_posthoc", ilv))
-        if online and all("inf_log_var_posthoc" in r for r in recs):
-            scores.update(_aggs("ilv_posthoc", [r["inf_log_var_posthoc"] for r in recs]))
+        if has_ilv:
+            scores.update(_aggs("ilv_online" if online else "ilv_posthoc", ilv))
+            if online and all("inf_log_var_posthoc" in r for r in recs):
+                scores.update(_aggs("ilv_posthoc", [r["inf_log_var_posthoc"] for r in recs]))
         scores.update({
             "entropy_mean_BASELINE": float(np.mean(ent)),
             "entropy_max_BASELINE": float(np.max(ent)),
@@ -836,12 +846,14 @@ def main():
     args = parse_args()
     torch.manual_seed(args.seed)
 
+    if args.arm != "det" and not args.swap_layers:
+        raise SystemExit("--swap_layers is required unless --arm det")
     model = load_peft_model_and_adapter(args.model_shortcode, adapter_path=args.kvq_adapter_path, device_map="cuda:0")
     tokenizer = load_tokenizer(args.model_shortcode)
-    model = prepare_model_fcvr(model, args)  # loads MAP (if map-prior) + FCVR weights, sets num_mc_samples
+    model, fcvr_layers = prepare_model_by_arm(model, args)  # fcvr: MAP (if map-prior) + trained FCVR weights
 
-    fcvr_layers = sorted(args.swap_layers)
     causal_model = model.base_model.model.model
+    print(f"Arm: {args.arm}")
     det = args.routing == "deterministic"
     for l in fcvr_layers:
         causal_model.layers[l].block_sparse_moe.router.deterministic_readout = det
@@ -869,6 +881,7 @@ def main():
 
     summary = analyze(all_records, per_example, args.spike_pct)
     summary["config"] = {
+        "arm": args.arm,
         "source": args.source, "split": args.split if args.source == "medexqa" else None,
         "mode": mode, "num_examples": len(per_example),
         "n_tokens": len(all_records), "fcvr_layers": fcvr_layers,

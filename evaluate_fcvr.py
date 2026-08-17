@@ -95,6 +95,44 @@ def prepare_model_fcvr(model, args):
     return model
 
 
+def prepare_model_untrained_fcvr(model, args):
+    """Baseline-ladder arm 'untrained': FCVR routers on the swap layers with FRESHLY
+    initialised variational heads (cholesky head init std 1e-3 -> L ~ I, mean
+    residual ~ 0), i.e. the architecture WITHOUT Stage-2 training. Any ILV
+    separation obtained here is not attributable to variational training.
+    prior_source is honoured (map -> MAP routers loaded first)."""
+    from model.routers.fcvr import FullCovarianceVariationalRouter
+    print(f"--- Preparing UNTRAINED FCVR model (prior_source={args.prior_source}) ---")
+    if args.prior_source == "map":
+        model = granite_adapter.load_granite_map_routers(model, args=args)
+    causal_model = model.base_model.model.model
+    for i in args.swap_layers:
+        target_layer = causal_model.layers[i]
+        new_router = FullCovarianceVariationalRouter(
+            config=causal_model.config, existing_router=target_layer.block_sparse_moe.router)
+        new_router.num_mc_samples_inference = args.num_samples
+        target_layer.block_sparse_moe.router = new_router.to(model.device)
+    model.eval()
+    print(f"UNTRAINED FCVR layers: {sorted(args.swap_layers)} | MC samples: {args.num_samples}")
+    return model
+
+
+def prepare_model_by_arm(model, args):
+    """Baseline ladder dispatch. arm: 'fcvr' (trained weights), 'untrained'
+    (fresh FCVR heads), 'det' (Stage-1 model with its stock deterministic
+    routers; no FCVR layers -> no ILV). Returns (model, fcvr_layers)."""
+    arm = getattr(args, "arm", "fcvr")
+    if arm == "fcvr":
+        return prepare_model_fcvr(model, args), sorted(args.swap_layers)
+    if arm == "untrained":
+        return prepare_model_untrained_fcvr(model, args), sorted(args.swap_layers)
+    if arm == "det":
+        print("--- arm=det: Stage-1 adapter with stock deterministic routers (no FCVR, no ILV) ---")
+        model.eval()
+        return model, []
+    raise ValueError(f"unknown arm {arm!r}")
+
+
 def compute_signals(model, tokenizer, dataset, fcvr_layers, args):
     """Single forward pass per batch -> (answer_entropy, inf_log_var) as np arrays."""
     model.eval()
