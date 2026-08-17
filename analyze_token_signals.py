@@ -281,13 +281,22 @@ def collect_medexqa(model, tokenizer, args, fcvr_layers, causal_model, device):
             model, tokenizer, full_ids, fcvr_layers, causal_model, device, answer_start=answer_start
         )
 
-        meta = {"id": ex.get("id", ""), "gold_letter": ex.get("gold_letter", "")}
+        meta = {"id": ex.get("id", ""), "gold_letter": ex.get("gold_letter", ""),
+                "prompt_len_tokens": int(answer_start)}
         if args.generate:
             gen_ids = full_ids[answer_start:]
             gen_text = tokenizer.decode(gen_ids, skip_special_tokens=True)
+            eos_id = tokenizer.eos_token_id
+            ended_with_eos = bool(eos_id is not None and gen_ids.numel() > 0 and int(gen_ids[-1]) == eos_id)
             meta["n_gen_tokens"] = int(gen_ids.shape[0])
-            meta["gen_text"] = gen_text[:400]
-            refs = [str(ex["answer"])] + ([str(ex["explanation_2"])] if ex.get("explanation_2") else [])
+            meta["gen_len_tokens"] = int(gen_ids.shape[0])
+            meta["ended_with_eos"] = ended_with_eos
+            # Hit the cap without emitting EOS -> the explanation was cut off.
+            meta["truncated"] = bool((not ended_with_eos) and gen_ids.shape[0] >= args.max_new_tokens)
+            meta["gen_text"] = gen_text  # FULL text (the label script judges it)
+            refs = [str(ex["answer"]).strip()] + ([str(ex["explanation_2"]).strip()] if ex.get("explanation_2") else [])
+            meta["refs"] = refs
+            meta["question"] = ex.get("letter_question") or ex["question"]
             meta["expl_f1"] = max(_unigram_f1(gen_text, r) for r in refs)
             if ex.get("gold_letter") and ex.get("letter_question"):
                 probe = multiple_choice_prompt_engineer(
@@ -299,8 +308,10 @@ def collect_medexqa(model, tokenizer, args, fcvr_layers, causal_model, device):
                 ).input_ids.to(device)
                 with torch.no_grad():
                     letter_logits = model(input_ids=probe_ids).logits[0, -1, :][choice_ids]
-                meta["pred_letter"] = choices[int(letter_logits.argmax().item())]
-                meta["correct"] = bool(meta["pred_letter"] == ex["gold_letter"])
+                # SECONDARY label: a separate MCQA letter-probe pass (different
+                # prompt); it does NOT judge the generated explanation.
+                meta["pred_letter_probe"] = choices[int(letter_logits.argmax().item())]
+                meta["correct_probe"] = bool(meta["pred_letter_probe"] == ex["gold_letter"])
 
         per_example.append(recs)
         raw_texts.append(ex["question"][:160])
@@ -513,7 +524,7 @@ def abstention_analysis(per_example_records, metas, last_k=10):
     score is the informative direction (flipped AUROC = 1 - AUROC)."""
     rows = []
     for recs, m in zip(per_example_records, metas):
-        if not recs or m.get("correct") is None:
+        if not recs or m.get("correct_probe") is None:
             continue
         ilv = [r["inf_log_var"] for r in recs]
         ent = [r["entropy"] for r in recs]
@@ -521,11 +532,21 @@ def abstention_analysis(per_example_records, metas, last_k=10):
         k = min(last_k, len(ilv))
         rows.append({
             "id": m.get("id", ""),
-            "wrong": 0 if m["correct"] else 1,
-            "pred_letter": m.get("pred_letter"),
+            # Probe-derived label (secondary). label_generation_correctness.py adds
+            # option_correct / NLI / unjudgeable fields to this row.
+            "wrong_probe": 0 if m["correct_probe"] else 1,
+            "correct_probe": bool(m["correct_probe"]),
+            "pred_letter_probe": m.get("pred_letter_probe"),
             "gold_letter": m.get("gold_letter"),
             "expl_f1": m.get("expl_f1"),
             "n_gen_tokens": m.get("n_gen_tokens"),
+            "gen_len_tokens": m.get("gen_len_tokens"),
+            "prompt_len_tokens": m.get("prompt_len_tokens"),
+            "truncated": m.get("truncated"),
+            "ended_with_eos": m.get("ended_with_eos"),
+            "gen_text": m.get("gen_text"),
+            "refs": m.get("refs"),
+            "question": m.get("question"),
             "scores": {
                 "ilv_mean": float(np.mean(ilv)),
                 "ilv_max": float(np.max(ilv)),
@@ -540,12 +561,14 @@ def abstention_analysis(per_example_records, metas, last_k=10):
     if not rows:
         return None, []
 
-    labels = [r["wrong"] for r in rows]
+    labels = [r["wrong_probe"] for r in rows]
     f1s = [r["expl_f1"] for r in rows]
     result = {
         "n": len(rows),
         "n_wrong": int(np.sum(labels)),
         "letter_probe_accuracy": float(1.0 - np.mean(labels)),
+        "n_truncated": int(sum(1 for r in rows if r.get("truncated"))),
+        "label": "wrong_probe (letter-probe; SECONDARY -- run label_generation_correctness.py for option/NLI labels)",
         "auroc_predict_wrong": {},
         "spearman_vs_expl_f1": {},
         "note": ("auroc_predict_wrong: score-high should flag WRONG answers; AUROC < 0.5 "
