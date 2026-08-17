@@ -56,6 +56,16 @@ _EXPLICIT_PATTERNS = [
     re.compile(r"\b(?:option|choice)\s+" + _LETTER + r"(?=\s*(?:[,.:;]|is\s+(?:the\s+)?correct|because|since|as\b))", re.I),
     # leading "B." / "B)" / "(B)" at the very start
     re.compile(r"^\s*\(?([A-D])[\.\):]\s", re.I),
+    # MedMCQA gold-explanation style (the model imitates it after medmcqa_gen training):
+    # "Ans. (c) Vitamin B12", "Ans. is 'd' i.e., ...", "Ans. C i.e. Mite", "Ans-a. The ...",
+    # "Answer- A. Glycogen", "Ans: A. Pregnant", "Ans. D Ref: Bailey". B/C/D only need
+    # a non-letter after them; "A" must be followed by a closing quote/bracket,
+    # punctuation, "i.e", or end-of-text so "Ans. A cell ..." (the article) is NOT
+    # read as option A. A separator (".", ":", "-", "is", or an opening bracket/quote)
+    # is required after "Ans/Answer" so free prose like "the answer B is wrong" is
+    # left to the patterns above.
+    re.compile(r"\bans(?:wer)?(?:\s*[\.:\-]+\s*(?:is\s*)?|\s+is\s+|\s*(?=[\(\['\"]))[\(\['\"]?\s*([B-D])(?![A-Za-z])", re.I),
+    re.compile(r"\bans(?:wer)?(?:\s*[\.:\-]+\s*(?:is\s*)?|\s+is\s+|\s*(?=[\(\['\"]))[\(\['\"]?\s*(A)(?=\s*(?:[\)\]'\".:,;\-]|i\.?e\b|$))", re.I),
 ]
 _NEGATED = re.compile(r"\b(?:not|isn't|is not|incorrect|wrong)\b", re.I)
 
@@ -286,7 +296,10 @@ def main():
     out_jsonl, out_summary = stem + "_labeled.jsonl", stem + "_labels_summary.json"
     if os.path.exists(out_jsonl) and not args.overwrite:
         sys.exit(f"Refusing to overwrite {out_jsonl} (pass --overwrite).")
-    tag = os.path.basename(stem).replace("step1_medexqa_", "").replace("_seqlevel", "")
+    # The audit CSV name is derived from this tag. MedExQA files keep the historical
+    # naming (audit_<val_>generate_<tag>.csv); other generation sources keep their
+    # source prefix (audit_medmcqa_gen_<val_>generate_<tag>.csv) so the two never collide.
+    tag = os.path.basename(stem).replace("step1_medexqa_", "").replace("step1_", "").replace("_seqlevel", "")
 
     rows = [json.loads(l) for l in open(args.input) if l.strip()]
     print(f"Loaded {len(rows)} generations from {args.input}")

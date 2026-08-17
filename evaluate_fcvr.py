@@ -42,7 +42,10 @@ OOD_DATASETS = {
 # Datasets sharing the medical-exam domain. When the ID anchor is one of them,
 # the other is NOT excluded (that was over-aggressive: MedExQA->MedMCQA is the
 # useful NEAR-domain / task-shift set); it is relabelled "near" instead.
-MEDICAL_DATASETS = {"medexqa", "medmcqa_med"}
+MEDICAL_DATASETS = {"medexqa", "medmcqa_med", "medmcqa_gen"}
+# Same upstream corpus as the ID anchor -> rows overlap the training split -> SKIPPED
+# (never a valid OoD set). medmcqa_med draws from MedMCQA train+validation.
+SAME_SOURCE = {"medmcqa_gen": {"medmcqa_med"}, "medmcqa_med": {"medmcqa_gen"}}
 
 
 def parse_args():
@@ -212,6 +215,9 @@ def run_ood_detection(model, tokenizer, args):
     for ood_code, shift_type in OOD_DATASETS.items():
         if ood_code == args.dataset_shortcode:
             print(f"SKIP {ood_code}: identical to the ID anchor")
+            continue
+        if ood_code in SAME_SOURCE.get(args.dataset_shortcode, set()):
+            print(f"SKIP {ood_code}: same upstream corpus as the ID anchor {args.dataset_shortcode} (leakage)")
             continue
         if args.dataset_shortcode in MEDICAL_DATASETS and ood_code in MEDICAL_DATASETS:
             shift_type = "near (same medical domain, task shift)"

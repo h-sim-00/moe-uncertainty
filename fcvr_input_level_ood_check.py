@@ -10,10 +10,15 @@ CONTENT rather than surface form.
 
 Protocol
 --------
-ID  = MedExQA prompts (the FCVR's training distribution), split = --split.
+ID  = --dataset_shortcode prompts (the FCVR's training distribution: medexqa or
+      medmcqa_gen), split = --split.
 OoD = --ood_datasets, same split, same number of examples. Default
       obqa (far), medmcqa_med (NEAR: same medical domain, MCQA task shift --
       the interesting one for "semantic novelty vs law-vs-medicine"), mmlu_law (far).
+      For a medmcqa_gen anchor medmcqa_med is REFUSED (same corpus -> leakage);
+      use medexqa as the near-OoD set instead (--ood_datasets obqa medexqa mmlu_law).
+      NOTE: --num_examples applies per dataset; small OoD val splits (obqa/medexqa
+      val = 50 rows) simply contribute fewer rows -- AUROC handles the imbalance.
 Every prompt is wrapped in the same outer chat template AND, by default, its
 INNER text is re-rendered in one canonical format (--inner_format generation =
 "Question/Options/Explain the reasoning..." = the FCVR's training format) so
@@ -62,14 +67,21 @@ from evaluate_fcvr import prepare_model_by_arm
 from uq_stats import auroc, auprc, bootstrap_ci
 
 OOD_DOMAIN = {"medmcqa_med": "near (medical domain, MCQA task shift)",
+              "medexqa": "near (medical domain, allied-health specialties, same explanation task)",
+              "medmcqa_gen": "near (medical domain, same explanation task)",
               "obqa": "far", "arc_c": "far", "arc_e": "far", "sciq": "far", "mmlu_law": "far"}
+
+# Sets drawn from the SAME upstream corpus as an ID anchor -> never valid OoD for
+# it (medmcqa_med samples MedMCQA train+validation 'Medicine' rows, which overlap
+# the medmcqa_gen train/val/test split). The script refuses these pairs.
+SAME_SOURCE = {"medmcqa_gen": {"medmcqa_med", "medmcqa"}, "medmcqa_med": {"medmcqa_gen", "medmcqa"}}
 
 
 def parse_args():
     p = argparse.ArgumentParser(description="Input-level ID-vs-OoD Inf-Logit-Var bridge test (FCVR).")
     p.add_argument("--model_shortcode", type=str, default="granite")
     p.add_argument("--dataset_shortcode", type=str, default="medexqa",
-                   help="ID dataset the FCVR was trained on (drives weight paths AND is the ID anchor).")
+                   help="ID dataset the FCVR was trained on (drives weight paths AND is the ID anchor): medexqa | medmcqa_gen.")
     p.add_argument("--kvq_adapter_path", type=str, required=True)
     p.add_argument("--arm", type=str, default="fcvr", choices=["fcvr", "untrained", "det"],
                    help="Baseline ladder: fcvr (trained), untrained (fresh FCVR heads), det (stock routers; entropy only).")
@@ -84,7 +96,8 @@ def parse_args():
     p.add_argument("--routing", type=str, default="stochastic", choices=["stochastic", "deterministic"],
                    help="stochastic = paper inference (PRIMARY); deterministic = posterior-mean routing (ABLATION).")
     p.add_argument("--ood_datasets", type=str, nargs="+", default=["obqa", "medmcqa_med", "mmlu_law"],
-                   help="OoD sets (load_exp_dataset shortcodes). medmcqa_med = near-domain task shift.")
+                   help="OoD sets (load_exp_dataset shortcodes). medmcqa_med = near-domain task shift for a "
+                        "medexqa anchor; for a medmcqa_gen anchor pass obqa medexqa mmlu_law (medmcqa_med is refused).")
     p.add_argument("--inner_format", type=str, default="generation", choices=["generation", "mcqa", "native"],
                    help="Canonical inner prompt format for ID AND OoD (default generation = FCVR training "
                         "format). native = each dataset's own format (confounded; comparison only).")
@@ -209,6 +222,11 @@ def main():
     ood_codes = [c for c in args.ood_datasets if c != args.dataset_shortcode]
     if len(ood_codes) != len(args.ood_datasets):
         print(f"SKIP {args.dataset_shortcode}: identical to the ID anchor")
+    leaky = [c for c in ood_codes if c in SAME_SOURCE.get(args.dataset_shortcode, set())]
+    if leaky:
+        raise SystemExit(f"ERROR: {leaky} come from the same upstream corpus as the ID anchor "
+                         f"{args.dataset_shortcode} (rows overlap the training split) -- not valid OoD sets. "
+                         f"For medmcqa_gen use e.g. --ood_datasets obqa medexqa mmlu_law.")
 
     model = load_peft_model_and_adapter(args.model_shortcode, adapter_path=args.kvq_adapter_path, device_map="cuda:0")
     tokenizer = load_tokenizer(args.model_shortcode)

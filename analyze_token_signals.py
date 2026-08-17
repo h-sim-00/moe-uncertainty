@@ -20,12 +20,13 @@ It reads THREE aligned per-token series in a single forward pass:
 and quantifies whether inf_log_var tracks entropy/surprisal (Pearson + Spearman
 with sign, per-token-category elevation, spike overlap).
 
-Two readouts on the MedExQA source (run BOTH; see fcvr-eval-granite-medexqa.sh):
+Two readouts on the generation sources (medexqa, medmcqa_gen -- run BOTH; see
+fcvr-eval-granite-medexqa.sh / run-iter1-granite-medmcqa.sh):
   * teacher-forced (default): the sequence is prompt + GOLD explanation, so the
     per-token signal is read over the reference answer.
   * --generate: the model greedily generates its own explanation; the signal is
     read over the MODEL'S generated tokens (the realistic decoding case).
-For the MedExQA source only the ANSWER region (explanation tokens) is analysed --
+For the generation sources only the ANSWER region (explanation tokens) is analysed --
 the prompt tokens are excluded because they are not what a decoder acts on.
 
 Sources 'builtin' (free prose) and 'obqa' (MCQA prompts) are kept for parity with
@@ -79,6 +80,11 @@ from utils import (
 from model import load_peft_model_and_adapter, load_tokenizer
 from evaluate_fcvr import prepare_model_by_arm  # reuse faithful reconstruction (+ baseline arms)
 from uq_stats import auroc as _auroc_fixed_sign, bootstrap_ci, bootstrap_mean_ci
+
+# Sources that are open-generation datasets (prompt + free-text explanation target,
+# answer-region readout, --generate, seq-level abstention rows). Output files are
+# named step1_<source>[_val]_<mode>_<tag>.*, so the two never collide.
+GENERATION_SOURCES = ("medexqa", "medmcqa_gen")
 
 # ---------------------------------------------------------------------------
 # Free-form prose probes (the "does it transfer to generation" test). Chosen to
@@ -141,21 +147,22 @@ def parse_args():
                         "deterministic = posterior-mean routing (ABLATION: changes downstream hidden states).")
     # --- what text to analyse ---
     p.add_argument("--split", type=str, default="val", choices=["val", "test"],
-                   help="Which MedExQA split to read (source=medexqa). PROTOCOL: 'val' (50 ex) is the "
-                        "selection set (sign/threshold/calibrator/NLI audit); 'test' (175 ex) is evaluated "
-                        "ONCE per frozen configuration -- pass --split test explicitly and only then.")
+                   help="Which generation-dataset split to read (source=medexqa: 50 val / 175 test; "
+                        "source=medmcqa_gen: 1000 val / 1000 test). PROTOCOL: 'val' is the selection set "
+                        "(sign/threshold/calibrator/NLI audit); 'test' is evaluated ONCE per frozen "
+                        "configuration -- pass --split test explicitly and only then.")
     p.add_argument("--source", type=str, default="medexqa",
-                   choices=["medexqa", "builtin", "obqa", "textfile"],
-                   help="medexqa=generation test set (answer region); builtin=free prose; "
-                        "obqa=MCQA prompts; textfile=one passage/line.")
+                   choices=list(GENERATION_SOURCES) + ["builtin", "obqa", "textfile"],
+                   help="medexqa / medmcqa_gen = generation split (answer region; explanation target); "
+                        "builtin=free prose; obqa=MCQA prompts; textfile=one passage/line.")
     p.add_argument("--generate", action="store_true",
-                   help="[medexqa only] Autoregressively generate the explanation and read the signal "
+                   help="[generation sources only] Autoregressively generate the explanation and read the signal "
                         "over the MODEL'S own tokens. Default: teacher-force over the GOLD explanation.")
     p.add_argument("--max_new_tokens", type=int, default=128,
                    help="[--generate] Max explanation tokens to generate per question.")
     p.add_argument("--text_path", type=str, default=None, help="Required if --source textfile.")
     p.add_argument("--num_examples", type=int, default=50,
-                   help="Max examples (medexqa/obqa/textfile). builtin uses all 15.")
+                   help="Max examples (medexqa/medmcqa_gen/obqa/textfile). builtin uses all 15.")
     p.add_argument("--chat_template", action="store_true",
                    help="Wrap builtin/textfile text in the MCQA chat template. Ignored for medexqa/obqa "
                         "(which always use their own template).")
@@ -334,7 +341,9 @@ def _entropy_surprisal_from_scores(scores, gen_ids):
 
 
 def collect_medexqa(model, tokenizer, args, fcvr_layers, causal_model, device):
-    """MedExQA generation source. Teacher-forced over the gold explanation, or
+    """Generation source (args.source: medexqa or medmcqa_gen -- same example
+    layout: question / answer=explanation / gold_letter / letter_question /
+    explanation_2 (empty for MedMCQA)). Teacher-forced over the gold explanation, or
     (with --generate) over the model's own greedily-generated explanation. Only
     the answer (explanation) region is analysed.
 
@@ -344,7 +353,7 @@ def collect_medexqa(model, tokenizer, args, fcvr_layers, causal_model, device):
     is asked the same question in MCQA form and its argmax choice over
     {A,B,C,D} is compared with the dataset's gold answer letter. These labels
     feed the abstention readout (see abstention_analysis)."""
-    ds = load_exp_dataset("medexqa", split=args.split)[: args.num_examples]
+    ds = load_exp_dataset(args.source, split=args.split)[: args.num_examples]
     pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
     eos = tokenizer.eos_token or ""
     choices = ["A", "B", "C", "D"]
@@ -426,6 +435,8 @@ def collect_medexqa(model, tokenizer, args, fcvr_layers, causal_model, device):
 
         meta = {"id": ex.get("id", ""), "gold_letter": ex.get("gold_letter", ""),
                 "prompt_len_tokens": int(answer_start)}
+        if ex.get("subject_name"):
+            meta["subject_name"] = ex["subject_name"]   # medmcqa_gen: per-subject breakdowns
         if args.generate:
             gen_ids = full_ids[answer_start:]
             gen_text = tokenizer.decode(gen_ids, skip_special_tokens=True)
@@ -772,6 +783,7 @@ def abstention_analysis(per_example_records, metas, last_k=10):
             "correct_probe": bool(m["correct_probe"]),
             "pred_letter_probe": m.get("pred_letter_probe"),
             "gold_letter": m.get("gold_letter"),
+            "subject_name": m.get("subject_name"),   # medmcqa_gen only (None otherwise)
             "expl_f1": m.get("expl_f1"),
             "n_gen_tokens": m.get("n_gen_tokens"),
             "gen_len_tokens": m.get("gen_len_tokens"),
@@ -902,12 +914,12 @@ def main():
         causal_model.layers[l].block_sparse_moe.router.deterministic_readout = det
     print(f"Routing mode: {'DETERMINISTIC posterior-mean (ABLATION)' if det else f'STOCHASTIC S={args.num_samples} (paper inference; PRIMARY)'}")
 
-    if args.source == "medexqa":
+    if args.source in GENERATION_SOURCES:
         mode = "generate" if args.generate else "teacher_forced"
         if args.split == "test":
-            print("#" * 72 + "\n# TEST SPLIT (175 ex): evaluate ONCE per frozen configuration. Selection\n"
+            print("#" * 72 + f"\n# TEST SPLIT ({args.source}): evaluate ONCE per frozen configuration. Selection\n"
                   "# (sign / thresholds / calibration / label audit) must already be frozen on val.\n" + "#" * 72)
-        print(f"MedExQA source | split={args.split} | mode={mode} | answer-region only | {args.num_examples} examples")
+        print(f"{args.source} generation source | split={args.split} | mode={mode} | answer-region only | {args.num_examples} examples")
         per_example, raw_texts, metas = collect_medexqa(model, tokenizer, args, fcvr_layers, causal_model, model.device)
     else:
         mode = args.source
@@ -925,14 +937,14 @@ def main():
     summary = analyze(all_records, per_example, args.spike_pct)
     summary["config"] = {
         "arm": args.arm,
-        "source": args.source, "split": args.split if args.source == "medexqa" else None,
+        "source": args.source, "split": args.split if args.source in GENERATION_SOURCES else None,
         "mode": mode, "num_examples": len(per_example),
         "n_tokens": len(all_records), "fcvr_layers": fcvr_layers,
         "prior_source": args.prior_source, "run_suffix": args.run_suffix,
         "routing": "deterministic" if det else f"stochastic_S{args.num_samples}",
         "num_samples": None if det else args.num_samples, "seed": args.seed,
-        "primary_readout": "online" if (args.source == "medexqa" and args.generate) else "teacher_forced",
-        "max_new_tokens": args.max_new_tokens if (args.source == "medexqa" and args.generate) else None,
+        "primary_readout": "online" if (args.source in GENERATION_SOURCES and args.generate) else "teacher_forced",
+        "max_new_tokens": args.max_new_tokens if (args.source in GENERATION_SOURCES and args.generate) else None,
     }
     v = verdict(summary)
     summary["verdict"] = v
@@ -940,7 +952,7 @@ def main():
     # Sequence-level abstention readout (generate mode only): does an
     # aggregate of the per-token signal predict a WRONG letter-probe answer?
     seq_rows = []
-    if args.source == "medexqa" and args.generate and metas is not None:
+    if args.source in GENERATION_SOURCES and args.generate and metas is not None:
         abst, seq_rows = abstention_analysis(per_example, metas, last_k=args.seq_last_k)
         if abst is not None:
             summary["abstention"] = abst
@@ -958,7 +970,7 @@ def main():
     tag = f"_{args.tag}" if args.tag else ""
     # Historical test-split files carry no split token; val-split outputs are
     # marked so the two can never be confused or overwrite each other.
-    split_tag = f"_{args.split}" if (args.source == "medexqa" and args.split != "test") else ""
+    split_tag = f"_{args.split}" if (args.source in GENERATION_SOURCES and args.split != "test") else ""
     base = os.path.join(args.output_dir, f"step1_{args.source}{split_tag}_{mode}{tag}")
     with open(base + ".json", "w") as f:
         json.dump(summary, f, indent=2)

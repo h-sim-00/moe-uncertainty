@@ -19,6 +19,7 @@ Prints one decoded example showing the prompt/target mask boundary.
 Usage:
     python check-answer-only-labels.py                            # granite/obqa (MCQA)
     python check-answer-only-labels.py --dataset_shortcode medexqa  # generation
+    python check-answer-only-labels.py --dataset_shortcode medmcqa_gen  # generation (MedMCQA explanations)
 """
 import argparse
 

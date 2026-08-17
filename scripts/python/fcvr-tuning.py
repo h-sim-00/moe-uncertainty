@@ -73,11 +73,48 @@ def train_fcvr_router(model, tokenizer, train_loader, val_loader, args):
     project_name = "moe-uncertainty"
     wandb.init(project=project_name, name=run_name, config=vars(args), reinit=True)
 
-    # Early stopping on validation NLL (the LM reconstruction loss).
+    # Early stopping on validation NLL (the LM reconstruction loss). Validation
+    # runs at every epoch end and -- with --eval_every N > 0 -- every N OPTIMIZER
+    # steps as well (large train sets such as medmcqa_gen). Patience is counted
+    # in evaluations (== epochs when --eval_every 0, the legacy behaviour).
     best_val_loss = float("inf")
-    epochs_no_improve = 0
+    evals_no_improve = 0
+    optim_step = 0
+
+    def run_validation():
+        model.eval()
+        total_val_loss = 0
+        with torch.no_grad():
+            for batch in val_loader:
+                inputs = {k: v.to(model.device) for k, v in batch.items()}
+                outputs = model(**inputs)
+                total_val_loss += outputs.loss.item()
+        model.train()
+        return total_val_loss / len(val_loader)
+
+    def check_and_save(avg_val_loss, where, epoch):
+        """-> True if training should stop (patience exhausted)."""
+        nonlocal best_val_loss, evals_no_improve
+        print(f"{where} validation loss (NLL): {avg_val_loss:.4f}")
+        wandb.log({"val_loss": avg_val_loss, "epoch": epoch, "optim_step": optim_step})
+        if avg_val_loss < best_val_loss - 1e-4:
+            best_val_loss = avg_val_loss
+            evals_no_improve = 0
+            print(f"  New best val NLL {best_val_loss:.4f} -> saving FCVR weights.")
+            save_bayesian_routers(model, method="fcvr", args=args)
+            return False
+        evals_no_improve += 1
+        print(f"  No val-NLL improvement ({evals_no_improve}/{args.early_stop_patience}).")
+        if evals_no_improve >= args.early_stop_patience:
+            print(f"--- Early stopping at {where} (best val NLL {best_val_loss:.4f}) ---")
+            return True
+        return False
 
     print("--- Starting FCVR Fine-tuning (Custom Loop) ---")
+    if args.eval_every:
+        print(f"--- Validation every {args.eval_every} optimizer steps AND at every epoch end; "
+              f"patience {args.early_stop_patience} evaluations ---")
+    stop = False
     for epoch in range(args.epochs):
         model.train()
         total_epoch_loss = 0
@@ -123,6 +160,7 @@ def train_fcvr_router(model, tokenizer, train_loader, val_loader, args):
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad()
+                optim_step += 1
 
             total_epoch_loss += loss.item()
             wandb.log({
@@ -132,33 +170,18 @@ def train_fcvr_router(model, tokenizer, train_loader, val_loader, args):
                 "kl_tokens_in_batch": int(kl_mask.sum().item()) if kl_mask is not None else int(inputs["input_ids"].numel()),
                 "lr": scheduler.get_last_lr()[0],
             })
+            if is_step and args.eval_every and optim_step % args.eval_every == 0 and (i + 1) < num_training_batches:
+                if check_and_save(run_validation(), f"Epoch {epoch+1} optim-step {optim_step}", epoch):
+                    stop = True
+                    break
+        if stop:
+            break
 
         print(f"Epoch {epoch+1} average training loss: {total_epoch_loss / num_training_batches:.4f}")
 
-        # Validation Loop
-        model.eval()
-        total_val_loss = 0
-        with torch.no_grad():
-            for batch in val_loader:
-                inputs = {k: v.to(model.device) for k, v in batch.items()}
-                outputs = model(**inputs)
-                total_val_loss += outputs.loss.item()
-        avg_val_loss = total_val_loss / len(val_loader)
-        print(f"Epoch {epoch+1} validation loss (NLL): {avg_val_loss:.4f}")
-        wandb.log({"val_loss": avg_val_loss, "epoch": epoch})
-
-        # Early stopping on val NLL: keep the best checkpoint on disk.
-        if avg_val_loss < best_val_loss - 1e-4:
-            best_val_loss = avg_val_loss
-            epochs_no_improve = 0
-            print(f"  New best val NLL {best_val_loss:.4f} -> saving FCVR weights.")
-            save_bayesian_routers(model, method="fcvr", args=args)
-        else:
-            epochs_no_improve += 1
-            print(f"  No val-NLL improvement ({epochs_no_improve}/{args.early_stop_patience}).")
-            if epochs_no_improve >= args.early_stop_patience:
-                print(f"--- Early stopping at epoch {epoch+1} (best val NLL {best_val_loss:.4f}) ---")
-                break
+        # Epoch-end validation (always); early stopping on val NLL keeps the best checkpoint on disk.
+        if check_and_save(run_validation(), f"Epoch {epoch+1}", epoch):
+            break
 
     # Safety net: if val NLL never improved (best checkpoint never written),
     # persist the final state so the weights dir is not empty.
@@ -187,7 +210,12 @@ def parse_args():
     parser.add_argument("--warmup_ratio", type=float, default=0.05,
                         help="Fraction of total optimizer steps used for LR warmup (paper D.2: 0.05).")
     parser.add_argument("--early_stop_patience", type=int, default=3,
-                        help="Stop after this many epochs without val-NLL improvement (paper: early stop on val NLL).")
+                        help="Stop after this many evaluations (== epochs unless --eval_every > 0) without val-NLL improvement (paper: early stop on val NLL).")
+    parser.add_argument("--eval_every", type=int, default=0,
+                        help="Also validate (and checkpoint on improvement) every N OPTIMIZER steps (after grad accumulation); "
+                             "0 = epoch end only (legacy). Use for large train sets (medmcqa_gen).")
+    parser.add_argument("--max_seq_len", type=int, default=0,
+                        help="Drop (never truncate) train/val rows longer than this many tokens; 0 = keep all.")
     parser.add_argument("--beta", type=float, default=0.01)
     parser.add_argument("--kl_mask", type=str, default="attention", choices=["none", "attention", "answer"],
                         help="Positions the per-token KL is averaged over: attention = real tokens only "
@@ -223,7 +251,8 @@ def main():
     # on the prompt too). Seq2Seq pads input_ids with pad_token and labels with
     # -100 dynamically per batch; right padding keeps real-token positions correct
     # during training (eval keeps left).
-    train_dataset, val_dataset = load_and_prepare_train_and_val_data(tokenizer, [args.dataset_shortcode], seed=args.seed, answer_only=True)
+    train_dataset, val_dataset = load_and_prepare_train_and_val_data(
+        tokenizer, [args.dataset_shortcode], seed=args.seed, answer_only=True, max_seq_len=args.max_seq_len or None)
     tokenizer.padding_side = "right"
     data_collator = DataCollatorForSeq2Seq(tokenizer=tokenizer, padding=True, label_pad_token_id=-100)
     print(f"--- Loss mode: {'explanation-only (generation)' if is_generation_dataset([args.dataset_shortcode]) else 'answer-only (MCQA)'} ---")

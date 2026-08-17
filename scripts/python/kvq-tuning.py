@@ -55,31 +55,16 @@ def train(model, tokenizer, train_loader, val_loader, args):
             save_expert_lora(model, expert_lora_path(final_save_path))
 
     # Best-val checkpointing + early stopping on val loss (mirrors fcvr-tuning.py):
-    # the adapter on disk is always the best epoch, never the (overfit) last one.
+    # the adapter on disk is always the best checkpoint, never the (overfit) last
+    # one. Evaluation happens at every epoch end and -- if --eval_every N > 0 --
+    # additionally every N optimizer steps (large datasets such as medmcqa_gen,
+    # where one epoch is thousands of steps). Patience is counted in
+    # EVALUATIONS (== epochs when --eval_every 0, the legacy behaviour).
     best_val_loss = float("inf")
-    epochs_no_improve = 0
+    evals_no_improve = 0
+    global_step = 0
 
-    print("--- Starting MAP Fine-tuning (Custom Loop) ---")
-    for epoch in range(args.epochs):
-        model.train()
-        total_epoch_loss = 0
-        for batch in tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}"):
-            optimizer.zero_grad()
-            inputs = {k: v.to(model.device) for k, v in batch.items()}
-            outputs = model(**inputs)
-            loss = outputs.loss
-            loss.backward()
-            optimizer.step()
-            scheduler.step()
-            total_epoch_loss += loss.item()
-            wandb.log({
-                "train_loss": loss.item(),
-                "lr": scheduler.get_last_lr()[0],
-            })
-
-        print(f"Epoch {epoch+1} average training loss: {total_epoch_loss / num_training_batches:.4f}")
-
-        # Validation Loop
+    def run_validation():
         model.eval()
         total_val_loss = 0
         with torch.no_grad():
@@ -87,26 +72,63 @@ def train(model, tokenizer, train_loader, val_loader, args):
                 inputs = {k: v.to(model.device) for k, v in batch.items()}
                 outputs = model(**inputs)
                 total_val_loss += outputs.loss.item()
-        avg_val_loss = total_val_loss / len(val_loader)
-        print(f"Epoch {epoch+1} validation loss: {avg_val_loss:.4f}")
-        wandb.log({"val_loss": avg_val_loss, "epoch": epoch})
+        model.train()
+        return total_val_loss / len(val_loader)
 
-        # Best-val checkpointing: only persist the adapter when validation
-        # improves (re-save overwrites the previous best, so final_save_path is
-        # always the best epoch); early-stop after `early_stop_patience` epochs
-        # without improvement.
+    def check_and_save(avg_val_loss, where, epoch):
+        """-> True if training should stop (patience exhausted)."""
+        nonlocal best_val_loss, evals_no_improve
+        print(f"{where} validation loss: {avg_val_loss:.4f}")
+        wandb.log({"val_loss": avg_val_loss, "epoch": epoch, "global_step": global_step})
         if avg_val_loss < best_val_loss - 1e-4:
             best_val_loss = avg_val_loss
-            epochs_no_improve = 0
+            evals_no_improve = 0
             print(f"  New best val loss {best_val_loss:.4f} -> saving adapter to {final_save_path}")
             save_adapter()
-        else:
-            epochs_no_improve += 1
-            print(f"  No val-loss improvement ({epochs_no_improve}/{args.early_stop_patience}); "
-                  f"keeping best checkpoint (val {best_val_loss:.4f}).")
-            if epochs_no_improve >= args.early_stop_patience:
-                print(f"--- Early stopping at epoch {epoch+1} (best val loss {best_val_loss:.4f}) ---")
-                break
+            return False
+        evals_no_improve += 1
+        print(f"  No val-loss improvement ({evals_no_improve}/{args.early_stop_patience}); "
+              f"keeping best checkpoint (val {best_val_loss:.4f}).")
+        if evals_no_improve >= args.early_stop_patience:
+            print(f"--- Early stopping at {where} (best val loss {best_val_loss:.4f}) ---")
+            return True
+        return False
+
+    print("--- Starting MAP Fine-tuning (Custom Loop) ---")
+    if args.eval_every:
+        print(f"--- Validation every {args.eval_every} optimizer steps AND at every epoch end; "
+              f"patience {args.early_stop_patience} evaluations ---")
+    stop = False
+    for epoch in range(args.epochs):
+        model.train()
+        total_epoch_loss = 0
+        for i, batch in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}")):
+            optimizer.zero_grad()
+            inputs = {k: v.to(model.device) for k, v in batch.items()}
+            outputs = model(**inputs)
+            loss = outputs.loss
+            loss.backward()
+            optimizer.step()
+            scheduler.step()
+            global_step += 1
+            total_epoch_loss += loss.item()
+            wandb.log({
+                "train_loss": loss.item(),
+                "lr": scheduler.get_last_lr()[0],
+            })
+            # Mid-epoch validation (skipped on the last batch: the epoch-end validation follows).
+            if args.eval_every and global_step % args.eval_every == 0 and (i + 1) < num_training_batches:
+                if check_and_save(run_validation(), f"Epoch {epoch+1} step {global_step}", epoch):
+                    stop = True
+                    break
+        if stop:
+            break
+
+        print(f"Epoch {epoch+1} average training loss: {total_epoch_loss / num_training_batches:.4f}")
+
+        # Epoch-end validation (always).
+        if check_and_save(run_validation(), f"Epoch {epoch+1}", epoch):
+            break
 
     # Safety net: if val loss never improved (best checkpoint never written),
     # persist the final state so the adapter dir is not empty.
@@ -132,7 +154,13 @@ def parse_args():
     parser.add_argument("--warmup_ratio", type=float, default=0.05,
                         help="Fraction of total optimizer steps used for LR warmup (paper D.2: 0.05).")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility.")
-    parser.add_argument("--early_stop_patience", type=int, default=2, help="Epochs of no val-loss improvement before early stopping (best checkpoint kept).")
+    parser.add_argument("--early_stop_patience", type=int, default=2,
+                        help="Evaluations (== epochs unless --eval_every > 0) of no val-loss improvement before early stopping (best checkpoint kept).")
+    parser.add_argument("--eval_every", type=int, default=0,
+                        help="Also validate (and checkpoint on improvement) every N optimizer steps; 0 = epoch end only (legacy). "
+                             "Use for large train sets (medmcqa_gen) so early stopping is not epoch-coarse.")
+    parser.add_argument("--max_seq_len", type=int, default=0,
+                        help="Drop (never truncate) train/val rows longer than this many tokens; 0 = keep all. Memory guard for long explanations.")
     return parser.parse_args()
 
 
@@ -158,7 +186,8 @@ def main():
     # cases labels mask the prompt (-100), so the collator must preserve them
     # instead of rebuilding labels from input_ids. Right padding keeps real-token
     # positions correct during training (eval keeps left).
-    train_dataset, val_dataset = load_and_prepare_train_and_val_data(tokenizer, [args.dataset_shortcode], seed=args.seed, answer_only=True)
+    train_dataset, val_dataset = load_and_prepare_train_and_val_data(
+        tokenizer, [args.dataset_shortcode], seed=args.seed, answer_only=True, max_seq_len=args.max_seq_len or None)
     tokenizer.padding_side = "right"
     data_collator = DataCollatorForSeq2Seq(tokenizer=tokenizer, padding=True, label_pad_token_id=-100)
     print(f"--- Loss mode: {'explanation-only (generation)' if is_generation_dataset([args.dataset_shortcode]) else 'answer-only (MCQA)'} ---")

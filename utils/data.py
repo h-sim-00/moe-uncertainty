@@ -12,7 +12,34 @@ from .prompt import multiple_choice_prompt_engineer, generation_prompt_engineer
 # option letter). These route through generation_prompt_engineer, get an EOS
 # appended to the target, and use a label-preserving (Seq2Seq) collator so the
 # prompt is masked out of the loss. Everything else stays multiple-choice.
-GENERATION_DATASETS = {"medexqa"}
+GENERATION_DATASETS = {"medexqa", "medmcqa_gen"}
+
+# ---------------------------------------------------------------------------
+# medmcqa_gen (branch MedMCQA): MedMCQA questions whose gold `exp` explanation is
+# used as the FREE-TEXT generation target. Split protocol (frozen by manifest):
+#   train  = MEDMCQA_GEN_N_TRAIN rows from the OFFICIAL train split, stratified
+#            (proportional) by subject_name;
+#   val    = MEDMCQA_GEN_N_VAL rows, also from official train, stratified,
+#            disjoint from train  -> the ONLY selection set;
+#   test   = MEDMCQA_GEN_N_TEST rows from the OFFICIAL validation split (the
+#            set MedMCQA papers report on; test-split answers are withheld),
+#            stratified  -> evaluated once per frozen configuration.
+# Row filter (identical for every split): choice_type == "single", valid cop,
+# four non-empty options, non-empty `exp` with MEDMCQA_GEN_MIN_EXP_WORDS <=
+# words <= MEDMCQA_GEN_MAX_EXP_WORDS (drops "Ans. C i.e. Mite"-style stubs and
+# textbook dumps that would exceed the generation cap), exact-duplicate
+# questions removed (a question already in test is never re-used in train/val).
+# ---------------------------------------------------------------------------
+MEDMCQA_GEN_N_TRAIN = 30000
+MEDMCQA_GEN_N_VAL = 1000
+MEDMCQA_GEN_N_TEST = 1000
+MEDMCQA_GEN_MIN_EXP_WORDS = 10
+MEDMCQA_GEN_MAX_EXP_WORDS = 160   # ~<=256 Granite tokens incl. medical sub-words; see max_new_tokens
+# Same inner prompt format as MedExQA (utils/prompt.py::render_inner 'generation'),
+# so the two generation datasets can be evaluated with one template and the
+# canonicalisation / format-control logic in the OoD bridge test applies to both.
+GENERATION_INNER_TEMPLATE = "Question: {q}\nOptions:\n{opts}\n\nExplain the reasoning for the correct answer."
+MCQA_INNER_TEMPLATE = "Question: {q}\nChoices:\n{opts}\nAnswer:"
 
 
 def is_generation_dataset(shortcodes):
@@ -389,7 +416,24 @@ def preprocess_answer_only_for_training(dataset_list: List[dict], tokenizer: Aut
         "labels": labels_list,
     })
 
-def load_and_prepare_train_and_val_data(tokenizer: AutoTokenizer, train_dataset_shortcodes: List, seed=42, answer_only=False) -> Tuple[Dataset, Dataset]:
+def _drop_overlong(dataset: Dataset, max_seq_len, name):
+    """Drop rows whose tokenized length exceeds max_seq_len (None/0 = keep all).
+    Rows are DROPPED, never truncated: truncating a generation target would cut
+    the EOS off and teach the model to stop mid-sentence."""
+    if not max_seq_len:
+        return dataset
+    lengths = [len(x) for x in dataset["input_ids"]]
+    keep = [i for i, n in enumerate(lengths) if n <= max_seq_len]
+    n_drop = len(lengths) - len(keep)
+    if lengths:
+        srt = sorted(lengths)
+        print(f"  [{name}] token lengths: max={srt[-1]} p50={srt[len(srt)//2]} p95={srt[int(0.95*(len(srt)-1))]} "
+              f"p99={srt[int(0.99*(len(srt)-1))]}; max_seq_len={max_seq_len} -> dropped {n_drop}/{len(lengths)} rows")
+    return dataset.select(keep) if n_drop else dataset
+
+
+def load_and_prepare_train_and_val_data(tokenizer: AutoTokenizer, train_dataset_shortcodes: List, seed=42,
+                                        answer_only=False, max_seq_len=None) -> Tuple[Dataset, Dataset]:
     """Loads and preprocesses the dataset for causal language modeling.
 
     Dispatch (three mutually exclusive paths):
@@ -403,6 +447,10 @@ def load_and_prepare_train_and_val_data(tokenizer: AutoTokenizer, train_dataset_
       * MCQA + `answer_only=False`: legacy full-sequence-padded masking.
     All paths return prompt-masked labels; pair with a labels-preserving collator
     (DataCollatorForSeq2Seq, label_pad_token_id=-100).
+    `max_seq_len` (optional): drop (never truncate) train/val rows longer than
+    this many tokens -- a memory guard for large generation sets (medmcqa_gen);
+    the number of dropped rows is printed. None/0 = keep everything (default,
+    identical to the behaviour that produced the MedExQA weights).
     """
     generation = is_generation_dataset(train_dataset_shortcodes)
     engineer = generation_prompt_engineer if generation else multiple_choice_prompt_engineer
@@ -427,23 +475,42 @@ def load_and_prepare_train_and_val_data(tokenizer: AutoTokenizer, train_dataset_
         train_dataset = preprocess(train_engineered, tokenizer)
         val_dataset = preprocess(val_engineered, tokenizer)
 
+    train_dataset = _drop_overlong(train_dataset, max_seq_len, "train")
+    val_dataset = _drop_overlong(val_dataset, max_seq_len, "val")
+
     print(f"Datasets '{train_dataset_shortcodes}' loaded and preprocessed.")
     print(f"Train samples: {len(train_dataset)}, Eval samples: {len(val_dataset)}")
 
     return train_dataset, val_dataset
 
-def medexqa_split_manifest_path(seed=42):
-    """Repo-relative path of the frozen MedExQA derived-split manifest."""
+# ---------------------------------------------------------------------------
+# Frozen derived-split manifests (medexqa, medmcqa_gen). One CSV per dataset:
+#   splits/<dataset>-derived-seed<seed>.csv   (qhash, split, id, question_prefix)
+# The loader verifies its in-memory split against the manifest on every call
+# and raises if the split moved. The medexqa_* names below are kept as thin
+# wrappers so existing callers / the MedExQA manifest file are unchanged.
+# ---------------------------------------------------------------------------
+_MANIFEST_LABEL = {"medexqa": "MedExQA", "medmcqa_gen": "MedMCQA-gen"}
+_MANIFEST_WRITER = {"medexqa": "write-medexqa-split-manifest.py",
+                    "medmcqa_gen": "write-medmcqa-split-manifest.py"}
+
+
+def split_manifest_path(dataset_shortcode, seed=42):
+    """Repo-relative path of the frozen derived-split manifest for a dataset."""
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    return os.path.join(repo_root, "splits", f"medexqa-derived-seed{seed}.csv")
+    return os.path.join(repo_root, "splits", f"{dataset_shortcode}-derived-seed{seed}.csv")
 
 
-def medexqa_example_hash(example):
-    """Content hash identifying a MedExQA example independently of the random id."""
+def example_hash(example):
+    """Content hash identifying an example independently of its (random) id."""
     return hashlib.sha1(example["question"].encode("utf-8")).hexdigest()[:16]
 
 
-def write_medexqa_split_manifest(train, val, test, path):
+def _skip_manifest_env(dataset_shortcode):
+    return f"{dataset_shortcode.upper()}_SKIP_MANIFEST"   # MEDEXQA_SKIP_MANIFEST / MEDMCQA_GEN_SKIP_MANIFEST
+
+
+def write_split_manifest(dataset_shortcode, train, val, test, path):
     """Freeze the derived split: one row per example (qhash, split, id, question_prefix)."""
     import csv as _csv
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -453,27 +520,30 @@ def write_medexqa_split_manifest(train, val, test, path):
         for split_name, rows in (("train", train), ("val", val), ("test", test)):
             for ex in rows:
                 prefix = " ".join(ex["question"].split())[:80]
-                w.writerow([medexqa_example_hash(ex), split_name, ex["id"], prefix])
-    print(f"  MedExQA: wrote split manifest -> {path} "
+                w.writerow([example_hash(ex), split_name, ex["id"], prefix])
+    print(f"  {_MANIFEST_LABEL.get(dataset_shortcode, dataset_shortcode)}: wrote split manifest -> {path} "
           f"(train={len(train)}, val={len(val)}, test={len(test)})")
 
 
-def verify_medexqa_split_manifest(train, val, test, seed=42, path=None):
+def verify_split_manifest(dataset_shortcode, train, val, test, seed=42, path=None):
     """Check the in-memory derived split against the frozen manifest.
 
     * manifest present  -> every example must be in the recorded split, and the
       per-split counts must match; otherwise raise (the split moved: RNG order,
-      dedup, or upstream TSVs changed). Set MEDEXQA_SKIP_MANIFEST=1 to bypass.
-    * manifest absent   -> print how to create it (write-medexqa-split-manifest.py).
+      dedup, or upstream data changed). Set <DATASET>_SKIP_MANIFEST=1 to bypass.
+    * manifest absent   -> print how to create it (write-<dataset>-split-manifest.py).
     """
     import csv as _csv
-    path = path or medexqa_split_manifest_path(seed)
-    if os.environ.get("MEDEXQA_SKIP_MANIFEST") == "1":
-        print("  MedExQA: split-manifest check SKIPPED (MEDEXQA_SKIP_MANIFEST=1)")
+    label = _MANIFEST_LABEL.get(dataset_shortcode, dataset_shortcode)
+    env = _skip_manifest_env(dataset_shortcode)
+    path = path or split_manifest_path(dataset_shortcode, seed)
+    if os.environ.get(env) == "1":
+        print(f"  {label}: split-manifest check SKIPPED ({env}=1)")
         return
     if not os.path.exists(path):
-        print(f"  MedExQA: no split manifest at {path}; run "
-              f"`python write-medexqa-split-manifest.py` once and commit it to freeze the split.")
+        print(f"  {label}: no split manifest at {path}; run "
+              f"`python {_MANIFEST_WRITER.get(dataset_shortcode, 'write-<dataset>-split-manifest.py')}` "
+              f"once and commit it to freeze the split.")
         return
     recorded = {}
     with open(path, newline="", encoding="utf-8") as f:
@@ -483,20 +553,176 @@ def verify_medexqa_split_manifest(train, val, test, seed=42, path=None):
     for split_name, rows in (("train", train), ("val", val), ("test", test)):
         for ex in rows:
             counts[split_name] += 1
-            got = recorded.get(medexqa_example_hash(ex))
+            got = recorded.get(example_hash(ex))
             if got != split_name:
                 mismatches.append((split_name, got, ex["question"][:60]))
     rec_counts = {s: sum(1 for v in recorded.values() if v == s) for s in counts}
     if mismatches or rec_counts != counts:
         head = "\n".join(f"    in-memory={a} manifest={b}: {q!r}" for a, b, q in mismatches[:5])
         raise RuntimeError(
-            f"MedExQA derived split does not match the frozen manifest {path}: "
+            f"{label} derived split does not match the frozen manifest {path}: "
             f"{len(mismatches)} misassigned example(s); counts in-memory={counts} manifest={rec_counts}.\n"
-            f"{head}\nThe split moved (RNG order / dedup / upstream TSV change). Do NOT proceed with "
-            f"val/test-dependent runs; investigate, or set MEDEXQA_SKIP_MANIFEST=1 to bypass knowingly."
+            f"{head}\nThe split moved (RNG order / dedup / upstream data change). Do NOT proceed with "
+            f"val/test-dependent runs; investigate, or set {env}=1 to bypass knowingly."
         )
-    print(f"  MedExQA: split matches frozen manifest ({path}); "
+    print(f"  {label}: split matches frozen manifest ({path}); "
           f"train={counts['train']} val={counts['val']} test={counts['test']}")
+
+
+# Backward-compatible MedExQA wrappers (write-medexqa-split-manifest.py imports these).
+def medexqa_split_manifest_path(seed=42):
+    return split_manifest_path("medexqa", seed)
+
+
+def medexqa_example_hash(example):
+    return example_hash(example)
+
+
+def write_medexqa_split_manifest(train, val, test, path):
+    return write_split_manifest("medexqa", train, val, test, path)
+
+
+def verify_medexqa_split_manifest(train, val, test, seed=42, path=None):
+    return verify_split_manifest("medexqa", train, val, test, seed=seed, path=path)
+
+
+# ---------------------------------------------------------------------------
+# medmcqa_gen loader
+# ---------------------------------------------------------------------------
+def _medmcqa_gen_reformat(example, split_name):
+    """MedMCQA row -> generation example, or None if it fails the row filter.
+
+    Same field layout as the MedExQA examples so every downstream script
+    (training, readouts, labels, OoD bridge) works unchanged:
+      question        generation prompt inner text (GENERATION_INNER_TEMPLATE)
+      answer          " " + gold explanation (`exp`)   -- the free-text target
+      id              medmcqa_gen_<split>_<official id>  (deterministic, no RNG)
+      gold_letter     A-D
+      letter_question MCQA-style prompt for the letter-probe label
+      explanation_2   ""  (MedMCQA has a single reference explanation)
+      subject_name    kept for stratification / per-subject analysis
+    Returns (example, None) if kept, else (None, reason) for the filter funnel.
+    """
+    if example.get("choice_type") != "single":
+        return None, "not_single"
+    cop = example.get("cop")
+    if cop is None or not (0 <= cop < 4):          # HF cop is 0-indexed (checked 2026-08-17)
+        return None, "bad_cop"
+    q = " ".join(str(example.get("question") or "").split())
+    choices = [" ".join(str(example.get(k) or "").split()) for k in ("opa", "opb", "opc", "opd")]
+    exp = " ".join(str(example.get("exp") or "").split())
+    if not q or any(not c for c in choices):
+        return None, "empty_field"
+    if not exp:
+        return None, "no_explanation"
+    n_words = len(exp.split())
+    if n_words < MEDMCQA_GEN_MIN_EXP_WORDS:
+        return None, "exp_too_short"
+    if n_words > MEDMCQA_GEN_MAX_EXP_WORDS:
+        return None, "exp_too_long"
+    labels = ["A", "B", "C", "D"]
+    opts = "\n".join(f"{lab}. {txt}" for lab, txt in zip(labels, choices))
+    return {
+        "question": GENERATION_INNER_TEMPLATE.format(q=q, opts=opts),
+        "answer": " " + exp,
+        "id": f"medmcqa_gen_{split_name}_{example.get('id')}",
+        "explanation_2": "",
+        "gold_letter": labels[cop],
+        "letter_question": MCQA_INNER_TEMPLATE.format(q=q, opts=opts),
+        "subject_name": str(example.get("subject_name") or "Unknown"),
+        "topic_name": str(example.get("topic_name") or ""),
+    }, None
+
+
+def _stratified_take(rows, n, key, rng):
+    """Proportional stratified sample of n rows (deterministic given rng).
+
+    Rows are grouped by `key`, each group is shuffled with `rng`, and every group
+    contributes round(n * group_frac) rows (largest-remainder rounding so the total
+    is exactly min(n, len(rows))). Returns (taken, remaining) with each group's
+    remaining rows kept in their shuffled order (so a second call on `remaining`
+    yields a disjoint stratified sample)."""
+    from collections import defaultdict
+    groups = defaultdict(list)
+    for r in rows:
+        groups[r[key]].append(r)
+    keys = sorted(groups)
+    for k in keys:
+        rng.shuffle(groups[k])
+    total = len(rows)
+    n = min(n, total)
+    quotas = {k: (n * len(groups[k])) / total for k in keys}
+    take = {k: int(quotas[k]) for k in keys}
+    short = n - sum(take.values())
+    for k in sorted(keys, key=lambda k: quotas[k] - int(quotas[k]), reverse=True)[:short]:
+        take[k] += 1
+    taken, remaining = [], []
+    for k in keys:
+        taken.extend(groups[k][:take[k]])
+        remaining.extend(groups[k][take[k]:])
+    rng.shuffle(taken)
+    return taken, remaining
+
+
+def _load_medmcqa_gen(seed):
+    """Build the medmcqa_gen (train, val, test) split. See the constants at the top."""
+    rng = random.Random(seed)   # private RNG: independent of the global stream
+
+    dataset = datasets.load_dataset("openlifescienceai/medmcqa")
+
+    def build(split_name):
+        raw = dataset[split_name]
+        funnel = {"rows": len(raw), "kept": 0}
+        out = []
+        for ex in raw:
+            r, reason = _medmcqa_gen_reformat(ex, split_name)
+            if r is None:
+                funnel[reason] = funnel.get(reason, 0) + 1
+                continue
+            out.append(r); funnel["kept"] += 1
+        print(f"  MedMCQA-gen [{split_name}] filter funnel: {funnel}")
+        return out
+
+    def qkey(r):
+        return " ".join(r["question"].lower().split())
+
+    # ---- test: official validation split (answers + explanations available) ----
+    dev_pool = build("validation")
+    seen, dedup = set(), []
+    for r in dev_pool:
+        k = qkey(r)
+        if k in seen: continue
+        seen.add(k); dedup.append(r)
+    test_dataset, _ = _stratified_take(dedup, MEDMCQA_GEN_N_TEST, "subject_name", rng)
+    test_keys = {qkey(r) for r in test_dataset}
+
+    # ---- train / val: official train split, deduped, disjoint from test ----
+    train_pool = build("train")
+    seen, dedup, n_dup, n_in_test = set(), [], 0, 0
+    for r in train_pool:
+        k = qkey(r)
+        if k in test_keys:
+            n_in_test += 1; continue
+        if k in seen:
+            n_dup += 1; continue
+        seen.add(k); dedup.append(r)
+    print(f"  MedMCQA-gen [train] after dedup: {len(dedup)} rows "
+          f"(dropped {n_dup} duplicate questions, {n_in_test} overlapping the test set)")
+    validation_dataset, rest = _stratified_take(dedup, MEDMCQA_GEN_N_VAL, "subject_name", rng)
+    train_dataset, _ = _stratified_take(rest, MEDMCQA_GEN_N_TRAIN, "subject_name", rng)
+
+    if len(train_dataset) < 5000 or len(validation_dataset) < 100 or len(test_dataset) < 100:
+        raise ValueError(f"MedMCQA-gen: unexpectedly small split after filtering: "
+                         f"train={len(train_dataset)} val={len(validation_dataset)} test={len(test_dataset)}")
+
+    def subj_hist(rows):
+        from collections import Counter
+        c = Counter(r["subject_name"] for r in rows)
+        return ", ".join(f"{k}={v}" for k, v in sorted(c.items(), key=lambda kv: -kv[1]))
+    print(f"  MedMCQA-gen subjects (train): {subj_hist(train_dataset)}")
+    print(f"  MedMCQA-gen subjects (val):   {subj_hist(validation_dataset)}")
+    print(f"  MedMCQA-gen subjects (test):  {subj_hist(test_dataset)}")
+    return train_dataset, validation_dataset, test_dataset
 
 
 def load_exp_dataset(dataset_shortcode, seed=42, split=None):
@@ -505,8 +731,9 @@ def load_exp_dataset(dataset_shortcode, seed=42, split=None):
     custom train/validation/test splits for fine-tuning and evaluation.
 
     Args:
-        dataset_shortcode (str): One of 'obqa', 'arc_c', 'arc_e', 
-                                 'sciq', 'mmlu_law', 'medmcqa_med'.
+        dataset_shortcode (str): One of 'obqa', 'arc_c', 'arc_e', 'sciq',
+                                 'mmlu_law', 'medmcqa_med' (MCQA) or the
+                                 generation sets 'medexqa', 'medmcqa_gen'.
         seed (int): Random seed for shuffling and sampling.
         split (str, optional): If specified, returns only the 'train', 
                                'validation', or 'test' split. 
@@ -744,14 +971,20 @@ def load_exp_dataset(dataset_shortcode, seed=42, split=None):
         test_dataset = pool[:175]
         train_dataset = pool[175:]   # generic tail carves 50 val from this -> ~740 train
 
+    elif dataset_shortcode == "medmcqa_gen":
+        train_dataset, validation_dataset, test_dataset = _load_medmcqa_gen(seed)
+
     else:
         raise ValueError(f"Dataset '{dataset_shortcode}' not supported by load_exp_dataset.")
 
-    validation_dataset = train_dataset[-50:]
-    train_dataset = train_dataset[:-50]
+    if dataset_shortcode != "medmcqa_gen":
+        # Generic tail: the last 50 train rows become the val set. medmcqa_gen
+        # builds its own (larger, stratified) val set above.
+        validation_dataset = train_dataset[-50:]
+        train_dataset = train_dataset[:-50]
 
-    if dataset_shortcode == "medexqa":
-        verify_medexqa_split_manifest(train_dataset, validation_dataset, test_dataset, seed=seed)
+    if dataset_shortcode in ("medexqa", "medmcqa_gen"):
+        verify_split_manifest(dataset_shortcode, train_dataset, validation_dataset, test_dataset, seed=seed)
 
     print(f"Dataset '{dataset_shortcode}' processed: Train={len(train_dataset)}, Val={len(validation_dataset)}, Test={len(test_dataset)}")
     

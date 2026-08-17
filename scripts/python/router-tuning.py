@@ -60,28 +60,15 @@ def train(model, tokenizer, train_loader, val_loader, args):
     wandb.init(project=project_name, name=run_name, config=vars(args), reinit=True)
 
     num_training_batches = len(train_loader)
+    # Best-val checkpoint + early stopping (the weights on disk are always the
+    # best checkpoint; re-save overwrites the previous best of THIS run only).
+    # Validation at every epoch end and, with --eval_every N > 0, every N steps;
+    # patience counted in evaluations (== epochs when --eval_every 0).
     best_val_loss = float("inf")
-    epochs_no_improve = 0
+    evals_no_improve = 0
+    global_step = 0
 
-    print("--- Starting MAP router fine-tuning (Custom Loop) ---")
-    for epoch in range(args.epochs):
-        model.train()
-        total_epoch_loss = 0
-        for batch in tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}"):
-            optimizer.zero_grad()
-            inputs = {k: v.to(model.device) for k, v in batch.items()}
-            outputs = model(**inputs)
-            loss = outputs.loss
-            loss.backward()
-            optimizer.step()
-            total_epoch_loss += loss.item()
-            wandb.log({
-                "train_loss": loss.item()
-            })
-
-        print(f"Epoch {epoch+1} average training loss: {total_epoch_loss / num_training_batches:.4f}")
-
-        # Validation Loop
+    def run_validation():
         model.eval()
         total_val_loss = 0
         with torch.no_grad():
@@ -89,23 +76,58 @@ def train(model, tokenizer, train_loader, val_loader, args):
                 inputs = {k: v.to(model.device) for k, v in batch.items()}
                 outputs = model(**inputs)
                 total_val_loss += outputs.loss.item()
-        avg_val_loss = total_val_loss / len(val_loader)
-        print(f"Epoch {epoch+1} validation loss: {avg_val_loss:.4f}")
-        wandb.log({"val_loss": avg_val_loss, "epoch": epoch})
+        model.train()
+        return total_val_loss / len(val_loader)
 
-        # Best-val checkpoint + early stopping (the weights on disk are always
-        # the best epoch; re-save overwrites the previous best of THIS run only).
+    def check_and_save(avg_val_loss, where, epoch):
+        nonlocal best_val_loss, evals_no_improve
+        print(f"{where} validation loss: {avg_val_loss:.4f}")
+        wandb.log({"val_loss": avg_val_loss, "epoch": epoch, "global_step": global_step})
         if avg_val_loss < best_val_loss - 1e-4:
             best_val_loss = avg_val_loss
-            epochs_no_improve = 0
+            evals_no_improve = 0
             print(f"  New best val loss {best_val_loss:.4f} -> saving MAP routers.")
             save_map_routers_func(model, args)
-        else:
-            epochs_no_improve += 1
-            print(f"  No val-loss improvement ({epochs_no_improve}/{args.early_stop_patience}).")
-            if epochs_no_improve >= args.early_stop_patience:
-                print(f"--- Early stopping at epoch {epoch+1} (best val loss {best_val_loss:.4f}) ---")
-                break
+            return False
+        evals_no_improve += 1
+        print(f"  No val-loss improvement ({evals_no_improve}/{args.early_stop_patience}).")
+        if evals_no_improve >= args.early_stop_patience:
+            print(f"--- Early stopping at {where} (best val loss {best_val_loss:.4f}) ---")
+            return True
+        return False
+
+    print("--- Starting MAP router fine-tuning (Custom Loop) ---")
+    if args.eval_every:
+        print(f"--- Validation every {args.eval_every} steps AND at every epoch end; "
+              f"patience {args.early_stop_patience} evaluations ---")
+    stop = False
+    for epoch in range(args.epochs):
+        model.train()
+        total_epoch_loss = 0
+        for i, batch in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}")):
+            optimizer.zero_grad()
+            inputs = {k: v.to(model.device) for k, v in batch.items()}
+            outputs = model(**inputs)
+            loss = outputs.loss
+            loss.backward()
+            optimizer.step()
+            global_step += 1
+            total_epoch_loss += loss.item()
+            wandb.log({
+                "train_loss": loss.item()
+            })
+            # Mid-epoch validation (skipped on the last batch: the epoch-end validation follows).
+            if args.eval_every and global_step % args.eval_every == 0 and (i + 1) < num_training_batches:
+                if check_and_save(run_validation(), f"Epoch {epoch+1} step {global_step}", epoch):
+                    stop = True
+                    break
+        if stop:
+            break
+
+        print(f"Epoch {epoch+1} average training loss: {total_epoch_loss / num_training_batches:.4f}")
+
+        if check_and_save(run_validation(), f"Epoch {epoch+1}", epoch):
+            break
 
     if best_val_loss == float("inf"):
         print("--- Val loss never improved; saving final state as a fallback ---")
@@ -124,7 +146,11 @@ def parse_args():
     parser.add_argument("--lr", type=float, default=5e-5)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--early_stop_patience", type=int, default=2,
-                        help="Epochs of no val-loss improvement before early stopping (best checkpoint kept).")
+                        help="Evaluations (== epochs unless --eval_every > 0) of no val-loss improvement before early stopping (best checkpoint kept).")
+    parser.add_argument("--eval_every", type=int, default=0,
+                        help="Also validate (and checkpoint on improvement) every N steps; 0 = epoch end only (legacy).")
+    parser.add_argument("--max_seq_len", type=int, default=0,
+                        help="Drop (never truncate) train/val rows longer than this many tokens; 0 = keep all.")
     parser.add_argument("--map_suffix", type=str, default=None,
                         help="Suffix on router_weights/base/<model>_<dataset>; keeps this run from overwriting an earlier MAP run.")
     return parser.parse_args()
@@ -146,7 +172,7 @@ def main():
     # labels (answer-only for MCQA, explanation-only + EOS for generation),
     # right padding, labels-preserving collator.
     train_dataset, val_dataset = load_and_prepare_train_and_val_data(
-        tokenizer, [args.dataset_shortcode], seed=args.seed, answer_only=True)
+        tokenizer, [args.dataset_shortcode], seed=args.seed, answer_only=True, max_seq_len=args.max_seq_len or None)
     tokenizer.padding_side = "right"
     data_collator = DataCollatorForSeq2Seq(tokenizer=tokenizer, padding=True, label_pad_token_id=-100)
     print(f"--- Loss mode: {'explanation-only (generation)' if is_generation_dataset([args.dataset_shortcode]) else 'answer-only (MCQA)'} ---")

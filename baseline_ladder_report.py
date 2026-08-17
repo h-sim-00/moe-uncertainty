@@ -11,9 +11,10 @@ results and prints one comparison table:
             OoD AUROC (ilv_last / entropy_last) per OoD set.
 
 Inputs are matched by filename tag:
-    results/token_analysis/step1_medexqa[_val]_generate_<TAG>_seqlevel_labeled.jsonl   (labels)
-    results/token_analysis/step1_medexqa[_val]_generate_<TAG>.json                     (config/runtime)
-    results/input_level_ood/input_ood_medexqa[_val]_<run_suffix>_<TAG>.json            (OoD, optional)
+    results/token_analysis/step1_<source>[_val]_generate_<TAG>_seqlevel_labeled.jsonl   (labels)
+    results/token_analysis/step1_<source>[_val]_generate_<TAG>.json                     (config/runtime)
+    results/input_level_ood/input_ood_<source>[_val]_<run_suffix>_<TAG>.json            (OoD, optional)
+  (--source medexqa | medmcqa_gen; default medexqa)
 
 Usage (CPU):
     python baseline_ladder_report.py --split val --tags beta0.01-S35-s42 det-S35-s42 untrained-S35-s42 ...
@@ -41,10 +42,10 @@ def find_one(pattern):
 
 def summarize_arm(tag, split, args):
     split_tok = "" if split == "test" else f"_{split}"
-    lab = find_one(f"{args.token_dir}/step1_medexqa{split_tok}_generate_{tag}_seqlevel_labeled.jsonl")
+    lab = find_one(f"{args.token_dir}/step1_{args.source}{split_tok}_generate_{tag}_seqlevel_labeled.jsonl")
     if lab is None:
-        return {"tag": tag, "missing": f"{args.token_dir}/step1_medexqa{split_tok}_generate_{tag}_seqlevel_labeled.jsonl"}
-    cfg_path = find_one(f"{args.token_dir}/step1_medexqa{split_tok}_generate_{tag}.json")
+        return {"tag": tag, "missing": f"{args.token_dir}/step1_{args.source}{split_tok}_generate_{tag}_seqlevel_labeled.jsonl"}
+    cfg_path = find_one(f"{args.token_dir}/step1_{args.source}{split_tok}_generate_{tag}.json")
     cfg = json.load(open(cfg_path)) if cfg_path else {}
     rows = load_rows(lab)
     label = args.label
@@ -81,7 +82,22 @@ def summarize_arm(tag, split, args):
         },
         "ood": {},
     }
-    ood_path = find_one(f"{args.ood_dir}/input_ood_medexqa{split_tok}_*_{tag}.json")
+    # Per-subject breakdown (medmcqa_gen rows carry subject_name; MedExQA rows do not):
+    # option accuracy + primary-score AUROC per subject (JSON only; n per subject is small).
+    if any(r.get("subject_name") for r in lab_rows):
+        by_subj = {}
+        for r, yy in zip(lab_rows, y):
+            by_subj.setdefault(r.get("subject_name") or "?", []).append((r, int(yy)))
+        out["per_subject"] = {}
+        for subj, items in sorted(by_subj.items(), key=lambda kv: -len(kv[1])):
+            ys = np.array([yy for _, yy in items], dtype=int)
+            ss = [r["scores"].get(args.primary_score) for r, _ in items]
+            auc = None
+            if len(items) >= 10 and 0 < ys.sum() < len(ys) and all(v is not None for v in ss):
+                auc = float(auroc(ys, np.array(ss, dtype=float)))
+            out["per_subject"][subj] = {"n": len(items), "option_acc": float(1.0 - ys.mean()),
+                                        f"auroc_{args.primary_score}": auc}
+    ood_path = find_one(f"{args.ood_dir}/input_ood_{args.source}{split_tok}_*_{tag}.json")
     if ood_path:
         o = json.load(open(ood_path))
         for code, r in o.get("ood", {}).items():
@@ -104,6 +120,8 @@ def fmt(v, nd=3):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--split", default="val", choices=["val", "test"])
+    p.add_argument("--source", default="medexqa", choices=["medexqa", "medmcqa_gen"],
+                   help="Generation dataset the readouts were run on (filename prefix step1_<source>/input_ood_<source>).")
     p.add_argument("--tags", nargs="+", required=True, help="Run tags in the order the rows should appear.")
     p.add_argument("--label", default="correct_primary",
                    help="Correctness label column (pre-registered: correct_primary = option_correct w/ probe fallback).")
@@ -117,7 +135,8 @@ def main():
 
     arms = [summarize_arm(t, args.split, args) for t in args.tags]
     os.makedirs(args.out_dir, exist_ok=True)
-    name = args.out_name or f"ladder_{args.split}"
+    # MedExQA keeps the historical name ladder_<split>; other sources are prefixed so reports never collide.
+    name = args.out_name or (f"ladder_{args.split}" if args.source == "medexqa" else f"ladder_{args.source}_{args.split}")
     with open(os.path.join(args.out_dir, name + ".json"), "w") as f:
         json.dump({"split": args.split, "label": args.label, "primary_score": args.primary_score, "arms": arms}, f, indent=2)
 
@@ -138,7 +157,7 @@ def main():
             o = a["ood"].get(c, {})
             row.append(f"{fmt(o.get('ilv_last'))}/{fmt(o.get('entropy_last'))}")
         lines.append("| " + " | ".join(row) + " |")
-    md = (f"# Baseline ladder — split={args.split}, label={args.label}, primary score={args.primary_score}\n\n"
+    md = (f"# Baseline ladder — source={args.source}, split={args.split}, label={args.label}, primary score={args.primary_score}\n\n"
           "AUROC = predict WRONG (sign fixed a priori: higher score ⇒ wrong); [lo,hi] = 95% example-level bootstrap CI. "
           "OoD columns = input-level AUROC(OoD=1) for ilv_last / entropy_last.\n\n" + "\n".join(lines) + "\n")
     with open(os.path.join(args.out_dir, name + ".md"), "w") as f:
