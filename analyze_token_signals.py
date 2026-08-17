@@ -78,6 +78,7 @@ from utils import (
 )
 from model import load_peft_model_and_adapter, load_tokenizer
 from evaluate_fcvr import prepare_model_by_arm  # reuse faithful reconstruction (+ baseline arms)
+from uq_stats import auroc as _auroc_fixed_sign, bootstrap_ci, bootstrap_mean_ci
 
 # ---------------------------------------------------------------------------
 # Free-form prose probes (the "does it transfer to generation" test). Chosen to
@@ -557,27 +558,46 @@ def analyze(all_records, per_example_records, spike_pct):
         "frac_positive": float(np.mean([x > 0 for x in per_ex_spearman])) if per_ex_spearman else float("nan"),
     }
 
-    # Permutation null for the headline statistic: shuffle ilv WITHIN each
-    # example, recompute the per-example-mean Spearman, repeat. This replaces
-    # the arbitrary +-0.20 rules of thumb with an empirical reference.
+    # Uncertainty on the headline statistic (per-example mean Spearman):
+    #  (a) example-level bootstrap CI (the example is the sampling unit);
+    #  (b) CIRCULAR-SHIFT null (primary): roll the ILV series by a random offset
+    #      within each example -- keeps its autocorrelation, destroys alignment;
+    #  (c) within-example permutation null (secondary): destroys autocorrelation
+    #      too, so its p-value is anti-conservative for autocorrelated tokens.
+    ci = bootstrap_mean_ci(per_ex_spearman, n_boot=2000, seed=0)
+    corr["per_example_spearman_ilv_entropy"]["ci95"] = [ci["lo"], ci["hi"]]
     rng = np.random.default_rng(0)
-    pairs = [([r["inf_log_var"] for r in recs], [r["entropy"] for r in recs])
+    pairs = [(np.asarray([r["inf_log_var"] for r in recs], float), np.asarray([r["entropy"] for r in recs], float))
              for recs in per_example_records if len(recs) >= 3]
-    null_means = []
-    for _ in range(200):
-        vals = []
-        for ilv_l, ent_l in pairs:
-            vals.append(_spearman(rng.permutation(ilv_l), ent_l)[0])
-        vals = [v for v in vals if not np.isnan(v)]
-        if vals:
-            null_means.append(float(np.mean(vals)))
     obs = corr["per_example_spearman_ilv_entropy"]["mean"]
-    if null_means and not np.isnan(obs):
-        null_arr = np.asarray(null_means)
-        corr["per_example_spearman_ilv_entropy"]["null_mean"] = float(null_arr.mean())
-        corr["per_example_spearman_ilv_entropy"]["null_std"] = float(null_arr.std())
-        corr["per_example_spearman_ilv_entropy"]["perm_p_two_sided"] = float(
-            np.mean(np.abs(null_arr) >= abs(obs)))
+
+    def _null(kind, n_rep=200):
+        means = []
+        for _ in range(n_rep):
+            vals = []
+            for ilv_l, ent_l in pairs:
+                if kind == "shift":
+                    k = int(rng.integers(1, len(ilv_l)))          # non-zero offset
+                    vals.append(_spearman(np.roll(ilv_l, k), ent_l)[0])
+                else:
+                    vals.append(_spearman(rng.permutation(ilv_l), ent_l)[0])
+            vals = [v for v in vals if not np.isnan(v)]
+            if vals:
+                means.append(float(np.mean(vals)))
+        if not means or np.isnan(obs):
+            return None
+        arr = np.asarray(means)
+        return {"null_mean": float(arr.mean()), "null_std": float(arr.std()),
+                "p_two_sided": float(np.mean(np.abs(arr) >= abs(obs))), "n_rep": len(means)}
+    shift_null, perm_null = _null("shift"), _null("perm")
+    if shift_null:
+        corr["per_example_spearman_ilv_entropy"]["circular_shift_null"] = shift_null
+    if perm_null:
+        corr["per_example_spearman_ilv_entropy"]["permutation_null"] = perm_null
+        # legacy keys (secondary)
+        corr["per_example_spearman_ilv_entropy"]["null_mean"] = perm_null["null_mean"]
+        corr["per_example_spearman_ilv_entropy"]["null_std"] = perm_null["null_std"]
+        corr["per_example_spearman_ilv_entropy"]["perm_p_two_sided"] = perm_null["p_two_sided"]
 
     cat_z = {}
     for recs in per_example_records:
@@ -615,10 +635,22 @@ def analyze(all_records, per_example_records, spike_pct):
         ent_spike += list(ent_top); ilv_spike += list(ilv_top); ilv_trough += list(ilv_bot)
         offset += n
     p = spike_pct
+    # per-example Jaccards -> example-level bootstrap CI of the mean
+    per_ex_j_top, per_ex_j_bot = [], []
+    for recs in per_example_records:
+        n = len(recs)
+        if n < 3:
+            continue
+        e = _zscore([r["entropy"] for r in recs]); i = _zscore([r["inf_log_var"] for r in recs])
+        k = max(1, int(round(spike_pct * n)))
+        et = set(np.argsort(e)[-k:]); per_ex_j_top.append(jacc(et, set(np.argsort(i)[-k:])))
+        per_ex_j_bot.append(jacc(et, set(np.argsort(i)[:k])))
     spikes = {
         "spike_pct": spike_pct,
         "jaccard_entropySpike_vs_ilvSpike": jacc(ent_spike, ilv_spike),
         "jaccard_entropySpike_vs_ilvTrough": jacc(ent_spike, ilv_trough),
+        "per_example_jaccard_top_ci95": bootstrap_mean_ci(per_ex_j_top, n_boot=2000, seed=1),
+        "per_example_jaccard_bottom_ci95": bootstrap_mean_ci(per_ex_j_bot, n_boot=2000, seed=2),
         "random_baseline_jaccard": p / (2 - p) if p < 1 else 1.0,
         "note": "If ilvTrough overlap >> ilvSpike overlap, the token-level signal is INVERTED "
                 "(entropy peaks coincide with LOW variance), consistent with the OoD inversion.",
@@ -650,9 +682,16 @@ def verdict(summary):
     lines = []
     lines.append(f"per-example mean Spearman(inf_log_var, entropy) = {r:+.3f}")
     ne = summary["correlation"]["per_example_spearman_ilv_entropy"]
-    if "null_mean" in ne:
-        lines.append(f"  vs within-example permutation null {ne['null_mean']:+.3f} "
-                     f"± {ne['null_std']:.3f}  (two-sided p ≈ {ne['perm_p_two_sided']:.3f})")
+    if "ci95" in ne and not np.isnan(ne["ci95"][0]):
+        lines.append(f"  95% example-level bootstrap CI [{ne['ci95'][0]:+.3f}, {ne['ci95'][1]:+.3f}]  (n={ne['n']})")
+    if "circular_shift_null" in ne:
+        cs = ne["circular_shift_null"]
+        lines.append(f"  vs circular-shift null (autocorrelation kept) {cs['null_mean']:+.3f} ± {cs['null_std']:.3f}  "
+                     f"(two-sided p ≈ {cs['p_two_sided']:.3f})")
+    if "permutation_null" in ne:
+        pn = ne["permutation_null"]
+        lines.append(f"  vs within-example permutation null (secondary) {pn['null_mean']:+.3f} ± {pn['null_std']:.3f}  "
+                     f"(p ≈ {pn['p_two_sided']:.3f})")
     lines.append(f"pooled z-scored Spearman(inf_log_var, entropy)  = {zr:+.3f}")
     ovp = summary.get("online_vs_posthoc")
     if ovp:
@@ -683,10 +722,13 @@ def abstention_analysis(per_example_records, metas, last_k=10):
     Aggregates the per-token Inf-Logit-Var over each generated explanation
     (mean / max / last / mean & max over the last k tokens) and tests whether
     any aggregate predicts that the model answered the underlying question
-    WRONG (letter-probe label). Every ILV aggregate is benchmarked against the
-    signals a decoder gets for free: mean/max predictive entropy and
-    per-token NLL of the generated sequence. AUROC < 0.5 means the INVERTED
-    score is the informative direction (flipped AUROC = 1 - AUROC)."""
+    WRONG. Label here = the SECONDARY letter-probe label (wrong_probe); the
+    pre-registered primary label (option_correct) is added by
+    label_generation_correctness.py and evaluated by abstention_report.py.
+    Every ILV aggregate is benchmarked against the signals a decoder gets for
+    free: mean/max predictive entropy, per-token NLL, generation length, gate
+    entropy. Sign is fixed A PRIORI (higher score => wrong); AUROC < 0.5 is a
+    negative result and is never flipped."""
     rows = []
     for recs, m in zip(per_example_records, metas):
         if not recs or m.get("correct_probe") is None:
@@ -753,25 +795,21 @@ def abstention_analysis(per_example_records, metas, last_k=10):
         "label": "wrong_probe (letter-probe; SECONDARY -- run label_generation_correctness.py for option/NLI labels)",
         "auroc_predict_wrong": {},
         "spearman_vs_expl_f1": {},
-        "note": ("auroc_predict_wrong: score-high should flag WRONG answers; AUROC < 0.5 "
-                 "means the inverted score works (flipped = 1 - AUROC). An ILV aggregate "
-                 "must beat the *_BASELINE rows to add value at decode time. "
-                 "spearman_vs_expl_f1: negative = high score tracks LOW explanation quality."),
+        "note": ("auroc_predict_wrong: higher score => predicted WRONG (sign fixed a priori); "
+                 "AUROC < 0.5 is a NEGATIVE result, never flipped. An ILV aggregate must beat "
+                 "the *_BASELINE rows to add value at decode time. auroc_ci95 = example-level "
+                 "stratified bootstrap. spearman_vs_expl_f1: negative = high score tracks LOW "
+                 "explanation quality."),
+        "auroc_ci95": {},
     }
-    try:
-        from sklearn.metrics import roc_auc_score
-        have_sklearn = True
-    except Exception:
-        have_sklearn = False
     names = sorted({k for r in rows for k in r["scores"]}, key=lambda n: (n.endswith("BASELINE"), n))
     for name in names:
         if any(name not in r["scores"] for r in rows):
             continue  # not available on every row (e.g. online failed for some)
         s = [r["scores"][name] for r in rows]
-        if have_sklearn and len(set(labels)) == 2:
-            result["auroc_predict_wrong"][name] = float(roc_auc_score(labels, s))
-        else:
-            result["auroc_predict_wrong"][name] = float("nan")
+        ci = bootstrap_ci(_auroc_fixed_sign, labels, s, n_boot=1000, seed=0)
+        result["auroc_predict_wrong"][name] = ci["point"]
+        result["auroc_ci95"][name] = [ci["lo"], ci["hi"]]
         result["spearman_vs_expl_f1"][name] = _spearman(s, f1s)[0]
     return result, rows
 
@@ -945,10 +983,12 @@ def main():
         print(f"\nSequence-level abstention readout "
               f"(n={a['n']}, wrong={a['n_wrong']}, letter-probe acc={a['letter_probe_accuracy']:.3f}):")
         for name, auc in a["auroc_predict_wrong"].items():
-            flip = (1.0 - auc) if not np.isnan(auc) else float("nan")
-            print(f"  AUROC(wrong)[{name:26s}] = {auc:.3f}   flipped = {flip:.3f}   "
+            lo, hi = a["auroc_ci95"].get(name, [float("nan"), float("nan")])
+            print(f"  AUROC(wrong)[{name:28s}] = {auc:.3f} [{lo:.2f},{hi:.2f}]   "
                   f"spearman_vs_f1 = {a['spearman_vs_expl_f1'][name]:+.3f}")
-        print("  (ILV aggregates must beat the *_BASELINE rows to matter.)")
+        print("  (sign fixed a priori: higher => wrong; <0.5 is a negative result. ILV must beat *_BASELINE.)")
+        print("  (label = SECONDARY letter probe; run label_generation_correctness.py + abstention_report.py "
+              "for the pre-registered option_correct label and the val->test protocol.)")
     print(f"\nSaved: {base}.json / _pertoken.jsonl / .html / .png"
           + (" / _seqlevel.jsonl" if seq_rows else ""))
 
