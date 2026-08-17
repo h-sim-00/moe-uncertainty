@@ -39,8 +39,9 @@ OOD_DATASETS = {
     "mmlu_law": "far",
 }
 
-# Datasets sharing the medical-exam domain: none of these may serve as an OoD
-# set when the ID anchor (the training dataset) is one of them.
+# Datasets sharing the medical-exam domain. When the ID anchor is one of them,
+# the other is NOT excluded (that was over-aggressive: MedExQA->MedMCQA is the
+# useful NEAR-domain / task-shift set); it is relabelled "near" instead.
 MEDICAL_DATASETS = {"medexqa", "medmcqa_med"}
 
 
@@ -209,11 +210,11 @@ def run_ood_detection(model, tokenizer, args):
 
     results = {}
     for ood_code, shift_type in OOD_DATASETS.items():
-        if ood_code == args.dataset_shortcode or (
-            args.dataset_shortcode in MEDICAL_DATASETS and ood_code in MEDICAL_DATASETS
-        ):
-            print(f"SKIP {ood_code}: same domain as ID anchor '{args.dataset_shortcode}' -- not a valid OoD set")
+        if ood_code == args.dataset_shortcode:
+            print(f"SKIP {ood_code}: identical to the ID anchor")
             continue
+        if args.dataset_shortcode in MEDICAL_DATASETS and ood_code in MEDICAL_DATASETS:
+            shift_type = "near (same medical domain, task shift)"
         print(f"OOD vs {ood_code} ({shift_type})")
         ood_dataset = load_exp_dataset(ood_code, split="test")
         ood_ent, ood_ilv = compute_signals(model, tokenizer, ood_dataset, fcvr_layers, args)

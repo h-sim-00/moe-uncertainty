@@ -99,3 +99,61 @@ def multi_shot_prompt_engineer(
         "answerKey": answer
     }
 
+
+
+# ---------------------------------------------------------------------------
+# Inner-prompt canonicalisation (codex-recom-iter1, supervisor point 5).
+# Every MCQA loader in utils/data.py renders the same inner format
+#   "Question: <q>\nChoices:\nA. ..\nB. ..\n...\nAnswer:"
+# while MedExQA renders
+#   "Question: <q>\nOptions:\nA. ..\n...\n\nExplain the reasoning for the correct answer."
+# An ID-vs-OoD score can therefore separate the two on SURFACE cues (Options vs
+# Choices, the trailing instruction, length). parse_mcqa_question() recovers
+# (question, options) from either, render_inner() re-renders in ONE format.
+# ---------------------------------------------------------------------------
+import re as _re
+
+_INNER_RE = _re.compile(
+    r"^\s*(?:Context:\s*(?P<context>.*?)\n)?Question:\s*(?P<q>.*?)\n(?:Choices|Options):\s*\n(?P<opts>.*?)"
+    r"(?:\n\s*\nExplain the reasoning for the correct answer\.\s*|\nAnswer:\s*)?$",
+    _re.S,
+)
+
+
+def parse_mcqa_question(inner_text):
+    """-> dict(question, options{letter: text}, context) or None if the text is
+    not in a recognised inner format."""
+    m = _INNER_RE.match(inner_text or "")
+    if not m:
+        return None
+    opts = {}
+    for om in _re.finditer(r"(?m)^\s*([A-Z])\.\s*(.*?)\s*$", m.group("opts")):
+        opts[om.group(1)] = om.group(2)
+    if not opts:
+        return None
+    return {"question": m.group("q").strip(), "options": opts, "context": (m.group("context") or "").strip()}
+
+
+def render_inner(parsed, fmt):
+    """Render (question, options) in one canonical inner format.
+    fmt='generation' -> MedExQA training format (Options + explain instruction)
+    fmt='mcqa'       -> Choices + 'Answer:'"""
+    opts = "\n".join(f"{k}. {v}" for k, v in parsed["options"].items())
+    ctx = f"Context: {parsed['context']}\n" if parsed.get("context") else ""
+    if fmt == "generation":
+        return f"{ctx}Question: {parsed['question']}\nOptions:\n{opts}\n\nExplain the reasoning for the correct answer."
+    if fmt == "mcqa":
+        return f"{ctx}Question: {parsed['question']}\nChoices:\n{opts}\nAnswer:"
+    raise ValueError(f"unknown inner format {fmt!r}")
+
+
+def canonicalise_inner(inner_text, fmt):
+    """Re-render an example's inner prompt in `fmt`; fmt='native' returns it
+    unchanged. Raises if the text cannot be parsed (so a silent fall-back can
+    never re-introduce the format confound)."""
+    if fmt == "native":
+        return inner_text
+    parsed = parse_mcqa_question(inner_text)
+    if parsed is None:
+        raise ValueError(f"cannot parse inner prompt for canonicalisation: {inner_text[:120]!r}")
+    return render_inner(parsed, fmt)

@@ -96,6 +96,7 @@ for BETA in "${BETAS[@]}"; do
         --run_suffix "$SUFFIX" \
         --prior_source "$PRIOR_SOURCE" \
         --ood_datasets obqa mmlu_law \
+        --inner_format native \
         --num_examples "$NUM_EXAMPLES" \
         --routing deterministic --num_samples 1 \
         --split test \

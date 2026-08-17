@@ -72,6 +72,9 @@ from .prompt import (
     multi_shot_prompt_engineer,
     multiple_choice_prompt_engineer,
     generation_prompt_engineer,
+    parse_mcqa_question,
+    render_inner,
+    canonicalise_inner,
 )
 
 def get_model_predictions(model, tokenizer, dataset, batch_size=8):
