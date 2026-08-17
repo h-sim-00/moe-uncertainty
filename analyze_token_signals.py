@@ -371,11 +371,14 @@ def collect_medexqa(model, tokenizer, args, fcvr_layers, causal_model, device):
             if device.type == "cuda":
                 torch.cuda.synchronize()
             t0 = time.perf_counter()
-            gen = model.generate(
-                prompt_ids, max_new_tokens=args.max_new_tokens, do_sample=False,
-                num_beams=1, pad_token_id=pad_id, use_cache=True,
-                return_dict_in_generate=True, output_logits=True,
-            )
+            gen_kwargs = dict(max_new_tokens=args.max_new_tokens, do_sample=False, num_beams=1,
+                              pad_token_id=pad_id, use_cache=True, return_dict_in_generate=True)
+            try:
+                gen = model.generate(prompt_ids, output_logits=True, **gen_kwargs)      # raw per-step logits (transformers >= 4.38)
+            except TypeError:
+                if recorder is not None:
+                    recorder.reset()
+                gen = model.generate(prompt_ids, output_scores=True, **gen_kwargs)      # greedy: scores == logits
             if device.type == "cuda":
                 torch.cuda.synchronize()
             timing["gen_seconds"] = time.perf_counter() - t0
