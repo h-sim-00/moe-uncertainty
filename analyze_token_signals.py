@@ -33,13 +33,27 @@ new-exp1 and analyse every position.
 
 Read the printed "VERDICT" block and results/token_analysis/*.json.
 
-Deterministic routing
----------------------
-By default the FCVR routers are put in `deterministic_readout` mode: routing uses
-the posterior mean (no S=35 MC sampling), so entropy/surprisal are reproducible
-and fast, and greedy generation is deterministic. The Cholesky factor (hence
-inf_log_var) is computed deterministically either way, so this does not change
-the signal -- only the routing noise.
+Routing at readout (--routing)
+------------------------------
+Default `stochastic` = the paper's inference: S (=35) samples from the logit
+posterior, softmax-averaged, then Top-K. `deterministic` routes on the posterior
+mean instead. NOTE: deterministic routing is an ABLATION, not a free
+simplification -- expert choices in earlier FCVR layers change the hidden states
+seen by later layers, hence later covariances, entropies and (with --generate) the
+whole generated trajectory. Only the per-layer L given a fixed input is unaffected.
+The MC sampling is in logit space and the experts run once, so S=35 costs ~nothing.
+
+Online vs post-hoc ILV (--generate)
+-----------------------------------
+`ilv_online` is captured DURING generation with forward hooks on the FCVR routers:
+for generated token t it is tr(L L^T) at the position that produced token t, in
+the very forward pass (and, under stochastic routing, the very posterior draw) that
+routed it -- a decoding-time score. `ilv_posthoc` re-reads the finished sequence in
+a second teacher-forced pass (the old readout); under stochastic routing it is a
+different draw and, in general, different hidden states. Both are written; the
+online series is PRIMARY (all `inf_log_var`/`entropy`/`surprisal` per-token fields
+and the `ilv_online_*` sequence aggregates), the post-hoc one is reported as
+`*_posthoc` for comparison.
 """
 
 import argparse
@@ -48,6 +62,7 @@ import json
 import os
 import re
 import string
+import time
 from collections import Counter
 
 import numpy as np
@@ -112,10 +127,11 @@ def parse_args():
                    help="Must match the training run's --run_suffix (FCVR weight dir).")
     p.add_argument("--prior_source", type=str, default="pretrained", choices=["map", "pretrained"],
                    help="Must match the training run.")
-    p.add_argument("--num_samples", type=int, default=1,
-                   help="MC samples if --stochastic_routing; ignored in the default deterministic mode.")
-    p.add_argument("--stochastic_routing", action="store_true",
-                   help="Route via S-sample MC (paper inference). Default: deterministic posterior-mean routing.")
+    p.add_argument("--num_samples", type=int, default=35,
+                   help="MC samples S for stochastic routing (paper: 35). Ignored if --routing deterministic.")
+    p.add_argument("--routing", type=str, default="stochastic", choices=["stochastic", "deterministic"],
+                   help="stochastic = paper inference (S-sample softmax-averaged routing; PRIMARY). "
+                        "deterministic = posterior-mean routing (ABLATION: changes downstream hidden states).")
     # --- what text to analyse ---
     p.add_argument("--split", type=str, default="val", choices=["val", "test"],
                    help="Which MedExQA split to read (source=medexqa). PROTOCOL: 'val' (50 ex) is the "
@@ -241,6 +257,71 @@ def _unigram_f1(pred, ref):
     return 2 * prec * rec / (prec + rec)
 
 
+class OnlineILVRecorder:
+    """Forward hooks on the FCVR routers that capture, at every forward call
+    made by `model.generate`, tr(L L^T) per position (the Inf-Logit-Var) and the
+    entropy of the actual routing distribution (gate entropy). Call 0 processes
+    the whole prompt (N = prompt_len rows), every later call one new token (N=1).
+    `per_generated_token()` aligns these to the generated tokens: token t was
+    produced by the position that predicted it -- the last prompt row for t=0,
+    the single row of call t for t>=1."""
+
+    def __init__(self, causal_model, fcvr_layers):
+        self.layers = list(fcvr_layers)
+        self.calls = {l: [] for l in self.layers}       # layer -> list of np arrays [N]
+        self.gate_ent = {l: [] for l in self.layers}
+        self.handles = []
+        for l in self.layers:
+            router = causal_model.layers[l].block_sparse_moe.router
+            self.handles.append(router.register_forward_hook(self._make_hook(l)))
+
+    def _make_hook(self, l):
+        def hook(module, inputs, output):
+            L = module.last_cholesky_factor.detach().float()            # [N, E, E]
+            self.calls[l].append((L ** 2).sum(dim=(-1, -2)).cpu().numpy())
+            logits = output[-1].detach().float()                         # [N, E] routing logits actually used
+            p = torch.softmax(logits, dim=-1)
+            self.gate_ent[l].append((-(p * torch.log(p.clamp(min=1e-12))).sum(-1)).cpu().numpy())
+        return hook
+
+    def reset(self):
+        for l in self.layers:
+            self.calls[l].clear(); self.gate_ent[l].clear()
+
+    def remove(self):
+        for h in self.handles:
+            h.remove()
+        self.handles = []
+
+    def per_generated_token(self, n_generated):
+        """-> (ilv [G], ilv_per_layer [n_layers, G], gate_entropy [G]) or None if the
+        call pattern does not match (e.g. a cache-less generate that re-runs the
+        full sequence each step)."""
+        ilv_layers, ge_layers = [], []
+        for l in self.layers:
+            calls = self.calls[l]
+            if not calls or len(calls) != n_generated:
+                return None
+            if any(c.shape[0] != 1 for c in calls[1:]):
+                return None
+            ilv_layers.append(np.array([calls[0][-1]] + [c[0] for c in calls[1:]], dtype=float))
+            ge = self.gate_ent[l]
+            ge_layers.append(np.array([ge[0][-1]] + [c[0] for c in ge[1:]], dtype=float))
+        ilv_layers = np.stack(ilv_layers, 0)
+        return ilv_layers.mean(0), ilv_layers, np.stack(ge_layers, 0).mean(0)
+
+
+def _entropy_surprisal_from_scores(scores, gen_ids):
+    """Decoding-time predictive entropy / surprisal of each generated token from
+    the per-step logits returned by generate(output_logits=True)."""
+    ent, sur = [], []
+    for step, tok in zip(scores, gen_ids.tolist()):
+        logp = F.log_softmax(step[0].float(), dim=-1)
+        ent.append(float(-(logp.exp() * logp).sum().item()))
+        sur.append(float(-logp[tok].item()))
+    return ent, sur
+
+
 def collect_medexqa(model, tokenizer, args, fcvr_layers, causal_model, device):
     """MedExQA generation source. Teacher-forced over the gold explanation, or
     (with --generate) over the model's own greedily-generated explanation. Only
@@ -258,28 +339,76 @@ def collect_medexqa(model, tokenizer, args, fcvr_layers, causal_model, device):
     choices = ["A", "B", "C", "D"]
     choice_ids = torch.tensor([tokenizer.convert_tokens_to_ids(c) for c in choices], device=device)
 
+    recorder = OnlineILVRecorder(causal_model, fcvr_layers) if (args.generate and fcvr_layers) else None
+    n_online_ok = 0
+
     per_example, raw_texts, metas = [], [], []
-    for ex in tqdm(ds, desc="generate" if args.generate else "teacher-force"):
+    for ex_i, ex in enumerate(tqdm(ds, desc="generate" if args.generate else "teacher-force")):
         prompt = generation_prompt_engineer(ex, tokenizer=tokenizer)["question"]
         prompt_ids = tokenizer(
             prompt, return_tensors="pt", add_special_tokens=False, truncation=True, max_length=2048
         ).input_ids.to(device)
         answer_start = prompt_ids.shape[1]
+        online = None
+        timing = {}
 
+        # Per-example seed so stochastic routing is reproducible independent of order.
+        torch.manual_seed(args.seed * 100003 + ex_i)
         if args.generate:
+            if recorder is not None:
+                recorder.reset()
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            t0 = time.perf_counter()
             gen = model.generate(
                 prompt_ids, max_new_tokens=args.max_new_tokens, do_sample=False,
-                num_beams=1, pad_token_id=pad_id,
+                num_beams=1, pad_token_id=pad_id, use_cache=True,
+                return_dict_in_generate=True, output_logits=True,
             )
-            full_ids = gen[0]                                  # prompt + generated
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            timing["gen_seconds"] = time.perf_counter() - t0
+            full_ids = gen.sequences[0]                        # prompt + generated
+            gen_ids = full_ids[answer_start:]
+            n_gen = int(gen_ids.shape[0])
+            timing["tokens_per_second"] = n_gen / max(timing["gen_seconds"], 1e-9)
+            step_logits = gen.logits if getattr(gen, "logits", None) is not None else gen.scores
+            ent_on, sur_on = _entropy_surprisal_from_scores(step_logits, gen_ids)
+            if recorder is not None:
+                aligned = recorder.per_generated_token(n_gen)
+                if aligned is not None:
+                    online = {"ilv": aligned[0], "ilv_layers": aligned[1], "gate_ent": aligned[2],
+                              "entropy": ent_on, "surprisal": sur_on}
+                    n_online_ok += 1
+                else:
+                    print(f"  (warning: online ILV alignment failed for example {ex_i}; "
+                          f"calls={[len(recorder.calls[l]) for l in fcvr_layers][:3]}..., n_gen={n_gen})")
+            else:
+                online = {"ilv": None, "ilv_layers": None, "gate_ent": None, "entropy": ent_on, "surprisal": sur_on}
         else:
             gold = str(ex["answer"]) + eos
             ans_ids = tokenizer(gold, add_special_tokens=False).input_ids
             full_ids = torch.cat([prompt_ids[0], torch.tensor(ans_ids, device=device)])
 
+        # Post-hoc pass (second teacher-forced forward over the finished sequence).
+        torch.manual_seed(args.seed * 100003 + ex_i)
         recs = records_from_ids(
             model, tokenizer, full_ids, fcvr_layers, causal_model, device, answer_start=answer_start
         )
+        if args.generate and online is not None and len(recs) == len(online["entropy"]):
+            # PRIMARY per-token fields = decoding-time (online); post-hoc kept as *_posthoc.
+            for k, r in enumerate(recs):
+                r["entropy_posthoc"] = r["entropy"]; r["surprisal_posthoc"] = r["surprisal"]
+                r["inf_log_var_posthoc"] = r["inf_log_var"]
+                r["entropy"] = online["entropy"][k]; r["surprisal"] = online["surprisal"][k]
+                if online["ilv"] is not None:
+                    r["inf_log_var"] = float(online["ilv"][k])
+                    r["inf_log_var_per_layer"] = [float(v) for v in online["ilv_layers"][:, k].tolist()]
+                    r["gate_entropy"] = float(online["gate_ent"][k])
+                r["readout"] = "online"
+        elif args.generate:
+            for r in recs:
+                r["readout"] = "posthoc_only"
 
         meta = {"id": ex.get("id", ""), "gold_letter": ex.get("gold_letter", ""),
                 "prompt_len_tokens": int(answer_start)}
@@ -294,6 +423,8 @@ def collect_medexqa(model, tokenizer, args, fcvr_layers, causal_model, device):
             # Hit the cap without emitting EOS -> the explanation was cut off.
             meta["truncated"] = bool((not ended_with_eos) and gen_ids.shape[0] >= args.max_new_tokens)
             meta["gen_text"] = gen_text  # FULL text (the label script judges it)
+            meta.update(timing)
+            meta["online_ilv_available"] = bool(online is not None and online.get("ilv") is not None)
             refs = [str(ex["answer"]).strip()] + ([str(ex["explanation_2"]).strip()] if ex.get("explanation_2") else [])
             meta["refs"] = refs
             meta["question"] = ex.get("letter_question") or ex["question"]
@@ -316,6 +447,9 @@ def collect_medexqa(model, tokenizer, args, fcvr_layers, causal_model, device):
         per_example.append(recs)
         raw_texts.append(ex["question"][:160])
         metas.append(meta)
+    if recorder is not None:
+        recorder.remove()
+        print(f"Online ILV captured for {n_online_ok}/{len(per_example)} generations.")
     return per_example, raw_texts, metas
 
 
@@ -479,7 +613,24 @@ def analyze(all_records, per_example_records, spike_pct):
         "note": "If ilvTrough overlap >> ilvSpike overlap, the token-level signal is INVERTED "
                 "(entropy peaks coincide with LOW variance), consistent with the OoD inversion.",
     }
-    return {"correlation": corr, "category": category, "spikes": spikes}
+    # Online vs post-hoc ILV agreement (generate mode): per-example Spearman and
+    # mean |diff|. If these are far from 1 / 0, the retrospective readout is NOT a
+    # proxy for the decoding-time score.
+    ovp = []
+    absdiff = []
+    for recs in per_example_records:
+        if len(recs) >= 3 and all("inf_log_var_posthoc" in r for r in recs):
+            a = [r["inf_log_var"] for r in recs]; b = [r["inf_log_var_posthoc"] for r in recs]
+            rho = _spearman(a, b)[0]
+            if not np.isnan(rho):
+                ovp.append(rho)
+            absdiff.append(float(np.mean(np.abs(np.asarray(a) - np.asarray(b)))))
+    online_vs_posthoc = None
+    if ovp:
+        online_vs_posthoc = {"n": len(ovp), "per_example_spearman_mean": float(np.mean(ovp)),
+                             "per_example_spearman_std": float(np.std(ovp)),
+                             "mean_abs_diff": float(np.mean(absdiff))}
+    return {"correlation": corr, "category": category, "spikes": spikes, "online_vs_posthoc": online_vs_posthoc}
 
 
 def verdict(summary):
@@ -493,6 +644,10 @@ def verdict(summary):
         lines.append(f"  vs within-example permutation null {ne['null_mean']:+.3f} "
                      f"± {ne['null_std']:.3f}  (two-sided p ≈ {ne['perm_p_two_sided']:.3f})")
     lines.append(f"pooled z-scored Spearman(inf_log_var, entropy)  = {zr:+.3f}")
+    ovp = summary.get("online_vs_posthoc")
+    if ovp:
+        lines.append(f"online vs post-hoc ILV: per-example Spearman {ovp['per_example_spearman_mean']:+.3f} "
+                     f"± {ovp['per_example_spearman_std']:.3f}, mean|diff| {ovp['mean_abs_diff']:.4f}  (n={ovp['n']})")
     lines.append(f"spike Jaccard  (entropy-top vs ilv-top)   = {sp['jaccard_entropySpike_vs_ilvSpike']:.3f}")
     lines.append(f"spike Jaccard  (entropy-top vs ilv-BOTTOM) = {sp['jaccard_entropySpike_vs_ilvTrough']:.3f}  "
                  f"(random ~ {sp['random_baseline_jaccard']:.3f})")
@@ -526,11 +681,33 @@ def abstention_analysis(per_example_records, metas, last_k=10):
     for recs, m in zip(per_example_records, metas):
         if not recs or m.get("correct_probe") is None:
             continue
+        online = all(r.get("readout") == "online" for r in recs)
         ilv = [r["inf_log_var"] for r in recs]
         ent = [r["entropy"] for r in recs]
         sur = [r["surprisal"] for r in recs]
         k = min(last_k, len(ilv))
+
+        def _aggs(prefix, v):
+            return {f"{prefix}_mean": float(np.mean(v)), f"{prefix}_max": float(np.max(v)),
+                    f"{prefix}_last": float(v[-1]), f"{prefix}_mean_last{last_k}": float(np.mean(v[-k:])),
+                    f"{prefix}_max_last{last_k}": float(np.max(v[-k:]))}
+        scores = {}
+        # PRIMARY: decoding-time ILV (online) when captured; else the post-hoc series only.
+        scores.update(_aggs("ilv_online" if online else "ilv_posthoc", ilv))
+        if online and all("inf_log_var_posthoc" in r for r in recs):
+            scores.update(_aggs("ilv_posthoc", [r["inf_log_var_posthoc"] for r in recs]))
+        scores.update({
+            "entropy_mean_BASELINE": float(np.mean(ent)),
+            "entropy_max_BASELINE": float(np.max(ent)),
+            "nll_per_token_BASELINE": float(np.mean(sur)),
+            "gen_len_BASELINE": float(len(recs)),
+        })
+        if all("gate_entropy" in r for r in recs):
+            ge = [r["gate_entropy"] for r in recs]
+            scores["gate_entropy_mean_BASELINE"] = float(np.mean(ge))
+            scores["gate_entropy_max_BASELINE"] = float(np.max(ge))
         rows.append({
+            "readout": "online" if online else "posthoc_only",
             "id": m.get("id", ""),
             # Probe-derived label (secondary). label_generation_correctness.py adds
             # option_correct / NLI / unjudgeable fields to this row.
@@ -547,16 +724,9 @@ def abstention_analysis(per_example_records, metas, last_k=10):
             "gen_text": m.get("gen_text"),
             "refs": m.get("refs"),
             "question": m.get("question"),
-            "scores": {
-                "ilv_mean": float(np.mean(ilv)),
-                "ilv_max": float(np.max(ilv)),
-                "ilv_last": float(ilv[-1]),
-                f"ilv_mean_last{last_k}": float(np.mean(ilv[-k:])),
-                f"ilv_max_last{last_k}": float(np.max(ilv[-k:])),
-                "entropy_mean_BASELINE": float(np.mean(ent)),
-                "entropy_max_BASELINE": float(np.max(ent)),
-                "nll_per_token_BASELINE": float(np.mean(sur)),
-            },
+            "gen_seconds": m.get("gen_seconds"),
+            "tokens_per_second": m.get("tokens_per_second"),
+            "scores": scores,
         })
     if not rows:
         return None, []
@@ -581,7 +751,10 @@ def abstention_analysis(per_example_records, metas, last_k=10):
         have_sklearn = True
     except Exception:
         have_sklearn = False
-    for name in rows[0]["scores"]:
+    names = sorted({k for r in rows for k in r["scores"]}, key=lambda n: (n.endswith("BASELINE"), n))
+    for name in names:
+        if any(name not in r["scores"] for r in rows):
+            continue  # not available on every row (e.g. online failed for some)
         s = [r["scores"][name] for r in rows]
         if have_sklearn and len(set(labels)) == 2:
             result["auroc_predict_wrong"][name] = float(roc_auc_score(labels, s))
@@ -669,10 +842,10 @@ def main():
 
     fcvr_layers = sorted(args.swap_layers)
     causal_model = model.base_model.model.model
-    det = not args.stochastic_routing
+    det = args.routing == "deterministic"
     for l in fcvr_layers:
         causal_model.layers[l].block_sparse_moe.router.deterministic_readout = det
-    print(f"Routing mode: {'DETERMINISTIC posterior-mean' if det else f'STOCHASTIC (S={args.num_samples})'}")
+    print(f"Routing mode: {'DETERMINISTIC posterior-mean (ABLATION)' if det else f'STOCHASTIC S={args.num_samples} (paper inference; PRIMARY)'}")
 
     if args.source == "medexqa":
         mode = "generate" if args.generate else "teacher_forced"
@@ -701,6 +874,8 @@ def main():
         "n_tokens": len(all_records), "fcvr_layers": fcvr_layers,
         "prior_source": args.prior_source, "run_suffix": args.run_suffix,
         "routing": "deterministic" if det else f"stochastic_S{args.num_samples}",
+        "num_samples": None if det else args.num_samples, "seed": args.seed,
+        "primary_readout": "online" if (args.source == "medexqa" and args.generate) else "teacher_forced",
         "max_new_tokens": args.max_new_tokens if (args.source == "medexqa" and args.generate) else None,
     }
     v = verdict(summary)
@@ -713,6 +888,15 @@ def main():
         abst, seq_rows = abstention_analysis(per_example, metas, last_k=args.seq_last_k)
         if abst is not None:
             summary["abstention"] = abst
+        secs = [m["gen_seconds"] for m in metas if m.get("gen_seconds") is not None]
+        tps = [m["tokens_per_second"] for m in metas if m.get("tokens_per_second") is not None]
+        summary["runtime"] = {
+            "n": len(secs), "gen_seconds_mean": float(np.mean(secs)) if secs else None,
+            "gen_seconds_total": float(np.sum(secs)) if secs else None,
+            "tokens_per_second_mean": float(np.mean(tps)) if tps else None,
+            "online_ilv_available_frac": float(np.mean([bool(m.get("online_ilv_available")) for m in metas])),
+            "n_truncated": int(sum(1 for m in metas if m.get("truncated"))),
+        }
 
     os.makedirs(args.output_dir, exist_ok=True)
     tag = f"_{args.tag}" if args.tag else ""

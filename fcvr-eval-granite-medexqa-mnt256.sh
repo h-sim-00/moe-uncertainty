@@ -56,6 +56,7 @@ for BETA in "${BETAS[@]}"; do
         --generate \
         --max_new_tokens "$MAX_NEW_TOKENS" \
         --num_examples "$NUM_EXAMPLES" \
+        --routing deterministic --num_samples 1 \
         --split test \
         --tag "beta${BETA}-mnt256"
 done

@@ -28,8 +28,10 @@ and the "last token" is genuinely the last token):
 
 Reports AUROC/AUPRC (OoD = 1) per signal per OoD set, plus the ID/OoD means
 with an OoD>ID / INVERTED direction note, mirroring evaluate_fcvr.py. FCVR
-routers run in deterministic posterior-mean mode (the Cholesky factor, hence
-the signal, is computed identically either way).
+routers run, by default, in the paper's stochastic S=35 mode. --routing deterministic
+is an ABLATION: routing on the posterior mean in earlier layers changes the hidden
+states seen by later layers, hence their covariances -- the multi-layer signal is
+NOT unaffected.
 
 Prereq: trained FCVR weights (fcvr-tuning-granite-medexqa.sh) + the Stage-1
 adapter. Run on quail-1 (moe_env); fcvr-eval-granite-medexqa.sh calls this
@@ -61,8 +63,11 @@ def parse_args():
                    help="Must match the training run's --run_suffix.")
     p.add_argument("--prior_source", type=str, default="pretrained", choices=["map", "pretrained"],
                    help="Must match the training run.")
-    p.add_argument("--num_samples", type=int, default=1,
-                   help="Unused (deterministic readout); kept for prepare_model_fcvr compatibility.")
+    p.add_argument("--num_samples", type=int, default=35,
+                   help="MC samples S for stochastic routing (paper: 35). Ignored if --routing deterministic.")
+    p.add_argument("--routing", type=str, default="stochastic", choices=["stochastic", "deterministic"],
+                   help="stochastic = paper inference (PRIMARY); deterministic = posterior-mean routing "
+                        "(ABLATION: changes downstream hidden states, hence later-layer covariances).")
     p.add_argument("--ood_datasets", type=str, nargs="+", default=["obqa", "mmlu_law"],
                    help="OoD test sets (load_exp_dataset shortcodes).")
     p.add_argument("--split", type=str, default="val", choices=["val", "test"],
@@ -138,8 +143,8 @@ def main():
     fcvr_layers = sorted(args.swap_layers)
     causal_model = model.base_model.model.model
     for l in fcvr_layers:
-        causal_model.layers[l].block_sparse_moe.router.deterministic_readout = True
-    print("Routing mode: DETERMINISTIC posterior-mean (signal unaffected)")
+        causal_model.layers[l].block_sparse_moe.router.deterministic_readout = (args.routing == "deterministic")
+    print(f"Routing mode: {'DETERMINISTIC posterior-mean (ABLATION)' if args.routing == 'deterministic' else f'STOCHASTIC S={args.num_samples} (paper inference; PRIMARY)'}")
 
     if args.split == "test":
         print("#" * 72 + "\n# TEST SPLIT: evaluate ONCE per frozen configuration (selection happens on val).\n" + "#" * 72)
@@ -152,6 +157,8 @@ def main():
             "id_dataset": args.dataset_shortcode, "ood_datasets": args.ood_datasets,
             "num_examples": args.num_examples, "split": args.split, "fcvr_layers": fcvr_layers,
             "run_suffix": args.run_suffix, "prior_source": args.prior_source,
+            "routing": args.routing, "num_samples": None if args.routing == "deterministic" else args.num_samples,
+            "seed": args.seed,
             "template": "generation_prompt_engineer (uniform across ID and OoD)",
         },
         "id_means": {k: float(v.mean()) for k, v in id_sig.items()},
