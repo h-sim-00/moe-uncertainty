@@ -9,7 +9,7 @@ from model.adapters import granite_adapter, qwen_adapter, deepseek_adapter
 
 from utils import setup_environment
 from model import load_peft_model_and_adapter, load_tokenizer
-from utils import load_and_prepare_train_and_val_data
+from utils import load_and_prepare_train_and_val_data, is_generation_dataset
 
 ADAPTER_MAP = {
     "granite": {
@@ -202,12 +202,17 @@ def main():
     )
     tokenizer = load_tokenizer(args.model_shortcode)
 
-    # Answer-only loss: labels mask the prompt (-100), so the collator must
-    # preserve them instead of rebuilding labels from input_ids. Right padding
-    # keeps real-token positions correct during training (eval keeps left).
+    # Answer-only loss for MCQA (`answer_only=True`) / explanation-only loss for
+    # generation datasets (prompt-masked labels + EOS, see utils/data.py): labels
+    # mask the prompt (-100), so the collator must preserve them instead of
+    # rebuilding labels from input_ids (DataCollatorForLanguageModeling would train
+    # on the prompt too). Seq2Seq pads input_ids with pad_token and labels with
+    # -100 dynamically per batch; right padding keeps real-token positions correct
+    # during training (eval keeps left).
     train_dataset, val_dataset = load_and_prepare_train_and_val_data(tokenizer, [args.dataset_shortcode], answer_only=True)
     tokenizer.padding_side = "right"
     data_collator = DataCollatorForSeq2Seq(tokenizer=tokenizer, padding=True, label_pad_token_id=-100)
+    print(f"--- Loss mode: {'explanation-only (generation)' if is_generation_dataset([args.dataset_shortcode]) else 'answer-only (MCQA)'} ---")
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, collate_fn=data_collator, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, collate_fn=data_collator)
     

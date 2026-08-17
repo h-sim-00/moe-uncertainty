@@ -39,6 +39,10 @@ OOD_DATASETS = {
     "mmlu_law": "far",
 }
 
+# Datasets sharing the medical-exam domain: none of these may serve as an OoD
+# set when the ID anchor (the training dataset) is one of them.
+MEDICAL_DATASETS = {"medexqa", "medmcqa_med"}
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Faithful FCVR evaluation (answer_entropy + inf_log_var).")
@@ -165,6 +169,11 @@ def run_ood_detection(model, tokenizer, args):
 
     results = {}
     for ood_code, shift_type in OOD_DATASETS.items():
+        if ood_code == args.dataset_shortcode or (
+            args.dataset_shortcode in MEDICAL_DATASETS and ood_code in MEDICAL_DATASETS
+        ):
+            print(f"SKIP {ood_code}: same domain as ID anchor '{args.dataset_shortcode}' -- not a valid OoD set")
+            continue
         print(f"OOD vs {ood_code} ({shift_type})")
         ood_dataset = load_exp_dataset(ood_code, split="test")
         ood_ent, ood_ilv = compute_signals(model, tokenizer, ood_dataset, fcvr_layers, args)

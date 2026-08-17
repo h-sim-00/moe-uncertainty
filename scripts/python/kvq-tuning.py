@@ -18,7 +18,7 @@ from transformers import DataCollatorForSeq2Seq, get_cosine_schedule_with_warmup
 from utils import setup_environment
 from model import load_peft_model, load_tokenizer
 from model.expert_lora import save_expert_lora, expert_lora_path
-from utils import load_and_prepare_train_and_val_data
+from utils import load_and_prepare_train_and_val_data, is_generation_dataset
 
 def train(model, tokenizer, train_loader, val_loader, args):
     """
@@ -54,7 +54,10 @@ def train(model, tokenizer, train_loader, val_loader, args):
         if args.finetune_mode == "qkv_experts":
             save_expert_lora(model, expert_lora_path(final_save_path))
 
+    # Best-val checkpointing + early stopping on val loss (mirrors fcvr-tuning.py):
+    # the adapter on disk is always the best epoch, never the (overfit) last one.
     best_val_loss = float("inf")
+    epochs_no_improve = 0
 
     print("--- Starting MAP Fine-tuning (Custom Loop) ---")
     for epoch in range(args.epochs):
@@ -73,7 +76,7 @@ def train(model, tokenizer, train_loader, val_loader, args):
                 "train_loss": loss.item(),
                 "lr": scheduler.get_last_lr()[0],
             })
-            
+
         print(f"Epoch {epoch+1} average training loss: {total_epoch_loss / num_training_batches:.4f}")
 
         # Validation Loop
@@ -89,21 +92,29 @@ def train(model, tokenizer, train_loader, val_loader, args):
         wandb.log({"val_loss": avg_val_loss, "epoch": epoch})
 
         # Best-val checkpointing: only persist the adapter when validation
-        # improves, so the saved weights are the best epoch, not the last one.
+        # improves (re-save overwrites the previous best, so final_save_path is
+        # always the best epoch); early-stop after `early_stop_patience` epochs
+        # without improvement.
         if avg_val_loss < best_val_loss - 1e-4:
             best_val_loss = avg_val_loss
+            epochs_no_improve = 0
             print(f"  New best val loss {best_val_loss:.4f} -> saving adapter to {final_save_path}")
             save_adapter()
         else:
-            print(f"  No val-loss improvement; keeping best checkpoint (val {best_val_loss:.4f}).")
+            epochs_no_improve += 1
+            print(f"  No val-loss improvement ({epochs_no_improve}/{args.early_stop_patience}); "
+                  f"keeping best checkpoint (val {best_val_loss:.4f}).")
+            if epochs_no_improve >= args.early_stop_patience:
+                print(f"--- Early stopping at epoch {epoch+1} (best val loss {best_val_loss:.4f}) ---")
+                break
 
     # Safety net: if val loss never improved (best checkpoint never written),
     # persist the final state so the adapter dir is not empty.
     if best_val_loss == float("inf"):
-        print("--- Val loss never improved; saving final state as a fallback ---")
+        print(f"--- Val loss never improved; saving final state to {final_save_path} as a fallback ---")
         save_adapter()
 
-    print(f"--- MAP Fine-tuning complete (best val loss {best_val_loss:.4f}) ---")
+    print(f"--- MAP Fine-tuning complete (best val loss {best_val_loss:.4f}); best adapter at {final_save_path} ---")
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Fine-tune a model with LoRA on a specific MMLU subject.")
@@ -121,6 +132,7 @@ def parse_args():
     parser.add_argument("--warmup_ratio", type=float, default=0.05,
                         help="Fraction of total optimizer steps used for LR warmup (paper D.2: 0.05).")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility.")
+    parser.add_argument("--early_stop_patience", type=int, default=2, help="Epochs of no val-loss improvement before early stopping (best checkpoint kept).")
     return parser.parse_args()
 
 
@@ -143,13 +155,15 @@ def main():
     )
     tokenizer = load_tokenizer(args.model_shortcode)
 
-    # Use the new argument to load a single dataset
-    # Answer-only loss: labels mask the prompt (-100), so the collator must
-    # preserve them instead of rebuilding labels from input_ids. Right padding
-    # keeps real-token positions correct during training (eval keeps left).
+    # Answer-only loss for MCQA (`answer_only=True`) and explanation-only loss for
+    # generation datasets (prompt-masked labels + EOS, see utils/data.py): in both
+    # cases labels mask the prompt (-100), so the collator must preserve them
+    # instead of rebuilding labels from input_ids. Right padding keeps real-token
+    # positions correct during training (eval keeps left).
     train_dataset, val_dataset = load_and_prepare_train_and_val_data(tokenizer, [args.dataset_shortcode], answer_only=True)
     tokenizer.padding_side = "right"
     data_collator = DataCollatorForSeq2Seq(tokenizer=tokenizer, padding=True, label_pad_token_id=-100)
+    print(f"--- Loss mode: {'explanation-only (generation)' if is_generation_dataset([args.dataset_shortcode]) else 'answer-only (MCQA)'} ---")
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, collate_fn=data_collator, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, collate_fn=data_collator)
 
