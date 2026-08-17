@@ -63,6 +63,7 @@ for BETA in "${BETAS[@]}"; do
         --prior_source "$PRIOR_SOURCE" \
         --source medexqa \
         --num_examples "$NUM_EXAMPLES" \
+        --split test \
         --tag "beta${BETA}"
 
     # (2) Autoregressive: read the signal over the model's own generated tokens
@@ -79,6 +80,7 @@ for BETA in "${BETAS[@]}"; do
         --generate \
         --max_new_tokens "$MAX_NEW_TOKENS" \
         --num_examples "$NUM_EXAMPLES" \
+        --split test \
         --tag "beta${BETA}"
 
     # (3) Bridge test: input-level ID-vs-OoD separation (paper Table 8 claim)
@@ -93,6 +95,7 @@ for BETA in "${BETAS[@]}"; do
         --prior_source "$PRIOR_SOURCE" \
         --ood_datasets obqa mmlu_law \
         --num_examples "$NUM_EXAMPLES" \
+        --split test \
         --tag "beta${BETA}"
 done
 

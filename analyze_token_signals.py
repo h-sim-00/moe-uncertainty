@@ -117,6 +117,10 @@ def parse_args():
     p.add_argument("--stochastic_routing", action="store_true",
                    help="Route via S-sample MC (paper inference). Default: deterministic posterior-mean routing.")
     # --- what text to analyse ---
+    p.add_argument("--split", type=str, default="val", choices=["val", "test"],
+                   help="Which MedExQA split to read (source=medexqa). PROTOCOL: 'val' (50 ex) is the "
+                        "selection set (sign/threshold/calibrator/NLI audit); 'test' (175 ex) is evaluated "
+                        "ONCE per frozen configuration -- pass --split test explicitly and only then.")
     p.add_argument("--source", type=str, default="medexqa",
                    choices=["medexqa", "builtin", "obqa", "textfile"],
                    help="medexqa=generation test set (answer region); builtin=free prose; "
@@ -248,7 +252,7 @@ def collect_medexqa(model, tokenizer, args, fcvr_layers, causal_model, device):
     is asked the same question in MCQA form and its argmax choice over
     {A,B,C,D} is compared with the dataset's gold answer letter. These labels
     feed the abstention readout (see abstention_analysis)."""
-    ds = load_exp_dataset("medexqa", split="test")[: args.num_examples]
+    ds = load_exp_dataset("medexqa", split=args.split)[: args.num_examples]
     pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
     eos = tokenizer.eos_token or ""
     choices = ["A", "B", "C", "D"]
@@ -649,7 +653,10 @@ def main():
 
     if args.source == "medexqa":
         mode = "generate" if args.generate else "teacher_forced"
-        print(f"MedExQA source | mode={mode} | answer-region only | {args.num_examples} examples")
+        if args.split == "test":
+            print("#" * 72 + "\n# TEST SPLIT (175 ex): evaluate ONCE per frozen configuration. Selection\n"
+                  "# (sign / thresholds / calibration / label audit) must already be frozen on val.\n" + "#" * 72)
+        print(f"MedExQA source | split={args.split} | mode={mode} | answer-region only | {args.num_examples} examples")
         per_example, raw_texts, metas = collect_medexqa(model, tokenizer, args, fcvr_layers, causal_model, model.device)
     else:
         mode = args.source
@@ -666,7 +673,8 @@ def main():
 
     summary = analyze(all_records, per_example, args.spike_pct)
     summary["config"] = {
-        "source": args.source, "mode": mode, "num_examples": len(per_example),
+        "source": args.source, "split": args.split if args.source == "medexqa" else None,
+        "mode": mode, "num_examples": len(per_example),
         "n_tokens": len(all_records), "fcvr_layers": fcvr_layers,
         "prior_source": args.prior_source, "run_suffix": args.run_suffix,
         "routing": "deterministic" if det else f"stochastic_S{args.num_samples}",
@@ -685,7 +693,10 @@ def main():
 
     os.makedirs(args.output_dir, exist_ok=True)
     tag = f"_{args.tag}" if args.tag else ""
-    base = os.path.join(args.output_dir, f"step1_{args.source}_{mode}{tag}")
+    # Historical test-split files carry no split token; val-split outputs are
+    # marked so the two can never be confused or overwrite each other.
+    split_tag = f"_{args.split}" if (args.source == "medexqa" and args.split != "test") else ""
+    base = os.path.join(args.output_dir, f"step1_{args.source}{split_tag}_{mode}{tag}")
     with open(base + ".json", "w") as f:
         json.dump(summary, f, indent=2)
     with open(base + "_pertoken.jsonl", "w") as f:

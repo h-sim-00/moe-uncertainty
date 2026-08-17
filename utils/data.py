@@ -432,6 +432,73 @@ def load_and_prepare_train_and_val_data(tokenizer: AutoTokenizer, train_dataset_
 
     return train_dataset, val_dataset
 
+def medexqa_split_manifest_path(seed=42):
+    """Repo-relative path of the frozen MedExQA derived-split manifest."""
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(repo_root, "splits", f"medexqa-derived-seed{seed}.csv")
+
+
+def medexqa_example_hash(example):
+    """Content hash identifying a MedExQA example independently of the random id."""
+    return hashlib.sha1(example["question"].encode("utf-8")).hexdigest()[:16]
+
+
+def write_medexqa_split_manifest(train, val, test, path):
+    """Freeze the derived split: one row per example (qhash, split, id, question_prefix)."""
+    import csv as _csv
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = _csv.writer(f)
+        w.writerow(["qhash", "split", "id", "question_prefix"])
+        for split_name, rows in (("train", train), ("val", val), ("test", test)):
+            for ex in rows:
+                prefix = " ".join(ex["question"].split())[:80]
+                w.writerow([medexqa_example_hash(ex), split_name, ex["id"], prefix])
+    print(f"  MedExQA: wrote split manifest -> {path} "
+          f"(train={len(train)}, val={len(val)}, test={len(test)})")
+
+
+def verify_medexqa_split_manifest(train, val, test, seed=42, path=None):
+    """Check the in-memory derived split against the frozen manifest.
+
+    * manifest present  -> every example must be in the recorded split, and the
+      per-split counts must match; otherwise raise (the split moved: RNG order,
+      dedup, or upstream TSVs changed). Set MEDEXQA_SKIP_MANIFEST=1 to bypass.
+    * manifest absent   -> print how to create it (write-medexqa-split-manifest.py).
+    """
+    import csv as _csv
+    path = path or medexqa_split_manifest_path(seed)
+    if os.environ.get("MEDEXQA_SKIP_MANIFEST") == "1":
+        print("  MedExQA: split-manifest check SKIPPED (MEDEXQA_SKIP_MANIFEST=1)")
+        return
+    if not os.path.exists(path):
+        print(f"  MedExQA: no split manifest at {path}; run "
+              f"`python write-medexqa-split-manifest.py` once and commit it to freeze the split.")
+        return
+    recorded = {}
+    with open(path, newline="", encoding="utf-8") as f:
+        for row in _csv.DictReader(f):
+            recorded[row["qhash"]] = row["split"]
+    mismatches, counts = [], {"train": 0, "val": 0, "test": 0}
+    for split_name, rows in (("train", train), ("val", val), ("test", test)):
+        for ex in rows:
+            counts[split_name] += 1
+            got = recorded.get(medexqa_example_hash(ex))
+            if got != split_name:
+                mismatches.append((split_name, got, ex["question"][:60]))
+    rec_counts = {s: sum(1 for v in recorded.values() if v == s) for s in counts}
+    if mismatches or rec_counts != counts:
+        head = "\n".join(f"    in-memory={a} manifest={b}: {q!r}" for a, b, q in mismatches[:5])
+        raise RuntimeError(
+            f"MedExQA derived split does not match the frozen manifest {path}: "
+            f"{len(mismatches)} misassigned example(s); counts in-memory={counts} manifest={rec_counts}.\n"
+            f"{head}\nThe split moved (RNG order / dedup / upstream TSV change). Do NOT proceed with "
+            f"val/test-dependent runs; investigate, or set MEDEXQA_SKIP_MANIFEST=1 to bypass knowingly."
+        )
+    print(f"  MedExQA: split matches frozen manifest ({path}); "
+          f"train={counts['train']} val={counts['val']} test={counts['test']}")
+
+
 def load_exp_dataset(dataset_shortcode, seed=42, split=None):
     """
     Loads and processes one of the six specified experimental datasets with
@@ -669,6 +736,11 @@ def load_exp_dataset(dataset_shortcode, seed=42, split=None):
             )
         print(f"  MedExQA: resolved {len(pool)} rows from {len(rel_paths)} TSVs.")
 
+        # DERIVED SPLIT (not the official MedExQA benchmark split): the official
+        # release has 25 dev + 940 test examples; we pool both (965), seed-shuffle
+        # (seed above), and carve 175 test / 50 val / ~740 train. The assignment is
+        # frozen in splits/medexqa-derived-seed<seed>.csv (see
+        # verify_medexqa_split_manifest below) so it can be cited and checked.
         test_dataset = pool[:175]
         train_dataset = pool[175:]   # generic tail carves 50 val from this -> ~740 train
 
@@ -677,6 +749,9 @@ def load_exp_dataset(dataset_shortcode, seed=42, split=None):
 
     validation_dataset = train_dataset[-50:]
     train_dataset = train_dataset[:-50]
+
+    if dataset_shortcode == "medexqa":
+        verify_medexqa_split_manifest(train_dataset, validation_dataset, test_dataset, seed=seed)
 
     print(f"Dataset '{dataset_shortcode}' processed: Train={len(train_dataset)}, Val={len(validation_dataset)}, Test={len(test_dataset)}")
     

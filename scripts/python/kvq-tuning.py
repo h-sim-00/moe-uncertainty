@@ -15,7 +15,7 @@ import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers import DataCollatorForSeq2Seq, get_cosine_schedule_with_warmup
-from utils import setup_environment
+from utils import setup_environment, seed_everything
 from model import load_peft_model, load_tokenizer
 from model.expert_lora import save_expert_lora, expert_lora_path
 from utils import load_and_prepare_train_and_val_data, is_generation_dataset
@@ -141,9 +141,7 @@ def main():
     setup_environment()
     args = parse_args()
 
-    torch.manual_seed(args.seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(args.seed)
+    seed_everything(args.seed)  # random (dataset shuffles/splits) + numpy + torch
 
     device = "cuda:0"
 
@@ -160,7 +158,7 @@ def main():
     # cases labels mask the prompt (-100), so the collator must preserve them
     # instead of rebuilding labels from input_ids. Right padding keeps real-token
     # positions correct during training (eval keeps left).
-    train_dataset, val_dataset = load_and_prepare_train_and_val_data(tokenizer, [args.dataset_shortcode], answer_only=True)
+    train_dataset, val_dataset = load_and_prepare_train_and_val_data(tokenizer, [args.dataset_shortcode], seed=args.seed, answer_only=True)
     tokenizer.padding_side = "right"
     data_collator = DataCollatorForSeq2Seq(tokenizer=tokenizer, padding=True, label_pad_token_id=-100)
     print(f"--- Loss mode: {'explanation-only (generation)' if is_generation_dataset([args.dataset_shortcode]) else 'answer-only (MCQA)'} ---")

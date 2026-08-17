@@ -37,6 +37,26 @@ def setup_environment():
     else:
         print("WANDB_API_KEY not set in environment; skipping explicit W&B login.")
 
+
+def seed_everything(seed: int):
+    """Seed python `random`, numpy and torch (CPU + all CUDA devices).
+
+    utils/data.py shuffles/splits with the global `random` module, so a run is
+    only reproducible if `random` is seeded too (torch alone is not enough).
+    """
+    import random
+    random.seed(seed)
+    try:
+        import numpy as np
+        np.random.seed(seed)
+    except ImportError:
+        pass
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    print(f"Seeded random/numpy/torch with seed={seed}")
+
+
 from .data import (
     load_generation_dataset,
     load_classification_dataset,

@@ -65,6 +65,9 @@ def parse_args():
                    help="Unused (deterministic readout); kept for prepare_model_fcvr compatibility.")
     p.add_argument("--ood_datasets", type=str, nargs="+", default=["obqa", "mmlu_law"],
                    help="OoD test sets (load_exp_dataset shortcodes).")
+    p.add_argument("--split", type=str, default="val", choices=["val", "test"],
+                   help="Split used for the ID anchor AND every OoD set. PROTOCOL: 'val' = selection; "
+                        "'test' = evaluated once per frozen configuration (pass explicitly).")
     p.add_argument("--num_examples", type=int, default=175, help="Examples per dataset.")
     p.add_argument("--output_dir", type=str, default="results/input_level_ood")
     p.add_argument("--tag", type=str, default=None, help="Extra tag appended to the output filename.")
@@ -73,9 +76,9 @@ def parse_args():
 
 
 @torch.no_grad()
-def collect_signals(model, tokenizer, dataset_code, num_examples, fcvr_layers, causal_model, device):
+def collect_signals(model, tokenizer, dataset_code, num_examples, fcvr_layers, causal_model, device, split="val"):
     """One prompt-only forward per example (batch 1) -> dict of np arrays."""
-    ds = load_exp_dataset(dataset_code, split="test")[:num_examples]
+    ds = load_exp_dataset(dataset_code, split=split)[:num_examples]
     out = {"ilv_last": [], "ilv_mean": [], "entropy_last": []}
     for ex in tqdm(ds, desc=dataset_code):
         prompt = generation_prompt_engineer(ex, tokenizer=tokenizer)["question"]
@@ -138,14 +141,16 @@ def main():
         causal_model.layers[l].block_sparse_moe.router.deterministic_readout = True
     print("Routing mode: DETERMINISTIC posterior-mean (signal unaffected)")
 
-    print(f"\nID anchor: {args.dataset_shortcode} ({args.num_examples} test prompts)")
+    if args.split == "test":
+        print("#" * 72 + "\n# TEST SPLIT: evaluate ONCE per frozen configuration (selection happens on val).\n" + "#" * 72)
+    print(f"\nID anchor: {args.dataset_shortcode} ({args.num_examples} {args.split} prompts)")
     id_sig = collect_signals(model, tokenizer, args.dataset_shortcode, args.num_examples,
-                             fcvr_layers, causal_model, model.device)
+                             fcvr_layers, causal_model, model.device, split=args.split)
 
     results = {
         "config": {
             "id_dataset": args.dataset_shortcode, "ood_datasets": args.ood_datasets,
-            "num_examples": args.num_examples, "fcvr_layers": fcvr_layers,
+            "num_examples": args.num_examples, "split": args.split, "fcvr_layers": fcvr_layers,
             "run_suffix": args.run_suffix, "prior_source": args.prior_source,
             "template": "generation_prompt_engineer (uniform across ID and OoD)",
         },
@@ -156,7 +161,7 @@ def main():
     for code in args.ood_datasets:
         print(f"\nOoD set: {code}")
         ood_sig = collect_signals(model, tokenizer, code, args.num_examples,
-                                  fcvr_layers, causal_model, model.device)
+                                  fcvr_layers, causal_model, model.device, split=args.split)
         results["ood"][code] = {}
         for sig in ("ilv_last", "ilv_mean", "entropy_last"):
             auroc, auprc = _auc(id_sig[sig], ood_sig[sig])
@@ -193,7 +198,9 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
     suffix = args.run_suffix or "nosuffix"
     tag_str = f"_{args.tag}" if args.tag else ""
-    out_path = os.path.join(args.output_dir, f"input_ood_{args.dataset_shortcode}_{suffix}{tag_str}.json")
+    # Historical (test-split) files carry no split token; val outputs are marked.
+    split_str = f"_{args.split}" if args.split != "test" else ""
+    out_path = os.path.join(args.output_dir, f"input_ood_{args.dataset_shortcode}{split_str}_{suffix}{tag_str}.json")
     with open(out_path, "w") as f:
         json.dump(results, f, indent=2)
     print(f"\nSaved: {out_path}")

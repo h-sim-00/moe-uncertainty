@@ -7,7 +7,7 @@ from transformers import DataCollatorForSeq2Seq, get_cosine_schedule_with_warmup
 
 from model.adapters import granite_adapter, qwen_adapter, deepseek_adapter
 
-from utils import setup_environment
+from utils import setup_environment, seed_everything
 from model import load_peft_model_and_adapter, load_tokenizer
 from utils import load_and_prepare_train_and_val_data, is_generation_dataset
 
@@ -191,9 +191,7 @@ def main():
     setup_environment()
     args = parse_args()
 
-    torch.manual_seed(args.seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(args.seed)
+    seed_everything(args.seed)  # random (dataset shuffles/splits) + numpy + torch
 
     model = load_peft_model_and_adapter(
         args.model_shortcode,
@@ -209,7 +207,7 @@ def main():
     # on the prompt too). Seq2Seq pads input_ids with pad_token and labels with
     # -100 dynamically per batch; right padding keeps real-token positions correct
     # during training (eval keeps left).
-    train_dataset, val_dataset = load_and_prepare_train_and_val_data(tokenizer, [args.dataset_shortcode], answer_only=True)
+    train_dataset, val_dataset = load_and_prepare_train_and_val_data(tokenizer, [args.dataset_shortcode], seed=args.seed, answer_only=True)
     tokenizer.padding_side = "right"
     data_collator = DataCollatorForSeq2Seq(tokenizer=tokenizer, padding=True, label_pad_token_id=-100)
     print(f"--- Loss mode: {'explanation-only (generation)' if is_generation_dataset([args.dataset_shortcode]) else 'answer-only (MCQA)'} ---")
