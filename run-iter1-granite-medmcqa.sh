@@ -230,10 +230,14 @@ PY
     STEP="preflight: label mask check (medmcqa_gen)"
     python check-answer-only-labels.py --dataset_shortcode "$DATASET_SHORTCODE"
     STEP="preflight: inputs"
-    if ! has_phase stage1; then
+    # Only enforce trained inputs when a phase of THIS invocation consumes them
+    # (PHASES=preflight alone on a fresh checkout must succeed before stage1 exists).
+    NEEDS_WEIGHTS=0
+    for ph in val test baselines prior kl ood report; do has_phase "$ph" && NEEDS_WEIGHTS=1; done
+    if [ "$NEEDS_WEIGHTS" = 1 ] && ! has_phase stage1; then
         [ -d "$KVQ_ADAPTER_PATH" ] || { echo "ERROR: adapter $KVQ_ADAPTER_PATH missing (run PHASES=stage1)"; exit 1; }
     fi
-    if ! has_phase stage2 && ! has_phase stage1; then
+    if [ "$NEEDS_WEIGHTS" = 1 ] && ! has_phase stage2 && ! has_phase stage1; then
         for B in "${BETAS[@]}"; do
             for L in "${LAYERS[@]}"; do
                 f="./router_weights/fcvr/fcvr-${MODEL_SHORTCODE}-${DATASET_SHORTCODE}-pretrained-prior-beta${B}/layer_${L}_weights.pt"
