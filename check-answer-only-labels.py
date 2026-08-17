@@ -61,8 +61,15 @@ def main():
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, collate_fn=data_collator)
 
     eos = tokenizer.eos_token or ""
-    n_checked, n_target_tokens, n_pad_total = 0, 0, 0
+    n_checked, n_target_tokens, n_pad_total, n_junction_diff = 0, 0, 0, 0
     printed_example = False
+
+    def _first_diff(a: str, b: str):
+        n = min(len(a), len(b))
+        for i in range(n):
+            if a[i] != b[i]:
+                return i
+        return None if len(a) == len(b) else n
     for b, batch in enumerate(val_loader):
         if args.num_batches and b >= args.num_batches:
             break
@@ -81,10 +88,28 @@ def main():
                 f"row {row_idx}: loss block does not end at the last real token"
             assert int(unmasked[-1] - unmasked[0]) + 1 == len(unmasked), \
                 f"row {row_idx}: loss positions are not contiguous"
-            decoded = tokenizer.decode(labels[r][unmasked])
             expected = val_engineered[row_idx]["answer"] + (eos if generation else "")
-            assert decoded == expected, \
-                f"row {row_idx}: loss tokens decode to {decoded[:120]!r}..., expected {expected[:120]!r}..."
+            label_ids = labels[r][unmasked].tolist()
+            expected_ids = tokenizer(expected, add_special_tokens=False).input_ids
+            if label_ids != expected_ids:
+                # Token ids can legitimately differ at the prompt/target junction
+                # (joint vs separate tokenisation); the TEXT must still be identical.
+                # Compare decoded text with tokenizer clean-up disabled on both sides
+                # (Granite's decode otherwise rewrites " ," -> "," , " 's" -> "'s" ...).
+                decoded = tokenizer.decode(label_ids, clean_up_tokenization_spaces=False)
+                expected_rt = tokenizer.decode(expected_ids, clean_up_tokenization_spaces=False)
+                if decoded != expected_rt:
+                    i = _first_diff(decoded, expected_rt)
+                    lo = max(0, (i or 0) - 40)
+                    raise AssertionError(
+                        f"row {row_idx}: loss tokens differ from target text at char {i} "
+                        f"(len decoded={len(decoded)}, expected={len(expected_rt)}, "
+                        f"n_ids {len(label_ids)} vs {len(expected_ids)}).\n"
+                        f"  decoded : {decoded[lo:(i or 0) + 40]!r}\n"
+                        f"  expected: {expected_rt[lo:(i or 0) + 40]!r}")
+                n_junction_diff += 1
+            else:
+                decoded = tokenizer.decode(label_ids, clean_up_tokenization_spaces=False)
             n_checked += 1
             n_target_tokens += len(unmasked)
             n_pad_total += int((attention_mask[r] == 0).sum())
@@ -102,6 +127,9 @@ def main():
     print(f"OK: {n_checked} rows checked, {n_target_tokens} {kind} tokens in loss "
           f"({n_target_tokens / n_checked:.2f} per row), {n_pad_total} pad positions all masked; "
           f"prompt fully masked; loss block contiguous at sequence end.")
+    if n_junction_diff:
+        print(f"note: {n_junction_diff} row(s) had a different token split at the prompt/target junction "
+              f"(joint vs separate tokenisation) but identical target text -- harmless.")
 
 
 if __name__ == "__main__":
