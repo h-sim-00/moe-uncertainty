@@ -1,15 +1,27 @@
+"""Stage 2a: deterministic MAP router tuning (all routers unfrozen, everything else frozen).
+
+NOT part of the ICML paper's protocol (App. D.2 freezes the pre-trained router
+weights W_r; the VGLR prior mean is l_det = u W_r). This stage exists in the
+inherited pipeline and is kept as the `prior_source=map` ABLATION arm: the FCVR
+mean_base / prior is then seeded from these MAP-tuned routers instead of the
+pre-trained ones. Both arms are run and reported (codex-recom-iter1-notes.md).
+
+iter1 changes: seeds applied; prompt-masked (answer-/explanation-only) labels via
+the same collator path as kvq-/fcvr-tuning; AdamW; best-val checkpoint +
+early stopping; --map_suffix so a run never overwrites an earlier one.
+"""
 import argparse
 from torch.utils.data import DataLoader
-from transformers import DataCollatorForLanguageModeling
+from transformers import DataCollatorForSeq2Seq
 from tqdm import tqdm
 import torch
 import wandb
 
 from model.adapters import granite_adapter, qwen_adapter, deepseek_adapter
 
-from utils import setup_environment
+from utils import setup_environment, seed_everything
 from model import load_peft_model_and_adapter, load_tokenizer
-from utils import load_and_prepare_train_and_val_data
+from utils import load_and_prepare_train_and_val_data, is_generation_dataset
 
 ADAPTER_MAP = {
     "granite": {
@@ -31,23 +43,27 @@ def train(model, tokenizer, train_loader, val_loader, args):
     adapter = ADAPTER_MAP[args.model_shortcode]
     prepare_for_tuning_func = adapter["prepare"]
     save_map_routers_func = adapter["save"]
-    
+
     run_name = f"{args.model_shortcode}_{args.dataset_shortcode}"
+    if args.map_suffix:
+        run_name = f"{run_name}_{args.map_suffix}"
 
     # === 1. Prepare Model for Training ===
     model = prepare_for_tuning_func(model)
 
     # === 2. Create Optimizer ===
     trainable_params = [p for p in model.parameters() if p.requires_grad]
-    optimizer = torch.optim.Adam(trainable_params, lr=args.lr)
+    optimizer = torch.optim.AdamW(trainable_params, lr=args.lr)
 
     # === 3. Run Custom Training Loop ===
     project_name = "moe-uncertainty"
     wandb.init(project=project_name, name=run_name, config=vars(args), reinit=True)
 
     num_training_batches = len(train_loader)
+    best_val_loss = float("inf")
+    epochs_no_improve = 0
 
-    print("--- Starting MAP Fine-tuning (Custom Loop) ---")
+    print("--- Starting MAP router fine-tuning (Custom Loop) ---")
     for epoch in range(args.epochs):
         model.train()
         total_epoch_loss = 0
@@ -62,7 +78,7 @@ def train(model, tokenizer, train_loader, val_loader, args):
             wandb.log({
                 "train_loss": loss.item()
             })
-            
+
         print(f"Epoch {epoch+1} average training loss: {total_epoch_loss / num_training_batches:.4f}")
 
         # Validation Loop
@@ -77,9 +93,25 @@ def train(model, tokenizer, train_loader, val_loader, args):
         print(f"Epoch {epoch+1} validation loss: {avg_val_loss:.4f}")
         wandb.log({"val_loss": avg_val_loss, "epoch": epoch})
 
-    print("--- MAP Fine-tuning complete ---")
-    
-    save_map_routers_func(model, args)
+        # Best-val checkpoint + early stopping (the weights on disk are always
+        # the best epoch; re-save overwrites the previous best of THIS run only).
+        if avg_val_loss < best_val_loss - 1e-4:
+            best_val_loss = avg_val_loss
+            epochs_no_improve = 0
+            print(f"  New best val loss {best_val_loss:.4f} -> saving MAP routers.")
+            save_map_routers_func(model, args)
+        else:
+            epochs_no_improve += 1
+            print(f"  No val-loss improvement ({epochs_no_improve}/{args.early_stop_patience}).")
+            if epochs_no_improve >= args.early_stop_patience:
+                print(f"--- Early stopping at epoch {epoch+1} (best val loss {best_val_loss:.4f}) ---")
+                break
+
+    if best_val_loss == float("inf"):
+        print("--- Val loss never improved; saving final state as a fallback ---")
+        save_map_routers_func(model, args)
+
+    print(f"--- MAP router fine-tuning complete (best val loss {best_val_loss:.4f}) ---")
 
 
 def parse_args():
@@ -91,12 +123,17 @@ def parse_args():
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--lr", type=float, default=5e-5)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--early_stop_patience", type=int, default=2,
+                        help="Epochs of no val-loss improvement before early stopping (best checkpoint kept).")
+    parser.add_argument("--map_suffix", type=str, default=None,
+                        help="Suffix on router_weights/base/<model>_<dataset>; keeps this run from overwriting an earlier MAP run.")
     return parser.parse_args()
 
 def main():
     print("Setting up the environment...")
     setup_environment()
     args = parse_args()
+    seed_everything(args.seed)  # random (dataset shuffles/splits) + numpy + torch
 
     model = load_peft_model_and_adapter(
         args.model_shortcode,
@@ -105,8 +142,14 @@ def main():
     )
     tokenizer = load_tokenizer(args.model_shortcode)
 
-    train_dataset, val_dataset = load_and_prepare_train_and_val_data(tokenizer, [args.dataset_shortcode])
-    data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
+    # Same loss/collator path as kvq-tuning.py / fcvr-tuning.py: prompt-masked
+    # labels (answer-only for MCQA, explanation-only + EOS for generation),
+    # right padding, labels-preserving collator.
+    train_dataset, val_dataset = load_and_prepare_train_and_val_data(
+        tokenizer, [args.dataset_shortcode], seed=args.seed, answer_only=True)
+    tokenizer.padding_side = "right"
+    data_collator = DataCollatorForSeq2Seq(tokenizer=tokenizer, padding=True, label_pad_token_id=-100)
+    print(f"--- Loss mode: {'explanation-only (generation)' if is_generation_dataset([args.dataset_shortcode]) else 'answer-only (MCQA)'} ---")
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, collate_fn=data_collator, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, collate_fn=data_collator)
 

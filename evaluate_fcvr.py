@@ -58,6 +58,8 @@ def parse_args():
                         help="Suffix on the FCVR weights dir; must match the training run's --run_suffix.")
     parser.add_argument("--prior_source", type=str, default="map", choices=["map", "pretrained"],
                         help="Must match the training run: FCVR mean_base from fine-tuned MAP ('map') or pre-trained Granite ('pretrained').")
+    parser.add_argument("--map_suffix", type=str, default=None,
+                        help="[prior_source=map] Suffix of the MAP router weights dir used at training.")
     parser.add_argument("--output_json_path", type=str, required=True)
 
     parser.add_argument("--num_samples", type=int, default=35, help="MC samples for FCVR inference.")

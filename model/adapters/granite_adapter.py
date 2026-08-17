@@ -61,6 +61,12 @@ def save_granite_map_routers(model, args):
     output_dir = "./router_weights/base"
     causal_model = model.base_model.model.model
     run_name = f"{args.model_shortcode}_{args.dataset_shortcode}"
+    # Optional suffix so a MAP run never overwrites an earlier one (mirrors
+    # run_suffix for the Bayesian weights). Default path unchanged.
+    map_suffix = getattr(args, "map_suffix", None)
+    if map_suffix:
+        run_name = f"{run_name}-{map_suffix}"
+    print(f"    -> {os.path.join(output_dir, run_name)}")
     for i, layer in enumerate(causal_model.layers):
         save_path = os.path.join(output_dir, run_name, f"layer_{i}_weights.pt")
         layer.block_sparse_moe.router.save_weights(save_path)
@@ -71,11 +77,19 @@ def load_granite_map_routers(model, args):
     print("--- Loading base MAP routers ---")
     causal_model = model.base_model.model.model
     map_run_name = f"{args.model_shortcode}_{args.dataset_shortcode}"
+    map_suffix = getattr(args, "map_suffix", None)
+    if map_suffix:
+        map_run_name = f"{map_run_name}-{map_suffix}"
     map_weights_dir = f"./router_weights/base/{map_run_name}"
-    
+    print(f"    <- {map_weights_dir}")
+
     for i, layer in enumerate(causal_model.layers):
         map_router = MoERouter(config=causal_model.config)
         map_weights_path = os.path.join(map_weights_dir, f"layer_{i}_weights.pt")
+        if not os.path.exists(map_weights_path):
+            raise FileNotFoundError(
+                f"No MAP router weights for layer {i} at {map_weights_path}. "
+                f"Run router-tuning (Stage 2a) for this dataset / --map_suffix first, or use --prior_source pretrained.")
         map_router.load_weights(map_weights_path, device=model.device)
         layer.block_sparse_moe.router = map_router.to(model.device)
 

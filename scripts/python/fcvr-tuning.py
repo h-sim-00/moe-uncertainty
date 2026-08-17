@@ -182,6 +182,8 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--run_suffix", type=str, default=None,
                         help="Optional suffix on the FCVR weights dir to avoid overwriting other runs.")
+    parser.add_argument("--map_suffix", type=str, default=None,
+                        help="[prior_source=map] Suffix of the MAP router weights dir (router_weights/base/<model>_<dataset>-<suffix>).")
     parser.add_argument("--prior_source", type=str, default="map", choices=["map", "pretrained"],
                         help="Seed FCVR mean_base from fine-tuned MAP routers ('map') or the pre-trained Granite router ('pretrained', paper-faithful).")
     return parser.parse_args()

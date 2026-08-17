@@ -65,6 +65,8 @@ def parse_args():
                    help="Must match the training run's --run_suffix.")
     p.add_argument("--prior_source", type=str, default="pretrained", choices=["map", "pretrained"],
                    help="Must match the training run.")
+    p.add_argument("--map_suffix", type=str, default=None,
+                   help="[prior_source=map] Suffix of the MAP router weights dir used at training.")
     p.add_argument("--num_samples", type=int, default=35,
                    help="MC samples S for stochastic routing (paper: 35). Ignored if --routing deterministic.")
     p.add_argument("--routing", type=str, default="stochastic", choices=["stochastic", "deterministic"],
