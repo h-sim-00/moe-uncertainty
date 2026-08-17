@@ -95,8 +95,12 @@ for BETA in "${BETAS[@]}"; do
         --beta "$BETA" \
         --seed "$SEED" \
         --run_suffix "$SUFFIX" \
-        --prior_source "$PRIOR_SOURCE"
+        --prior_source "$PRIOR_SOURCE" \
+        --kl_mask none
 done
+# --kl_mask none: the existing pretrained-prior-beta* weights were trained with the
+# legacy KL (mean over every position incl. padding); keep that explicit now that
+# the script default is 'attention' (codex-recom-iter1). New runs use the driver.
 
 echo ""
 echo "############################################################"
