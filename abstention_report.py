@@ -1,4 +1,4 @@
-"""Abstention readout with a frozen val -> test protocol (supervisor points 6, 8).
+"""Abstention readout with a frozen val -> test protocol (supervisor points 6, 8; 5 = --calibrate).
 
 Two phases, two files, never mixed:
 
@@ -15,11 +15,15 @@ Two phases, two files, never mixed:
              applied unchanged, and a likelihood-ratio test of +ILV on test
              (reported as analysis; no decision is derived from it). Refuses to
              run without a frozen file; warns if the input is not a test file.
+  --calibrate (phase 2, gated): Platt/isotonic map score -> P(wrong) fitted on
+             val, scored on test: Brier / NLL / ECE / adaptive ECE / AURC and a
+             reliability table. Runs only if the frozen test AUROC CI of the
+             primary score excludes 0.5 (or --force, marked exploratory).
   --aggregate eval_*.json ...  -> mean +- sd across inference seeds.
 
 Label: --label correct_primary (pre-registered: option_correct with explicit
-probe fallback); alternatives (correct_probe, expl_entails, option_correct) are
-reported as secondary via --extra_labels.
+probe fallback); rerun with --label correct_probe / option_correct / expl_entails
+and a different --tag to report the secondary labels.
 Primary score: --primary_score ilv_online_mean_last10 (pre-registered);
 every ilv_* / *_BASELINE score in the file is reported.
 """
@@ -32,7 +36,7 @@ import sys
 
 import numpy as np
 
-from uq_stats import auroc, bootstrap_ci, risk_coverage, apply_thresholds
+from uq_stats import (auroc, bootstrap_ci, risk_coverage, apply_thresholds, calibration_metrics)
 
 BASELINE_KEYS = ["entropy_mean_BASELINE", "entropy_max_BASELINE", "nll_per_token_BASELINE", "gen_len_BASELINE"]
 
@@ -244,6 +248,62 @@ def do_evaluate(args):
     print(f"Saved: {out} / .md")
 
 
+def do_calibrate(args):
+    frozen = json.load(open(args.frozen))
+    ev_path = os.path.join(args.out_dir, f"eval_{frozen['tag']}{'_' + args.eval_tag if args.eval_tag else ''}.json")
+    if not os.path.exists(ev_path):
+        sys.exit(f"--calibrate needs the test evaluation first ({ev_path}).")
+    ev = json.load(open(ev_path))
+    prim = frozen["primary_score"]
+    gate = ev["scores"][prim]["ci_excludes_0.5"] and ev["scores"][prim]["auroc"] > 0.5
+    if not gate and not args.force:
+        sys.exit(f"GATED: primary score {prim} test AUROC {ev['scores'][prim]['auroc']:.3f} "
+                 f"CI {ev['scores'][prim]['auroc_ci95']} does not exclude 0.5 in the a-priori direction. "
+                 f"Calibration/decoding is phase 2 and stays gated (--force = exploratory only).")
+    val_rows, _ = labelled(load_rows(args.val_input), frozen["label"])
+    test_rows, y_te = labelled(load_rows(args.input), frozen["label"])
+    _, y_va = labelled(load_rows(args.val_input), frozen["label"])
+    out = {"tag": frozen["tag"], "gated_pass": bool(gate), "exploratory": not gate, "method": args.method, "scores": {}}
+    for n in [prim] + [s for s in args.calibrate_scores if s != prim]:
+        if not all(n in r["scores"] for r in val_rows + test_rows):
+            continue
+        s_va = np.array([r["scores"][n] for r in val_rows]); s_te = np.array([r["scores"][n] for r in test_rows])
+        if args.method == "platt":
+            Xs, mu, sd = standardise(s_va[:, None]); w = fit_logreg(Xs, y_va)
+            p_te = logreg_predict(w, (s_te[:, None] - mu) / sd)
+        else:  # isotonic (PAVA), val-fitted, step-interpolated on test
+            order = np.argsort(s_va); xs, ys = s_va[order], y_va[order].astype(float)
+            # pool adjacent violators
+            blocks = [[xs[i], xs[i], ys[i], 1] for i in range(len(xs))]
+            i = 0
+            while i < len(blocks) - 1:
+                if blocks[i][2] > blocks[i + 1][2]:
+                    a, b = blocks[i], blocks[i + 1]
+                    m = (a[2] * a[3] + b[2] * b[3]) / (a[3] + b[3])
+                    blocks[i:i + 2] = [[a[0], b[1], m, a[3] + b[3]]]
+                    i = max(i - 1, 0)
+                else:
+                    i += 1
+            lo = np.array([b[0] for b in blocks]); val = np.array([b[2] for b in blocks])
+            idx = np.clip(np.searchsorted(lo, s_te, side="right") - 1, 0, len(val) - 1)
+            p_te = val[idx]
+        cm = calibration_metrics(y_te, p_te, n_bins=args.n_bins)
+        rc = risk_coverage(y_te, p_te)
+        # reliability table
+        edges = np.linspace(0, 1, args.n_bins + 1); rel = []
+        for lo_, hi_ in zip(edges[:-1], edges[1:]):
+            m = (p_te >= lo_) & (p_te < hi_) if hi_ < 1 else (p_te >= lo_) & (p_te <= hi_)
+            if m.any():
+                rel.append({"bin": [float(lo_), float(hi_)], "n": int(m.sum()), "mean_pred": float(p_te[m].mean()), "frac_wrong": float(y_te[m].mean())})
+        out["scores"][n] = {**cm, "aurc": rc["aurc"], "reliability": rel}
+    o = os.path.join(args.out_dir, f"calib_{frozen['tag']}{'_' + args.eval_tag if args.eval_tag else ''}_{args.method}.json")
+    json.dump(out, open(o, "w"), indent=2)
+    for n, r in out["scores"].items():
+        print(f"[CALIB {args.method}{' EXPLORATORY' if not gate else ''}] {n}: Brier {r['brier']:.3f} NLL {r['nll']:.3f} "
+              f"ECE {r['ece']:.3f} adaECE {r['ece_adaptive']:.3f} AURC {r['aurc']:.3f}")
+    print(f"Saved: {o}")
+
+
 def do_aggregate(args):
     files = [f for pat in args.aggregate for f in sorted(glob.glob(pat))]
     if not files:
@@ -267,14 +327,19 @@ def main():
     mode = p.add_mutually_exclusive_group(required=True)
     mode.add_argument("--select", action="store_true", help="Fit/freeze on the VAL file.")
     mode.add_argument("--evaluate", action="store_true", help="Evaluate the TEST file once with a frozen selection.")
+    mode.add_argument("--calibrate", action="store_true", help="Phase 2 (gated): score->P(wrong) fitted on val, scored on test.")
     mode.add_argument("--aggregate", nargs="+", default=None, help="eval_*.json globs -> mean ± sd across seeds.")
     p.add_argument("--input", help="Labelled seqlevel jsonl (val for --select, test for --evaluate/--calibrate).")
+    p.add_argument("--val_input", help="[--calibrate] the VAL labelled file the calibrator is fitted on.")
     p.add_argument("--frozen", help="frozen_<tag>.json from --select.")
     p.add_argument("--tag", default=None)
     p.add_argument("--eval_tag", default=None, help="Extra tag for the eval/calib output (e.g. seed).")
     p.add_argument("--label", default="correct_primary")
     p.add_argument("--primary_score", default="ilv_online_mean_last10")
     p.add_argument("--coverages", nargs="+", type=float, default=[0.9, 0.8, 0.7])
+    p.add_argument("--method", default="platt", choices=["platt", "isotonic"])
+    p.add_argument("--calibrate_scores", nargs="+", default=["entropy_max_BASELINE", "nll_per_token_BASELINE"])
+    p.add_argument("--n_bins", type=int, default=10)
     p.add_argument("--n_boot", type=int, default=2000)
     p.add_argument("--out_dir", default="results/abstention")
     p.add_argument("--overwrite", action="store_true")
@@ -288,6 +353,10 @@ def main():
         if not args.input:
             sys.exit("--evaluate needs --input <test labelled jsonl> and --frozen")
         do_evaluate(args)
+    elif args.calibrate:
+        if not (args.input and args.val_input and args.frozen):
+            sys.exit("--calibrate needs --input <test> --val_input <val> --frozen")
+        do_calibrate(args)
     else:
         do_aggregate(args)
 
