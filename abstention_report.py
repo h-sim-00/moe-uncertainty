@@ -57,6 +57,13 @@ def labelled(rows, label):
     return keep, y
 
 
+def label_source_counts(rows):
+    """Provenance tally. Labelled files written before `label_source` existed carry no
+    such key; those rows are counted under an explicit string rather than None, so the
+    counts stay sortable (str vs None does not compare) and JSON-safe."""
+    return dict(Counter(r.get("label_source") or "(not recorded)" for r in rows))
+
+
 def score_matrix(rows, names):
     return np.array([[r["scores"].get(n, np.nan) for n in names] for r in rows], dtype=float)
 
@@ -130,7 +137,7 @@ def do_select(args):
         # Rows carrying no primary label are silently dropped by labelled(); record how
         # many, and where the surviving labels came from.
         "n_val_rows_read": int(len(rows)), "n_val_unlabelled": int(len(rows) - len(keep)),
-        "label_source_counts": dict(Counter(r.get("label_source") for r in keep)),
+        "label_source_counts": label_source_counts(keep),
         "config_hash": ch, "config": cfg, "val_file": args.input,
         "scores": {}, "thresholds": {}, "residual_models": {},
     }
@@ -188,7 +195,7 @@ def do_evaluate(args):
     res = {"tag": frozen["tag"], "frozen": args.frozen, "test_file": args.input, "label": label,
            "primary_score": frozen["primary_score"], "n_test": int(len(keep)), "n_wrong_test": int(y.sum()),
            "n_test_rows_read": int(len(rows)), "n_test_unlabelled": int(len(rows) - len(keep)),
-           "label_source_counts": dict(Counter(r.get("label_source") for r in keep)),
+           "label_source_counts": label_source_counts(keep),
            "accuracy_test": float(1 - y.mean()) if len(y) else None, "scores": {}, "residual": {}}
     for j, n in enumerate(names):
         ci = bootstrap_ci(auroc, y, S[:, j], n_boot=args.n_boot)

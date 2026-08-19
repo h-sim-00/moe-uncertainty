@@ -41,6 +41,13 @@ def find_one(pattern):
     return hits[0] if hits else None
 
 
+def label_source_counts(rows):
+    """Provenance tally. Labelled files written before `label_source` existed carry no
+    such key; those rows are counted under an explicit string rather than None, so the
+    counts stay sortable (str vs None does not compare) and JSON-safe."""
+    return dict(Counter(r.get("label_source") or "(not recorded)" for r in rows))
+
+
 def summarize_arm(tag, split, args):
     split_tok = "" if split == "test" else f"_{split}"
     lab = find_one(f"{args.token_dir}/step1_{args.source}{split_tok}_generate_{tag}_seqlevel_labeled.jsonl")
@@ -67,7 +74,7 @@ def summarize_arm(tag, split, args):
         "tag": tag, "arm": cfg.get("config", {}).get("arm"), "routing": cfg.get("config", {}).get("routing"),
         "run_suffix": cfg.get("config", {}).get("run_suffix"), "prior_source": cfg.get("config", {}).get("prior_source"),
         "n": len(rows), "n_labeled": len(lab_rows), "n_unlabeled": len(rows) - len(lab_rows), "label": label,
-        "label_source_counts": dict(Counter(r.get("label_source") for r in rows)),
+        "label_source_counts": label_source_counts(rows),
         # Accuracy of whatever --label selects, over the SAME rows the AUROC uses,
         # so it shares a denominator with n_labeled.
         "primary_acc": mean_of(label, lab_rows), "probe_acc": mean_of("correct_probe"),
