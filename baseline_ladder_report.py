@@ -5,7 +5,7 @@ Collects, per ARM, the labelled sequence-level readouts and the input-level OoD
 results and prints one comparison table:
     arms  = det (Stage-1, stock routers) | untrained FCVR heads | pretrained-prior FCVR
             | MAP-prior FCVR | KL mask none/attention/answer | beta=0   (+ any tag you pass)
-    cols  = n, option acc (primary label), probe acc, expl_entails rate, truncated rate,
+    cols  = n, primary acc (whatever --label selects), probe acc, expl_entails rate, truncated rate,
             ROUGE-L / BERTScore / unigram-F1, tokens/s, wall-clock/example,
             AUROC(wrong) with bootstrap CI for the primary ILV score, entropy_max, gen_len,
             OoD AUROC (ilv_last / entropy_last) per OoD set.
@@ -25,6 +25,7 @@ import argparse
 import glob
 import json
 import os
+from collections import Counter
 
 import numpy as np
 
@@ -65,8 +66,11 @@ def summarize_arm(tag, split, args):
     out = {
         "tag": tag, "arm": cfg.get("config", {}).get("arm"), "routing": cfg.get("config", {}).get("routing"),
         "run_suffix": cfg.get("config", {}).get("run_suffix"), "prior_source": cfg.get("config", {}).get("prior_source"),
-        "n": len(rows), "n_labeled": len(lab_rows), "label": label,
-        "option_acc": mean_of("correct_primary"), "probe_acc": mean_of("correct_probe"),
+        "n": len(rows), "n_labeled": len(lab_rows), "n_unlabeled": len(rows) - len(lab_rows), "label": label,
+        "label_source_counts": dict(Counter(r.get("label_source") for r in rows)),
+        # Accuracy of whatever --label selects, over the SAME rows the AUROC uses,
+        # so it shares a denominator with n_labeled.
+        "primary_acc": mean_of(label, lab_rows), "probe_acc": mean_of("correct_probe"),
         "expl_entails_rate": mean_of("expl_entails"), "expl_any_contra_rate": mean_of("expl_any_contra"),
         "truncated_rate": mean_of("truncated"), "unjudgeable_rate": mean_of("unjudgeable"),
         "rouge_l": mean_of("rouge_l"), "bertscore_f1": mean_of("bertscore_f1"), "expl_f1": mean_of("expl_f1"),
@@ -83,7 +87,7 @@ def summarize_arm(tag, split, args):
         "ood": {},
     }
     # Per-subject breakdown (medmcqa_gen rows carry subject_name; MedExQA rows do not):
-    # option accuracy + primary-score AUROC per subject (JSON only; n per subject is small).
+    # primary accuracy + primary-score AUROC per subject (JSON only; n per subject is small).
     if any(r.get("subject_name") for r in lab_rows):
         by_subj = {}
         for r, yy in zip(lab_rows, y):
@@ -95,7 +99,7 @@ def summarize_arm(tag, split, args):
             auc = None
             if len(items) >= 10 and 0 < ys.sum() < len(ys) and all(v is not None for v in ss):
                 auc = float(auroc(ys, np.array(ss, dtype=float)))
-            out["per_subject"][subj] = {"n": len(items), "option_acc": float(1.0 - ys.mean()),
+            out["per_subject"][subj] = {"n": len(items), "primary_acc": float(1.0 - ys.mean()),
                                         f"auroc_{args.primary_score}": auc}
     ood_path = find_one(f"{args.ood_dir}/input_ood_{args.source}{split_tok}_*_{tag}.json")
     if ood_path:
@@ -141,14 +145,15 @@ def main():
         json.dump({"split": args.split, "label": args.label, "primary_score": args.primary_score, "arms": arms}, f, indent=2)
 
     ood_codes = sorted({c for a in arms for c in a.get("ood", {})})
-    hdr = ["tag", "arm", "n", "opt acc", "probe acc", "entails", "trunc", "ROUGE-L", "BERTSc", "uniF1",
+    hdr = ["tag", "arm", "n", "n lab", "n unlab", "primary acc", "probe acc", "entails", "trunc", "ROUGE-L", "BERTSc", "uniF1",
            "tok/s", f"AUROC {args.primary_score}", "AUROC ent_max", "AUROC nll", "AUROC len"] + [f"OoD {c} ilv/ent" for c in ood_codes]
     lines = ["| " + " | ".join(hdr) + " |", "|" + "---|" * len(hdr)]
     for a in arms:
         if "missing" in a:
             lines.append(f"| {a['tag']} | MISSING: {a['missing']} |" + " |" * (len(hdr) - 2))
             continue
-        row = [a["tag"], fmt(a["arm"]), str(a["n"]), fmt(a["option_acc"]), fmt(a["probe_acc"]), fmt(a["expl_entails_rate"]),
+        row = [a["tag"], fmt(a["arm"]), str(a["n"]), str(a["n_labeled"]), str(a["n_unlabeled"]),
+               fmt(a["primary_acc"]), fmt(a["probe_acc"]), fmt(a["expl_entails_rate"]),
                fmt(a["truncated_rate"], 2), fmt(a["rouge_l"]), fmt(a["bertscore_f1"]), fmt(a["expl_f1"]),
                fmt(a["tokens_per_second"], 1), fmt_ci(a["auroc"].get(args.primary_score)),
                fmt_ci(a["auroc"].get("entropy_max_BASELINE")), fmt_ci(a["auroc"].get("nll_per_token_BASELINE")),
@@ -157,9 +162,19 @@ def main():
             o = a["ood"].get(c, {})
             row.append(f"{fmt(o.get('ilv_last'))}/{fmt(o.get('entropy_last'))}")
         lines.append("| " + " | ".join(row) + " |")
+    # Provenance of the primary label, so a probe-fallback-contaminated table can never
+    # be mistaken for one graded purely on what the model actually generated.
+    prov = ["", "## Primary-label provenance", "",
+            "`n unlab` rows carry no primary label and are excluded from every AUROC above.", ""]
+    for a in arms:
+        if "missing" in a:
+            continue
+        counts = ", ".join(f"{k}={v}" for k, v in sorted(a["label_source_counts"].items()))
+        prov.append(f"- **{a['tag']}**: {counts or '(none recorded)'}")
     md = (f"# Baseline ladder — source={args.source}, split={args.split}, label={args.label}, primary score={args.primary_score}\n\n"
           "AUROC = predict WRONG (sign fixed a priori: higher score ⇒ wrong); [lo,hi] = 95% example-level bootstrap CI. "
-          "OoD columns = input-level AUROC(OoD=1) for ilv_last / entropy_last.\n\n" + "\n".join(lines) + "\n")
+          "OoD columns = input-level AUROC(OoD=1) for ilv_last / entropy_last.\n\n"
+          + "\n".join(lines) + "\n" + "\n".join(prov) + "\n")
     with open(os.path.join(args.out_dir, name + ".md"), "w") as f:
         f.write(md)
     print(md)

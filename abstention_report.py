@@ -21,9 +21,13 @@ Two phases, two files, never mixed:
              primary score excludes 0.5 (or --force, marked exploratory).
   --aggregate eval_*.json ...  -> mean +- sd across inference seeds.
 
-Label: --label correct_primary (pre-registered: option_correct with explicit
-probe fallback); rerun with --label correct_probe / option_correct / expl_entails
-and a different --tag to report the secondary labels.
+Label: --label correct_primary (pre-registered). Its meaning is set upstream by
+label_generation_correctness.py --primary_label_policy, which defaults to
+option_only: a generation that never named an answer is left unlabelled and is
+EXCLUDED here rather than graded by the separate letter-probe pass. The count of
+excluded rows and the provenance of the surviving labels are recorded in the
+frozen/eval JSON and printed in the markdown. Rerun with --label correct_probe /
+option_correct / expl_entails and a different --tag for the secondary labels.
 Primary score: --primary_score ilv_online_mean_last10 (pre-registered);
 every ilv_* / *_BASELINE score in the file is reported.
 """
@@ -33,6 +37,7 @@ import hashlib
 import json
 import os
 import sys
+from collections import Counter
 
 import numpy as np
 
@@ -122,6 +127,10 @@ def do_select(args):
         "tag": args.tag, "label": args.label, "primary_score": args.primary_score,
         "sign": "a priori: higher score => WRONG. Never flipped.",
         "coverages": args.coverages, "n_val": int(len(keep)), "n_wrong_val": int(y.sum()),
+        # Rows carrying no primary label are silently dropped by labelled(); record how
+        # many, and where the surviving labels came from.
+        "n_val_rows_read": int(len(rows)), "n_val_unlabelled": int(len(rows) - len(keep)),
+        "label_source_counts": dict(Counter(r.get("label_source") for r in keep)),
         "config_hash": ch, "config": cfg, "val_file": args.input,
         "scores": {}, "thresholds": {}, "residual_models": {},
     }
@@ -178,6 +187,8 @@ def do_evaluate(args):
     S = score_matrix(keep, names)
     res = {"tag": frozen["tag"], "frozen": args.frozen, "test_file": args.input, "label": label,
            "primary_score": frozen["primary_score"], "n_test": int(len(keep)), "n_wrong_test": int(y.sum()),
+           "n_test_rows_read": int(len(rows)), "n_test_unlabelled": int(len(rows) - len(keep)),
+           "label_source_counts": dict(Counter(r.get("label_source") for r in keep)),
            "accuracy_test": float(1 - y.mean()) if len(y) else None, "scores": {}, "residual": {}}
     for j, n in enumerate(names):
         ci = bootstrap_ci(auroc, y, S[:, j], n_boot=args.n_boot)
@@ -219,8 +230,11 @@ def do_evaluate(args):
         sys.exit(f"{out} exists -- the test set is evaluated ONCE per frozen configuration (pass --overwrite only to redo a botched run).")
     json.dump(res, open(out, "w"), indent=2)
     # markdown
+    _src = ", ".join(f"{k}={v}" for k, v in sorted(res["label_source_counts"].items())) or "(none recorded)"
     lines = [f"# Abstention eval — {frozen['tag']} (label={label}, n={len(keep)}, wrong={int(y.sum())}, acc={res['accuracy_test']:.3f})",
-             "", "Sign fixed a priori (higher ⇒ wrong). CI = 95% example-level bootstrap. Thresholds frozen on val.", "",
+             "", "Sign fixed a priori (higher ⇒ wrong). CI = 95% example-level bootstrap. Thresholds frozen on val.",
+             f"Rows read {res['n_test_rows_read']}, unlabelled and excluded {res['n_test_unlabelled']}. "
+             f"Primary-label provenance: {_src}.", "",
              "| score | test AUROC [CI] | val AUROC | AURC | " + " | ".join(f"risk@cov{c} (cov)" for c in frozen["coverages"]) + " |",
              "|---|---|---|---|" + "---|" * len(frozen["coverages"])]
     order = [frozen["primary_score"]] + [n for n in names if n != frozen["primary_score"]]

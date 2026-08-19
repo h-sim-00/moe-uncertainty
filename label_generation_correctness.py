@@ -21,9 +21,18 @@ into one verdict -- each question below gets its own field:
 Explanation quality (multi-reference max): unigram-F1 (kept), BLEU (sacrebleu),
 ROUGE-L, METEOR, BERTScore-F1 with SciBERT -- MedExQA's own metric suite.
 
-Pre-registered PRIMARY abstention label = `option_correct`; when the option is
-unjudgeable the row falls back to `correct_probe` and says so in
-`label_source`. Both are written; nothing is silently merged.
+Pre-registered PRIMARY abstention label = `option_correct`. What happens when the
+generation never commits to an option is controlled by --primary_label_policy:
+
+  option_only        (DEFAULT) `correct_primary` stays None and the row drops out
+                     of every downstream AUROC. A generation that never named an
+                     answer is NOT graded by a separate probe pass.
+  option_then_probe  legacy behaviour -- fall back to `correct_probe`.
+
+`correct_probe` comes from a SEPARATE letter-probability pass, not from the text
+that was generated, so under the fallback a row whose generation never committed
+could still be reported "correct". The provenance is always recorded per row in
+`label_source` and counted in summary["counts"]["label_source"].
 
 Usage (quail, moe_env):
     python label_generation_correctness.py --input results/token_analysis/<...>_seqlevel.jsonl
@@ -267,6 +276,10 @@ def parse_args():
     p.add_argument("--nli_contra_thr", type=float, default=0.5)
     p.add_argument("--nli_frac_thr", type=float, default=0.5,
                    help="expl_entails requires >= this fraction of sentences entailed AND zero contradicted.")
+    p.add_argument("--primary_label_policy", choices=("option_only", "option_then_probe"), default="option_only",
+                   help="What correct_primary does when the generation commits to no option. "
+                        "option_only (default): leave it None so the row drops out of downstream AUROCs. "
+                        "option_then_probe: legacy fallback to the separate letter-probe pass.")
     p.add_argument("--no_metrics", action="store_true", help="Skip BLEU/ROUGE-L/METEOR/BERTScore.")
     p.add_argument("--bertscore_model", default="allenai/scibert_scivocab_uncased")
     p.add_argument("--device", default="cuda:0")
@@ -329,10 +342,12 @@ def main():
                       "expl_entails": None, "expl_neutral": None, "n_sentences": len(split_sentences(gen))})
         r["unjudgeable"] = bool(r["option_unjudgeable"] and (r.get("expl_neutral") in (True, None)))
         r["truncated"] = bool(r.get("truncated"))
-        # Pre-registered primary label with explicit provenance.
+        # Pre-registered primary label with explicit provenance. Under the default
+        # option_only policy a generation that never named an answer is left
+        # unlabelled rather than graded by the separate letter-probe pass.
         if r["option_correct"] is not None:
             r["correct_primary"], r["label_source"] = bool(r["option_correct"]), "option_correct"
-        elif r.get("correct_probe") is not None:
+        elif args.primary_label_policy == "option_then_probe" and r.get("correct_probe") is not None:
             r["correct_primary"], r["label_source"] = bool(r["correct_probe"]), "correct_probe(fallback)"
         else:
             r["correct_primary"], r["label_source"] = None, "none"
@@ -351,6 +366,7 @@ def main():
         return float(np.mean(v)) if v else None
     summary = {
         "input": args.input, "n": len(rows), "tag": tag,
+        "primary_label_policy": args.primary_label_policy,
         "nli_model": None if scorer is None else args.nli_model,
         "thresholds": {"entail": args.nli_entail_thr, "contra": args.nli_contra_thr, "frac": args.nli_frac_thr},
         "counts": {
@@ -359,6 +375,10 @@ def main():
             "unjudgeable": int(sum(1 for r in rows if r["unjudgeable"])),
             "truncated": int(sum(1 for r in rows if r["truncated"])),
             "label_source": dict(Counter(r["label_source"] for r in rows)),
+            # How many rows survive into the downstream AUROCs, and how many are
+            # dropped for having no primary label at all.
+            "primary_labelled": int(sum(1 for r in rows if r["correct_primary"] is not None)),
+            "primary_unlabelled": int(sum(1 for r in rows if r["correct_primary"] is None)),
         },
         "accuracy": {
             "option_correct (judgeable only)": _mean("option_correct"),

@@ -734,7 +734,8 @@ def abstention_analysis(per_example_records, metas, last_k=10):
     """Sequence-level abstention readout (--generate mode only).
 
     Aggregates the per-token Inf-Logit-Var over each generated explanation
-    (mean / max / last / mean & max over the last k tokens) and tests whether
+    (mean / max / last / mean & max over the last k tokens, plus mean & max over
+    the FIRST k -- the prefix, before any answer is committed) and tests whether
     any aggregate predicts that the model answered the underlying question
     WRONG. Label here = the SECONDARY letter-probe label (wrong_probe); the
     pre-registered primary label (option_correct) is added by
@@ -744,7 +745,7 @@ def abstention_analysis(per_example_records, metas, last_k=10):
     entropy. Sign is fixed A PRIORI (higher score => wrong); AUROC < 0.5 is a
     negative result and is never flipped."""
     rows = []
-    for recs, m in zip(per_example_records, metas):
+    for ex_i, (recs, m) in enumerate(zip(per_example_records, metas)):
         if not recs or m.get("correct_probe") is None:
             continue
         online = all(r.get("readout") == "online" for r in recs)
@@ -754,9 +755,15 @@ def abstention_analysis(per_example_records, metas, last_k=10):
         k = min(last_k, len(ilv))
 
         def _aggs(prefix, v):
+            # Suffix aggregates summarise the whole generation / its end, so they can only
+            # ever be retrospective. The _first{k} pair covers the PREFIX -- the tokens
+            # emitted before the answer is committed -- which is what an early-warning
+            # claim needs. Both are written; nothing is merged.
             return {f"{prefix}_mean": float(np.mean(v)), f"{prefix}_max": float(np.max(v)),
                     f"{prefix}_last": float(v[-1]), f"{prefix}_mean_last{last_k}": float(np.mean(v[-k:])),
-                    f"{prefix}_max_last{last_k}": float(np.max(v[-k:]))}
+                    f"{prefix}_max_last{last_k}": float(np.max(v[-k:])),
+                    f"{prefix}_mean_first{last_k}": float(np.mean(v[:k])),
+                    f"{prefix}_max_first{last_k}": float(np.max(v[:k]))}
         scores = {}
         has_ilv = not np.all(np.isnan(ilv))
         # PRIMARY: decoding-time ILV (online) when captured; else the post-hoc series only.
@@ -777,6 +784,10 @@ def abstention_analysis(per_example_records, metas, last_k=10):
         rows.append({
             "readout": "online" if online else "posthoc_only",
             "id": m.get("id", ""),
+            # Index into the SAME per-example list the _pertoken.jsonl writer enumerates,
+            # so the per-token ILV series can be rejoined to this row. Rows skipped above
+            # leave gaps, which is exactly why the index has to be carried explicitly.
+            "example": ex_i,
             # Probe-derived label (secondary). label_generation_correctness.py adds
             # option_correct / NLI / unjudgeable fields to this row.
             "wrong_probe": 0 if m["correct_probe"] else 1,
