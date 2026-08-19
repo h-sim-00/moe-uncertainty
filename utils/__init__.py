@@ -66,12 +66,18 @@ from .data import (
     load_exp_dataset,
     is_generation_dataset,
     GENERATION_DATASETS,
+    TARGET_MODES,
+    build_target_mode_example,
+    loss_mode_label,
 )
 
 from .prompt import (
     multi_shot_prompt_engineer,
     multiple_choice_prompt_engineer,
     generation_prompt_engineer,
+    system_instruction_for_target_mode,
+    MCQ_SYSTEM_INSTRUCTION,
+    ANSWER_EXPLANATION_SYSTEM_INSTRUCTION,
     parse_mcqa_question,
     render_inner,
     canonicalise_inner,

@@ -1,23 +1,60 @@
 from transformers import PreTrainedTokenizerBase
 
-def multiple_choice_prompt_engineer(
-        example, 
-        tokenizer: PreTrainedTokenizerBase
-        # Base class for [`PreTrainedTokenizer`] and [`PreTrainedTokenizerFast`]
-):
-    """
-    Preprocess a single example to form the input prompt.
-    Returns a dictionary with input text and the correct answer.
-    """
-
-    SYSTEM_INSTRUCTION = (
+# System instruction of the MCQA (letter-only) prompt. Unchanged from the
+# original code; every MCQA run (OBQA, ...) and the arm-A ("letter") MedMCQA
+# comparison runs use it.
+MCQ_SYSTEM_INSTRUCTION = (
     "You are a multiple-choice quiz answer generator. "
     "Respond with ONLY the letter of the correct option, for example, 'A', 'B', 'C', or 'D'."
 )
 
+# System instruction of arm B ("answer_explanation") of the MedMCQA comparison
+# (branch MedMCQA-comparison): the user turn is the SAME MCQA prompt (ends in
+# "Answer:"), the assistant target is "<letter>\nExplanation: <gold explanation>".
+# The letter is the first target token in both arms, so the letter read-out is
+# identical across arms; only the system instruction and the target differ.
+ANSWER_EXPLANATION_SYSTEM_INSTRUCTION = (
+    "You are a multiple-choice quiz answer generator. "
+    "First respond with ONLY the letter of the correct option, for example, 'A', 'B', 'C', or 'D'. "
+    "Then, on a new line beginning with 'Explanation:', explain the reasoning behind that answer."
+)
+
+# target_mode (utils/data.py::load_and_prepare_train_and_val_data) -> system instruction
+# used for the MCQA-style prompt of that arm.
+TARGET_MODE_SYSTEM_INSTRUCTION = {
+    "letter": MCQ_SYSTEM_INSTRUCTION,
+    "answer_explanation": ANSWER_EXPLANATION_SYSTEM_INSTRUCTION,
+}
+
+
+def system_instruction_for_target_mode(target_mode):
+    """System instruction of the MCQA-style prompt for a comparison arm
+    ('letter' | 'answer_explanation'). Raises on anything else."""
+    try:
+        return TARGET_MODE_SYSTEM_INSTRUCTION[target_mode]
+    except KeyError:
+        raise ValueError(f"no MCQA-style system instruction for target_mode={target_mode!r}; "
+                         f"expected one of {sorted(TARGET_MODE_SYSTEM_INSTRUCTION)}")
+
+
+def multiple_choice_prompt_engineer(
+        example,
+        tokenizer: PreTrainedTokenizerBase,
+        # Base class for [`PreTrainedTokenizer`] and [`PreTrainedTokenizerFast`]
+        system_instruction: str = None,
+):
+    """
+    Preprocess a single example to form the input prompt.
+    Returns a dictionary with input text and the correct answer.
+    `system_instruction` (optional) overrides the default MCQ system prompt
+    (used by the arm-B "answer_explanation" prompt); None = unchanged behaviour.
+    """
+
+    SYSTEM_INSTRUCTION = system_instruction if system_instruction is not None else MCQ_SYSTEM_INSTRUCTION
+
     chat = [
         {
-            "role": "system", 
+            "role": "system",
             "content": SYSTEM_INSTRUCTION
         },
         {

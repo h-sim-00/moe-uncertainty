@@ -6,7 +6,12 @@ of steps, and reports peak GPU memory + an estimated wall-clock per epoch. Use
 it to decide whether the real run will fit before committing hours to it.
 
   python expert-lora-memory-check.py --dataset_shortcode obqa --batch_size 8 --expert_lora_r 64
+  python expert-lora-memory-check.py --dataset_shortcode medmcqa_gen --target_mode answer_explanation \
+         --max_seq_len 768 --batch_size 8          # MedMCQA-comparison arm B (worst-case batch first)
 
+Uses the same loader / collator path as kvq-tuning.py (answer-only or
+target_mode labels, right padding, DataCollatorForSeq2Seq) and runs the batch of
+the LONGEST rows first, so the reported peak is the real worst case.
 Nothing is saved and no weights are written, so it cannot clobber a run.
 """
 
@@ -15,7 +20,7 @@ import time
 
 import torch
 from torch.utils.data import DataLoader
-from transformers import DataCollatorForLanguageModeling
+from transformers import DataCollatorForSeq2Seq
 
 from utils import setup_environment, load_and_prepare_train_and_val_data
 from model import load_peft_model, load_tokenizer
@@ -37,6 +42,10 @@ def parse_args():
                         help="Training steps to run. Must be >=2: Adam allocates its state during the first step.")
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--target_mode", type=str, default="explanation", choices=["explanation", "letter", "answer_explanation"],
+                        help="[generation datasets] which training target to build (same as kvq-tuning.py --target_mode).")
+    parser.add_argument("--max_seq_len", type=int, default=0,
+                        help="Drop rows longer than this (same as kvq-tuning.py --max_seq_len); 0 = keep all.")
     return parser.parse_args()
 
 
@@ -95,21 +104,35 @@ def main():
           f"(grads {n_train*bytes_per/GiB:.2f} GiB + Adam state {2*n_train*bytes_per/GiB:.2f} GiB)")
     report("after model load", idx)
 
-    print("\n--- Building data ---")
-    train_dataset, _ = load_and_prepare_train_and_val_data(tokenizer, [args.dataset_shortcode])
-    collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
+    print("\n--- Building data (same loader/collator path as kvq-tuning.py) ---")
+    train_dataset, _ = load_and_prepare_train_and_val_data(
+        tokenizer, [args.dataset_shortcode], seed=args.seed, answer_only=True,
+        max_seq_len=args.max_seq_len or None, target_mode=args.target_mode)
+    tokenizer.padding_side = "right"
+    collator = DataCollatorForSeq2Seq(tokenizer=tokenizer, padding=True, label_pad_token_id=-100)
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, collate_fn=collator, shuffle=True)
     batches_per_epoch = len(train_loader)
     print(f"{len(train_dataset)} train examples -> {batches_per_epoch} batches/epoch at batch_size={args.batch_size}")
+    # Worst case first: the batch made of the LONGEST rows (per-batch padding means
+    # a random batch is not the memory peak -- this one is).
+    lengths = [len(x) for x in train_dataset["input_ids"]]
+    longest = sorted(range(len(lengths)), key=lambda i: -lengths[i])[:args.batch_size]
+    worst_batch = collator([train_dataset[i] for i in longest])
+    print(f"worst-case batch: {len(longest)} longest rows, padded seq_len {worst_batch['input_ids'].shape[1]}")
 
     optimizer = torch.optim.Adam(trainable, lr=args.lr)
 
     steps = max(2, args.steps)
-    print(f"\n--- Running {steps} training steps (same loop as kvq-tuning.py) ---")
+    print(f"\n--- Running {steps} training steps (same loop as kvq-tuning.py; step 1 = worst-case batch) ---")
     model.train()
     step_times = []
+
+    def _batches():
+        yield worst_batch
+        for b in train_loader:
+            yield b
     try:
-        for i, batch in enumerate(train_loader):
+        for i, batch in enumerate(_batches()):
             if i >= steps:
                 break
             torch.cuda.synchronize(idx)

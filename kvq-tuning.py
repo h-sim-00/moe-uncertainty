@@ -18,7 +18,7 @@ from transformers import DataCollatorForSeq2Seq, get_cosine_schedule_with_warmup
 from utils import setup_environment, seed_everything
 from model import load_peft_model, load_tokenizer
 from model.expert_lora import save_expert_lora, expert_lora_path
-from utils import load_and_prepare_train_and_val_data, is_generation_dataset
+from utils import load_and_prepare_train_and_val_data, loss_mode_label
 
 def train(model, tokenizer, train_loader, val_loader, args):
     """
@@ -161,6 +161,10 @@ def parse_args():
                              "Use for large train sets (medmcqa_gen) so early stopping is not epoch-coarse.")
     parser.add_argument("--max_seq_len", type=int, default=0,
                         help="Drop (never truncate) train/val rows longer than this many tokens; 0 = keep all. Memory guard for long explanations.")
+    parser.add_argument("--target_mode", type=str, default="explanation", choices=["explanation", "letter", "answer_explanation"],
+                        help="[generation datasets only] fine-tuning target: 'explanation' (default; explanation-only loss, the existing "
+                             "recipe), 'letter' (MedMCQA-comparison arm A: MCQA prompt -> gold letter, answer-only loss), "
+                             "'answer_explanation' (arm B: MCQA prompt -> letter + '\\nExplanation:' + explanation, loss on both).")
     return parser.parse_args()
 
 
@@ -187,10 +191,11 @@ def main():
     # instead of rebuilding labels from input_ids. Right padding keeps real-token
     # positions correct during training (eval keeps left).
     train_dataset, val_dataset = load_and_prepare_train_and_val_data(
-        tokenizer, [args.dataset_shortcode], seed=args.seed, answer_only=True, max_seq_len=args.max_seq_len or None)
+        tokenizer, [args.dataset_shortcode], seed=args.seed, answer_only=True, max_seq_len=args.max_seq_len or None,
+        target_mode=args.target_mode)
     tokenizer.padding_side = "right"
     data_collator = DataCollatorForSeq2Seq(tokenizer=tokenizer, padding=True, label_pad_token_id=-100)
-    print(f"--- Loss mode: {'explanation-only (generation)' if is_generation_dataset([args.dataset_shortcode]) else 'answer-only (MCQA)'} ---")
+    print(f"--- Loss mode: {loss_mode_label([args.dataset_shortcode], args.target_mode)} ---")
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, collate_fn=data_collator, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, collate_fn=data_collator)
 

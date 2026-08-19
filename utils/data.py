@@ -6,13 +6,81 @@ from datasets import Dataset
 from typing import List, Tuple
 from transformers import AutoTokenizer
 import random
-from .prompt import multiple_choice_prompt_engineer, generation_prompt_engineer
+from .prompt import multiple_choice_prompt_engineer, generation_prompt_engineer, system_instruction_for_target_mode
 
 # Datasets whose fine-tuning target is FREE-TEXT GENERATION (not a single MCQA
 # option letter). These route through generation_prompt_engineer, get an EOS
 # appended to the target, and use a label-preserving (Seq2Seq) collator so the
 # prompt is masked out of the loss. Everything else stays multiple-choice.
 GENERATION_DATASETS = {"medexqa", "medmcqa_gen"}
+
+# ---------------------------------------------------------------------------
+# target_mode (branch MedMCQA-comparison): what the fine-tuning TARGET of a
+# generation dataset (medmcqa_gen) is. Selected by --target_mode on the three
+# training scripts; "explanation" is the default and reproduces the existing
+# behaviour bit-for-bit.
+#   explanation          generation prompt -> " " + gold explanation + EOS
+#                        (explanation-only loss; what every existing
+#                        MedExQA/MedMCQA adapter and router was trained with)
+#   letter               arm A: MCQA prompt (`letter_question`, ends "Answer:")
+#                        -> bare gold letter, NO EOS -- exactly the corrected
+#                        answer-only recipe of branch exp4-train-ans
+#   answer_explanation   arm B: the SAME MCQA prompt (arm-specific system
+#                        instruction) -> gold letter + "\nExplanation:" + " " +
+#                        gold explanation + EOS; loss on letter AND explanation
+# In both comparison arms the letter is the FIRST target token, so the letter
+# read-out at the answer position is identical across arms.
+# ---------------------------------------------------------------------------
+TARGET_MODES = ("explanation", "letter", "answer_explanation")
+EXPLANATION_MARKER = "\nExplanation:"
+
+
+def loss_mode_label(dataset_shortcodes, target_mode="explanation"):
+    """Human-readable description of which tokens carry the training loss
+    (printed by the training scripts; mirrors the dispatch in
+    load_and_prepare_train_and_val_data)."""
+    if not is_generation_dataset(dataset_shortcodes):
+        return "answer-only (MCQA)"
+    return {
+        "explanation": "explanation-only (generation)",
+        "letter": "answer-only letter (generation dataset, target_mode=letter -- comparison arm A)",
+        "answer_explanation": "letter + explanation + EOS (target_mode=answer_explanation -- comparison arm B)",
+    }[target_mode]
+
+
+def build_target_mode_example(example, tokenizer, target_mode):
+    """Turn one raw generation example (medmcqa_gen / medexqa layout: `question`,
+    `answer` = " " + explanation, `gold_letter`, `letter_question`, `id`) into the
+    prompt-engineered {question, answer, id} dict of the requested comparison arm.
+
+      letter              -> question = MCQA prompt (MCQ system instruction),
+                             answer   = gold letter (bare, e.g. "C")
+      answer_explanation  -> question = MCQA prompt (arm-B system instruction),
+                             answer   = gold letter + "\\nExplanation:" + explanation
+    The caller decides about EOS (answer_explanation gets one, letter does not).
+    Raises if the example does not carry the MCQA fields (non-generation datasets
+    must keep using the plain MCQA path)."""
+    if target_mode not in ("letter", "answer_explanation"):
+        raise ValueError(f"build_target_mode_example: target_mode must be 'letter' or "
+                         f"'answer_explanation', got {target_mode!r}")
+    gold_letter = example.get("gold_letter")
+    letter_question = example.get("letter_question")
+    if not gold_letter or not letter_question:
+        raise ValueError(f"target_mode={target_mode!r} needs `gold_letter` and `letter_question` on every "
+                         f"example (generation datasets only); missing on id={example.get('id')!r}")
+    engineered = multiple_choice_prompt_engineer(
+        {"question": letter_question, "answer": gold_letter, "id": example["id"]},
+        tokenizer=tokenizer,
+        system_instruction=system_instruction_for_target_mode(target_mode),
+    )
+    if target_mode == "letter":
+        target = gold_letter
+    else:
+        exp = example["answer"]                      # " " + gold explanation (loader convention)
+        if not exp.startswith(" "):
+            exp = " " + exp
+        target = f"{gold_letter}{EXPLANATION_MARKER}{exp}"
+    return {"question": engineered["question"], "answer": target, "id": engineered["id"]}
 
 # ---------------------------------------------------------------------------
 # medmcqa_gen (branch MedMCQA): MedMCQA questions whose gold `exp` explanation is
@@ -433,18 +501,29 @@ def _drop_overlong(dataset: Dataset, max_seq_len, name):
 
 
 def load_and_prepare_train_and_val_data(tokenizer: AutoTokenizer, train_dataset_shortcodes: List, seed=42,
-                                        answer_only=False, max_seq_len=None) -> Tuple[Dataset, Dataset]:
+                                        answer_only=False, max_seq_len=None,
+                                        target_mode="explanation") -> Tuple[Dataset, Dataset]:
     """Loads and preprocesses the dataset for causal language modeling.
 
-    Dispatch (three mutually exclusive paths):
-      * GENERATION datasets (see GENERATION_DATASETS): generation prompt template,
+    Dispatch (mutually exclusive paths):
+      * GENERATION datasets (see GENERATION_DATASETS), `target_mode="explanation"`
+        (default): generation prompt template,
         `preprocess_mask_question_for_training(append_eos=True, pad=False)` --
         prompt-masked labels + EOS on the explanation, rows un-padded. This is
-        the exact recipe that produced the existing MedExQA adapters/weights;
-        `answer_only` is irrelevant here (the loss is already target-only).
+        the exact recipe that produced the existing MedExQA/MedMCQA
+        adapters/weights; `answer_only` is irrelevant here (the loss is already
+        target-only).
+      * GENERATION datasets, `target_mode="letter"` (comparison arm A): MCQA
+        prompt from `letter_question` -> bare gold letter, answer-only
+        preprocessor, no EOS (== the corrected exp4-train-ans MCQA recipe).
+      * GENERATION datasets, `target_mode="answer_explanation"` (arm B): the
+        same MCQA prompt (arm-B system instruction) -> letter + "\\nExplanation:"
+        + explanation + EOS, generation preprocessor (loss on letter AND
+        explanation). See TARGET_MODES / build_target_mode_example.
       * MCQA + `answer_only=True`: `preprocess_answer_only_for_training` (prompt
         and answer tokenized separately -> exact answer-only labels).
       * MCQA + `answer_only=False`: legacy full-sequence-padded masking.
+      (`target_mode` other than "explanation" on a non-generation dataset raises.)
     All paths return prompt-masked labels; pair with a labels-preserving collator
     (DataCollatorForSeq2Seq, label_pad_token_id=-100).
     `max_seq_len` (optional): drop (never truncate) train/val rows longer than
@@ -452,8 +531,16 @@ def load_and_prepare_train_and_val_data(tokenizer: AutoTokenizer, train_dataset_
     the number of dropped rows is printed. None/0 = keep everything (default,
     identical to the behaviour that produced the MedExQA weights).
     """
+    if target_mode not in TARGET_MODES:
+        raise ValueError(f"target_mode must be one of {TARGET_MODES}, got {target_mode!r}")
     generation = is_generation_dataset(train_dataset_shortcodes)
+    if target_mode != "explanation" and not generation:
+        raise ValueError(f"target_mode={target_mode!r} is only defined for generation datasets "
+                         f"{sorted(GENERATION_DATASETS)} (they carry gold_letter/letter_question); "
+                         f"got {train_dataset_shortcodes}")
     engineer = generation_prompt_engineer if generation else multiple_choice_prompt_engineer
+    if target_mode != "explanation":
+        engineer = lambda x, tokenizer: build_target_mode_example(x, tokenizer, target_mode)  # noqa: E731
 
     train_raw, val_raw = [], []
     for dataset_shortcode in train_dataset_shortcodes:
@@ -464,12 +551,21 @@ def load_and_prepare_train_and_val_data(tokenizer: AutoTokenizer, train_dataset_
     train_engineered = [engineer(x, tokenizer=tokenizer) for x in train_raw]
     val_engineered = [engineer(x, tokenizer=tokenizer) for x in val_raw]
 
-    if generation:
-        # Generation: append EOS + keep rows un-padded (dynamic Seq2Seq collator).
+    if target_mode == "letter":
+        # Arm A: exact answer-only labels on the bare letter, no EOS (exp4 recipe).
+        train_dataset = preprocess_answer_only_for_training(train_engineered, tokenizer)
+        val_dataset = preprocess_answer_only_for_training(val_engineered, tokenizer)
+        print(f"--- target_mode=letter: MCQA prompt -> gold letter (answer-only loss, no EOS) ---")
+    elif generation:
+        # Generation (explanation / answer_explanation): append EOS + keep rows
+        # un-padded (dynamic Seq2Seq collator).
         train_dataset = preprocess_mask_question_for_training(
             train_engineered, tokenizer, append_eos=True, pad=False)
         val_dataset = preprocess_mask_question_for_training(
             val_engineered, tokenizer, append_eos=True, pad=False)
+        if target_mode == "answer_explanation":
+            print(f"--- target_mode=answer_explanation: MCQA prompt -> letter + '\\nExplanation:' + explanation + EOS "
+                  f"(loss on letter AND explanation) ---")
     else:
         preprocess = preprocess_answer_only_for_training if answer_only else preprocess_mask_question_for_training
         train_dataset = preprocess(train_engineered, tokenizer)
