@@ -18,7 +18,7 @@ from transformers import DataCollatorForSeq2Seq, get_cosine_schedule_with_warmup
 from utils import setup_environment, seed_everything
 from model import load_peft_model, load_tokenizer
 from model.expert_lora import save_expert_lora, expert_lora_path
-from utils import load_and_prepare_train_and_val_data, loss_mode_label
+from utils import load_and_prepare_train_and_val_data, loss_mode_label, add_target_mode_arg
 
 def train(model, tokenizer, train_loader, val_loader, args):
     """
@@ -161,10 +161,7 @@ def parse_args():
                              "Use for large train sets (medmcqa_gen) so early stopping is not epoch-coarse.")
     parser.add_argument("--max_seq_len", type=int, default=0,
                         help="Drop (never truncate) train/val rows longer than this many tokens; 0 = keep all. Memory guard for long explanations.")
-    parser.add_argument("--target_mode", type=str, default="explanation", choices=["explanation", "letter", "answer_explanation"],
-                        help="[generation datasets only] fine-tuning target: 'explanation' (default; explanation-only loss, the existing "
-                             "recipe), 'letter' (MedMCQA-comparison arm A: MCQA prompt -> gold letter, answer-only loss), "
-                             "'answer_explanation' (arm B: MCQA prompt -> letter + '\\nExplanation:' + explanation, loss on both).")
+    add_target_mode_arg(parser)
     return parser.parse_args()
 
 

@@ -99,6 +99,18 @@ def load_peft_model_and_adapter(model_shortcode: str, adapter_path: str, eval_mo
     every downstream stage sees the same Stage-1 model.
     """
     assert model_shortcode in MODEL_SHORTCODE2ID, f"Model shortcode '{model_shortcode}' not defined."
+    if adapter_path is None:
+        # Untuned model (zero-shot rows). PeftModel.from_pretrained(base, None)
+        # crashes, so wrap the base model in a FRESH Q/K/V LoRA instead: LoRA B is
+        # zero-initialised, so in eval mode the forward pass is exactly the base
+        # model, while the object keeps the PeftModel structure
+        # (model.base_model.model.model.layers[i].block_sparse_moe.router) that
+        # every evaluator relies on.
+        print(f"No adapter requested: loading base model {model_shortcode} with a fresh (identity) LoRA wrapper")
+        peft_model = load_peft_model(model_shortcode, finetune_mode="qkv", device_map=device_map)
+        if eval_mode:
+            peft_model.eval()
+        return peft_model
     print(f"Loading base model: {model_shortcode}")
     base_model = load_model(model_shortcode, device_map=device_map)
 

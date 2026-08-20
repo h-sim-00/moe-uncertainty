@@ -22,7 +22,7 @@ import torch
 from torch.utils.data import DataLoader
 from transformers import DataCollatorForSeq2Seq
 
-from utils import setup_environment, load_and_prepare_train_and_val_data
+from utils import setup_environment, load_and_prepare_train_and_val_data, add_target_mode_arg
 from model import load_peft_model, load_tokenizer
 
 
@@ -42,8 +42,7 @@ def parse_args():
                         help="Training steps to run. Must be >=2: Adam allocates its state during the first step.")
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--target_mode", type=str, default="explanation", choices=["explanation", "letter", "answer_explanation"],
-                        help="[generation datasets] which training target to build (same as kvq-tuning.py --target_mode).")
+    add_target_mode_arg(parser)
     parser.add_argument("--max_seq_len", type=int, default=0,
                         help="Drop rows longer than this (same as kvq-tuning.py --max_seq_len); 0 = keep all.")
     return parser.parse_args()

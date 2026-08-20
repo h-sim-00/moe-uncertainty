@@ -5,8 +5,10 @@ Question answered: does training on the explanation AS WELL as the answer
 ANSWER compared with answer-only training (arm A, target_mode=letter)?
 
 So everything here is measured on the answer letter and nothing is generated:
-  * prompt  = the arm's MCQA prompt (system instruction of the arm + the
-              `letter_question` inner text, ends in "Answer:") + assistant header
+  * prompt  = the comparison prompt, IDENTICAL for both arms (COMPARISON_SYSTEM_
+              INSTRUCTION + the `letter_question` inner text, ends in "Answer:")
+              + assistant header; --system_prompt mcq selects the original MCQ
+              instruction for models trained with it (OBQA reference rows)
   * read-out= next-token logits at the last prompt position, restricted to the
               four bare letter tokens A/B/C/D, softmax -> 4-way distribution
               (identical to utils.get_model_predictions / Albus's evaluate.py)
@@ -32,10 +34,8 @@ Methods (rows of the comparison table):
               --prior_source, S=--num_samples MC samples), as evaluate_fcvr.py
 
 Usage:
-  python evaluate_letter.py --dataset_shortcode medmcqa_gen --split val --target_mode letter \
-      --method zero_shot --tag zero-shot --n 50
-  python evaluate_letter.py --dataset_shortcode medmcqa_gen --split test --target_mode answer_explanation \
-      --method fcvr --kvq_adapter_path adapters/granite-medmcqa_gen-armB-ansexp \
+  python evaluate_letter.py --dataset_shortcode medmcqa_gen --split val --method zero_shot --tag zero-shot --n 50
+  python evaluate_letter.py --dataset_shortcode medmcqa_gen --split test --method fcvr --kvq_adapter_path adapters/granite-medmcqa_gen-armB-ansexp \
       --swap_layers 5 6 7 8 19 20 28 29 30 31 --run_suffix armB-ansexp-pretrained-prior-beta0.01 \
       --prior_source pretrained --tag armB-ansexp_fcvr_S35-s42
 Works for plain MCQA datasets too (obqa, ...: prompt = example['question'],
@@ -53,7 +53,7 @@ from tqdm import tqdm
 
 from utils import setup_environment, seed_everything, load_exp_dataset
 from utils import calculate_accuracy, calculate_ece_mce, calculate_nll
-from utils.prompt import multiple_choice_prompt_engineer, system_instruction_for_target_mode
+from utils.prompt import multiple_choice_prompt_engineer, SYSTEM_INSTRUCTIONS
 from model import load_peft_model_and_adapter, load_tokenizer
 from model.adapters import granite_adapter
 from uq_stats import auroc, bootstrap_ci
@@ -67,8 +67,9 @@ def parse_args():
     p.add_argument("--model_shortcode", type=str, default="granite")
     p.add_argument("--dataset_shortcode", type=str, default="medmcqa_gen")
     p.add_argument("--split", type=str, default="test", choices=["val", "test"])
-    p.add_argument("--target_mode", type=str, default="letter", choices=["letter", "answer_explanation"],
-                   help="Which arm's prompt (system instruction) to evaluate under. The read-out is the same.")
+    p.add_argument("--system_prompt", type=str, default="comparison", choices=sorted(SYSTEM_INSTRUCTIONS),
+                   help="'comparison' (default): the shared comparison-arm instruction; 'mcq': the original "
+                        "letter-only instruction (for models trained with it, e.g. the OBQA reference).")
     p.add_argument("--method", type=str, required=True, choices=["zero_shot", "kvq_ft", "det", "fcvr"])
     p.add_argument("--kvq_adapter_path", type=str, default=None, help="Stage-1 adapter (kvq_ft / det / fcvr).")
     p.add_argument("--map_suffix", type=str, default=None,
@@ -124,10 +125,10 @@ def prepare(args):
 # ---------------------------------------------------------------------------
 # prompts
 # ---------------------------------------------------------------------------
-def build_prompts(dataset, tokenizer, target_mode):
+def build_prompts(dataset, tokenizer, system_prompt):
     """-> (prompt_texts, gold_letters, metas). medmcqa_gen/medexqa rows carry
     `letter_question`/`gold_letter`; plain MCQA rows use question/answer."""
-    system = system_instruction_for_target_mode(target_mode)
+    system = SYSTEM_INSTRUCTIONS[system_prompt]
     prompts, golds, metas = [], [], []
     for ex in dataset:
         if ex.get("letter_question") and ex.get("gold_letter"):
@@ -251,10 +252,10 @@ def main():
     if args.n:
         dataset = dataset[:args.n]
     print(f"--- {args.dataset_shortcode}/{args.split}: {len(dataset)} examples | method={args.method} "
-          f"| prompt arm={args.target_mode} ---")
+          f"| system_prompt={args.system_prompt} | seed={args.seed} ---")
 
     model, tokenizer, fcvr_layers = prepare(args)
-    prompts, golds, metas = build_prompts(dataset, tokenizer, args.target_mode)
+    prompts, golds, metas = build_prompts(dataset, tokenizer, args.system_prompt)
     print(f"--- prompt (first example, last 300 chars): ...{prompts[0][-300:]!r}")
 
     r = readout(model, tokenizer, prompts, fcvr_layers, args.batch_size)

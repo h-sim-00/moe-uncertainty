@@ -39,7 +39,7 @@ from transformers import DataCollatorForSeq2Seq
 from utils import setup_environment
 from model import load_tokenizer
 from utils.data import (load_exp_dataset, load_and_prepare_train_and_val_data, is_generation_dataset,
-                        build_target_mode_example, TARGET_MODES)
+                        build_target_mode_example, comparison_eligible_indices, add_target_mode_arg)
 from utils.prompt import multiple_choice_prompt_engineer, generation_prompt_engineer
 
 
@@ -50,8 +50,9 @@ def parse_args():
     p.add_argument("--batch_size", type=int, default=8)
     p.add_argument("--num_batches", type=int, default=4, help="How many val batches to check (0 = all).")
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--target_mode", type=str, default="explanation", choices=list(TARGET_MODES),
-                   help="Same as the training scripts' --target_mode (generation datasets only).")
+    add_target_mode_arg(p)
+    p.add_argument("--max_seq_len", type=int, default=0,
+                   help="Same as the training scripts' --max_seq_len (comparison arms: applies the shared eligible-ID list).")
     return p.parse_args()
 
 
@@ -71,8 +72,16 @@ def main():
 
     # Same call the training scripts make (val split is unshuffled -> row order matches).
     _, val_dataset = load_and_prepare_train_and_val_data(
-        tokenizer, [args.dataset_shortcode], seed=args.seed, answer_only=True, target_mode=args.target_mode)
+        tokenizer, [args.dataset_shortcode], seed=args.seed, answer_only=True,
+        max_seq_len=args.max_seq_len or None, target_mode=args.target_mode)
     _, val_raw, _ = load_exp_dataset(args.dataset_shortcode, seed=args.seed)
+    if arm and args.max_seq_len:
+        # the loader kept only the shared eligible rows -> mirror that here so row order matches
+        keep = comparison_eligible_indices(val_raw, tokenizer, args.max_seq_len)
+        val_raw = [val_raw[i] for i in keep]
+    elif args.max_seq_len:
+        raise SystemExit("--max_seq_len is only supported with a comparison --target_mode in this check "
+                         "(the legacy path drops rows after tokenisation; run without it).")
     val_engineered = [engineer(x, tokenizer=tokenizer) for x in val_raw]
     assert len(val_engineered) == len(val_dataset), "val length mismatch between raw and preprocessed"
 

@@ -9,7 +9,7 @@ from model.adapters import granite_adapter, qwen_adapter, deepseek_adapter
 
 from utils import setup_environment, seed_everything
 from model import load_peft_model_and_adapter, load_tokenizer
-from utils import load_and_prepare_train_and_val_data, loss_mode_label
+from utils import load_and_prepare_train_and_val_data, loss_mode_label, add_target_mode_arg
 
 ADAPTER_MAP = {
     "granite": {
@@ -228,11 +228,7 @@ def parse_args():
                         help="[prior_source=map] Suffix of the MAP router weights dir (router_weights/base/<model>_<dataset>-<suffix>).")
     parser.add_argument("--prior_source", type=str, default="map", choices=["map", "pretrained"],
                         help="Seed FCVR mean_base from fine-tuned MAP routers ('map') or the pre-trained Granite router ('pretrained', paper-faithful).")
-    parser.add_argument("--target_mode", type=str, default="explanation", choices=["explanation", "letter", "answer_explanation"],
-                        help="[generation datasets only] fine-tuning target: 'explanation' (default; explanation-only loss, the existing "
-                             "recipe), 'letter' (MedMCQA-comparison arm A: MCQA prompt -> gold letter, answer-only loss), "
-                             "'answer_explanation' (arm B: MCQA prompt -> letter + '\\nExplanation:' + explanation, loss on both). "
-                             "Must match the Stage-1 adapter's mode.")
+    add_target_mode_arg(parser, "Must match the Stage-1 adapter's mode.")
     return parser.parse_args()
 
 def main():

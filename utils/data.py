@@ -6,7 +6,7 @@ from datasets import Dataset
 from typing import List, Tuple
 from transformers import AutoTokenizer
 import random
-from .prompt import multiple_choice_prompt_engineer, generation_prompt_engineer, system_instruction_for_target_mode
+from .prompt import multiple_choice_prompt_engineer, generation_prompt_engineer, COMPARISON_SYSTEM_INSTRUCTION
 
 # Datasets whose fine-tuning target is FREE-TEXT GENERATION (not a single MCQA
 # option letter). These route through generation_prompt_engineer, get an EOS
@@ -17,22 +17,41 @@ GENERATION_DATASETS = {"medexqa", "medmcqa_gen"}
 # ---------------------------------------------------------------------------
 # target_mode (branch MedMCQA-comparison): what the fine-tuning TARGET of a
 # generation dataset (medmcqa_gen) is. Selected by --target_mode on the three
-# training scripts; "explanation" is the default and reproduces the existing
-# behaviour bit-for-bit.
+# training scripts (add_target_mode_arg); "explanation" is the default and
+# reproduces the existing behaviour bit-for-bit.
 #   explanation          generation prompt -> " " + gold explanation + EOS
 #                        (explanation-only loss; what every existing
 #                        MedExQA/MedMCQA adapter and router was trained with)
-#   letter               arm A: MCQA prompt (`letter_question`, ends "Answer:")
-#                        -> bare gold letter, NO EOS -- exactly the corrected
-#                        answer-only recipe of branch exp4-train-ans
-#   answer_explanation   arm B: the SAME MCQA prompt (arm-specific system
-#                        instruction) -> gold letter + "\nExplanation:" + " " +
-#                        gold explanation + EOS; loss on letter AND explanation
-# In both comparison arms the letter is the FIRST target token, so the letter
-# read-out at the answer position is identical across arms.
+#   letter               arm A: comparison prompt (`letter_question`, ends
+#                        "Answer:", COMPARISON_SYSTEM_INSTRUCTION) -> bare gold
+#                        letter, NO EOS -- the corrected answer-only recipe of
+#                        branch exp4-train-ans
+#   answer_explanation   arm B: the IDENTICAL prompt -> gold letter +
+#                        "\nExplanation:" + " " + gold explanation + EOS; loss on
+#                        letter AND explanation
+# The prompt is the same in both arms and the letter is the FIRST target token,
+# so only the target differs and the letter read-out is identical across arms.
+# With max_seq_len, BOTH arms keep exactly the rows whose answer_explanation
+# sequence fits (comparison_eligible_indices), so they train on the same rows.
 # ---------------------------------------------------------------------------
 TARGET_MODES = ("explanation", "letter", "answer_explanation")
+COMPARISON_MODES = ("letter", "answer_explanation")
 EXPLANATION_MARKER = "\nExplanation:"
+# Artefact / result-file suffix of each comparison arm (adapters, router weights,
+# evaluate_letter.py tags). The single place this mapping lives in python; the
+# overnight driver mirrors it in bash (arm_sfx).
+TARGET_MODE_SUFFIX = {"letter": "armA-letter", "answer_explanation": "armB-ansexp"}
+TARGET_MODE_HELP = ("[generation datasets only] fine-tuning target: 'explanation' (default; explanation-only "
+                    "loss, the existing recipe), 'letter' (MedMCQA-comparison arm A: comparison prompt -> gold "
+                    "letter, answer-only loss), 'answer_explanation' (arm B: same prompt -> letter + "
+                    "'\\nExplanation:' + explanation, loss on both).")
+
+
+def add_target_mode_arg(parser, extra_help=""):
+    """The one --target_mode argparse definition shared by every script."""
+    parser.add_argument("--target_mode", type=str, default="explanation", choices=list(TARGET_MODES),
+                        help=TARGET_MODE_HELP + (" " + extra_help if extra_help else ""))
+    return parser
 
 
 def loss_mode_label(dataset_shortcodes, target_mode="explanation"):
@@ -43,7 +62,7 @@ def loss_mode_label(dataset_shortcodes, target_mode="explanation"):
         return "answer-only (MCQA)"
     return {
         "explanation": "explanation-only (generation)",
-        "letter": "answer-only letter (generation dataset, target_mode=letter -- comparison arm A)",
+        "letter": "answer-only letter (target_mode=letter -- comparison arm A)",
         "answer_explanation": "letter + explanation + EOS (target_mode=answer_explanation -- comparison arm B)",
     }[target_mode]
 
@@ -53,16 +72,15 @@ def build_target_mode_example(example, tokenizer, target_mode):
     `answer` = " " + explanation, `gold_letter`, `letter_question`, `id`) into the
     prompt-engineered {question, answer, id} dict of the requested comparison arm.
 
-      letter              -> question = MCQA prompt (MCQ system instruction),
-                             answer   = gold letter (bare, e.g. "C")
-      answer_explanation  -> question = MCQA prompt (arm-B system instruction),
-                             answer   = gold letter + "\\nExplanation:" + explanation
+    The prompt is the SAME for both arms (comparison prompt = `letter_question`
+    wrapped with COMPARISON_SYSTEM_INSTRUCTION); only the target differs:
+      letter              -> answer = gold letter (bare, e.g. "C")
+      answer_explanation  -> answer = gold letter + "\\nExplanation:" + explanation
     The caller decides about EOS (answer_explanation gets one, letter does not).
     Raises if the example does not carry the MCQA fields (non-generation datasets
     must keep using the plain MCQA path)."""
-    if target_mode not in ("letter", "answer_explanation"):
-        raise ValueError(f"build_target_mode_example: target_mode must be 'letter' or "
-                         f"'answer_explanation', got {target_mode!r}")
+    if target_mode not in COMPARISON_MODES:
+        raise ValueError(f"build_target_mode_example: target_mode must be one of {COMPARISON_MODES}, got {target_mode!r}")
     gold_letter = example.get("gold_letter")
     letter_question = example.get("letter_question")
     if not gold_letter or not letter_question:
@@ -70,8 +88,7 @@ def build_target_mode_example(example, tokenizer, target_mode):
                          f"example (generation datasets only); missing on id={example.get('id')!r}")
     engineered = multiple_choice_prompt_engineer(
         {"question": letter_question, "answer": gold_letter, "id": example["id"]},
-        tokenizer=tokenizer,
-        system_instruction=system_instruction_for_target_mode(target_mode),
+        tokenizer=tokenizer, system_instruction=COMPARISON_SYSTEM_INSTRUCTION,
     )
     if target_mode == "letter":
         target = gold_letter
@@ -81,6 +98,47 @@ def build_target_mode_example(example, tokenizer, target_mode):
             exp = " " + exp
         target = f"{gold_letter}{EXPLANATION_MARKER}{exp}"
     return {"question": engineered["question"], "answer": target, "id": engineered["id"]}
+
+
+def comparison_eligible_indices(raw_rows, tokenizer, max_seq_len):
+    """Indices of `raw_rows` whose LONGER (answer_explanation) training sequence --
+    prompt + letter + "\\nExplanation:" + explanation + EOS, tokenized exactly as the
+    generation preprocessor does -- has <= max_seq_len tokens. Both comparison arms
+    apply this one list, so arm A never keeps a row arm B drops. None/0 = all rows."""
+    if not max_seq_len:
+        return list(range(len(raw_rows)))
+    eos = tokenizer.eos_token or ""
+    keep = []
+    for i, ex in enumerate(raw_rows):
+        e = build_target_mode_example(ex, tokenizer, "answer_explanation")
+        n = len(tokenizer(e["question"] + e["answer"] + eos, add_special_tokens=False).input_ids)
+        if n <= max_seq_len:
+            keep.append(i)
+    return keep
+
+
+def eligible_ids_path(dataset_shortcode, max_seq_len, split_name, seed=42):
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(repo_root, "splits", f"{dataset_shortcode}-comparison-eligible-{split_name}-maxseq{max_seq_len}-seed{seed}.txt")
+
+
+def _freeze_eligible_ids(dataset_shortcode, split_name, raw_rows, keep, max_seq_len, seed):
+    """Write the eligible-ID list once (splits/...txt); on later calls verify the
+    in-memory list is identical (so arm A and arm B provably used the same rows)."""
+    path = eligible_ids_path(dataset_shortcode, max_seq_len, split_name, seed)
+    ids = [str(raw_rows[i]["id"]) for i in keep]
+    if os.path.exists(path):
+        frozen = [l.rstrip("\n") for l in open(path, encoding="utf-8") if l.strip()]
+        if frozen != ids:
+            raise RuntimeError(f"eligible-ID list for {split_name} differs from the frozen one at {path} "
+                               f"({len(ids)} vs {len(frozen)} ids). Both arms must use the same rows; "
+                               f"delete the file only if you MEAN to move the list.")
+        print(f"  [{split_name}] eligible-ID list verified against {path} ({len(ids)} ids)")
+    else:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("\n".join(ids) + ("\n" if ids else ""))
+        print(f"  [{split_name}] eligible-ID list written -> {path} ({len(ids)} ids)")
 
 # ---------------------------------------------------------------------------
 # medmcqa_gen (branch MedMCQA): MedMCQA questions whose gold `exp` explanation is
@@ -513,13 +571,17 @@ def load_and_prepare_train_and_val_data(tokenizer: AutoTokenizer, train_dataset_
         the exact recipe that produced the existing MedExQA/MedMCQA
         adapters/weights; `answer_only` is irrelevant here (the loss is already
         target-only).
-      * GENERATION datasets, `target_mode="letter"` (comparison arm A): MCQA
-        prompt from `letter_question` -> bare gold letter, answer-only
-        preprocessor, no EOS (== the corrected exp4-train-ans MCQA recipe).
+      * GENERATION datasets, `target_mode="letter"` (comparison arm A):
+        comparison prompt (`letter_question` + COMPARISON_SYSTEM_INSTRUCTION)
+        -> bare gold letter, answer-only preprocessor, no EOS (== the corrected
+        exp4-train-ans MCQA recipe).
       * GENERATION datasets, `target_mode="answer_explanation"` (arm B): the
-        same MCQA prompt (arm-B system instruction) -> letter + "\\nExplanation:"
-        + explanation + EOS, generation preprocessor (loss on letter AND
-        explanation). See TARGET_MODES / build_target_mode_example.
+        IDENTICAL prompt -> letter + "\\nExplanation:" + explanation + EOS,
+        generation preprocessor (loss on letter AND explanation).
+        With `max_seq_len`, both arms keep the same rows: those whose
+        answer_explanation sequence fits (comparison_eligible_indices; the ID
+        list is frozen under splits/ and verified on every later call).
+        See TARGET_MODES / build_target_mode_example.
       * MCQA + `answer_only=True`: `preprocess_answer_only_for_training` (prompt
         and answer tokenized separately -> exact answer-only labels).
       * MCQA + `answer_only=False`: legacy full-sequence-padded masking.
@@ -548,6 +610,21 @@ def load_and_prepare_train_and_val_data(tokenizer: AutoTokenizer, train_dataset_
         train_raw.extend(train_raw_curr)
         val_raw.extend(val_raw_curr)
 
+    comparison = target_mode in COMPARISON_MODES
+    if comparison and max_seq_len:
+        # ONE eligible-ID list for both arms, computed from the LONGER
+        # (answer_explanation) sequence and frozen on disk, so arm A and arm B
+        # train/validate on exactly the same rows whatever the target.
+        ds_name = "+".join(train_dataset_shortcodes)
+        keep_tr = comparison_eligible_indices(train_raw, tokenizer, max_seq_len)
+        keep_va = comparison_eligible_indices(val_raw, tokenizer, max_seq_len)
+        print(f"--- comparison eligibility (answer+explanation sequence <= {max_seq_len} tokens): "
+              f"train {len(keep_tr)}/{len(train_raw)}, val {len(keep_va)}/{len(val_raw)} rows kept ---")
+        _freeze_eligible_ids(ds_name, "train", train_raw, keep_tr, max_seq_len, seed)
+        _freeze_eligible_ids(ds_name, "val", val_raw, keep_va, max_seq_len, seed)
+        train_raw = [train_raw[i] for i in keep_tr]
+        val_raw = [val_raw[i] for i in keep_va]
+
     train_engineered = [engineer(x, tokenizer=tokenizer) for x in train_raw]
     val_engineered = [engineer(x, tokenizer=tokenizer) for x in val_raw]
 
@@ -555,7 +632,7 @@ def load_and_prepare_train_and_val_data(tokenizer: AutoTokenizer, train_dataset_
         # Arm A: exact answer-only labels on the bare letter, no EOS (exp4 recipe).
         train_dataset = preprocess_answer_only_for_training(train_engineered, tokenizer)
         val_dataset = preprocess_answer_only_for_training(val_engineered, tokenizer)
-        print(f"--- target_mode=letter: MCQA prompt -> gold letter (answer-only loss, no EOS) ---")
+        print("--- target_mode=letter: comparison prompt -> gold letter (answer-only loss, no EOS) ---")
     elif generation:
         # Generation (explanation / answer_explanation): append EOS + keep rows
         # un-padded (dynamic Seq2Seq collator).
@@ -564,15 +641,19 @@ def load_and_prepare_train_and_val_data(tokenizer: AutoTokenizer, train_dataset_
         val_dataset = preprocess_mask_question_for_training(
             val_engineered, tokenizer, append_eos=True, pad=False)
         if target_mode == "answer_explanation":
-            print(f"--- target_mode=answer_explanation: MCQA prompt -> letter + '\\nExplanation:' + explanation + EOS "
-                  f"(loss on letter AND explanation) ---")
+            print("--- target_mode=answer_explanation: comparison prompt -> letter + '\\nExplanation:' + explanation + EOS "
+                  "(loss on letter AND explanation) ---")
     else:
         preprocess = preprocess_answer_only_for_training if answer_only else preprocess_mask_question_for_training
         train_dataset = preprocess(train_engineered, tokenizer)
         val_dataset = preprocess(val_engineered, tokenizer)
 
-    train_dataset = _drop_overlong(train_dataset, max_seq_len, "train")
-    val_dataset = _drop_overlong(val_dataset, max_seq_len, "val")
+    if not comparison:
+        # Legacy per-arm length filter (explanation / MCQA). The comparison arms
+        # were already filtered above on the shared list; _drop_overlong would be
+        # a no-op for answer_explanation and must NOT run for letter.
+        train_dataset = _drop_overlong(train_dataset, max_seq_len, "train")
+        val_dataset = _drop_overlong(val_dataset, max_seq_len, "val")
 
     print(f"Datasets '{train_dataset_shortcodes}' loaded and preprocessed.")
     print(f"Train samples: {len(train_dataset)}, Eval samples: {len(val_dataset)}")

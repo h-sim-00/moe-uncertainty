@@ -8,33 +8,25 @@ MCQ_SYSTEM_INSTRUCTION = (
     "Respond with ONLY the letter of the correct option, for example, 'A', 'B', 'C', or 'D'."
 )
 
-# System instruction of arm B ("answer_explanation") of the MedMCQA comparison
-# (branch MedMCQA-comparison): the user turn is the SAME MCQA prompt (ends in
-# "Answer:"), the assistant target is "<letter>\nExplanation: <gold explanation>".
-# The letter is the first target token in both arms, so the letter read-out is
-# identical across arms; only the system instruction and the target differ.
-ANSWER_EXPLANATION_SYSTEM_INSTRUCTION = (
+# System instruction of the MedMCQA comparison (branch MedMCQA-comparison),
+# used by BOTH arms (letter-only and letter+explanation) at training and at
+# evaluation, so the prompt is identical across arms and only the TARGET differs.
+# The user turn is the MCQA prompt (ends in "Answer:"); the assistant target is
+# "<letter>" (arm A) or "<letter>\nExplanation: <gold explanation>" (arm B).
+# Supervisor's wording: the prompt asks for an answer and an explanation.
+COMPARISON_SYSTEM_INSTRUCTION = (
     "You are a multiple-choice quiz answer generator. "
     "First respond with ONLY the letter of the correct option, for example, 'A', 'B', 'C', or 'D'. "
     "Then, on a new line beginning with 'Explanation:', explain the reasoning behind that answer."
 )
 
-# target_mode (utils/data.py::load_and_prepare_train_and_val_data) -> system instruction
-# used for the MCQA-style prompt of that arm.
-TARGET_MODE_SYSTEM_INSTRUCTION = {
-    "letter": MCQ_SYSTEM_INSTRUCTION,
-    "answer_explanation": ANSWER_EXPLANATION_SYSTEM_INSTRUCTION,
+# Named system instructions selectable at evaluation time (evaluate_letter.py
+# --system_prompt): 'comparison' for the comparison arms, 'mcq' for models that
+# were trained with the original MCQ instruction (e.g. the OBQA reference).
+SYSTEM_INSTRUCTIONS = {
+    "comparison": COMPARISON_SYSTEM_INSTRUCTION,
+    "mcq": MCQ_SYSTEM_INSTRUCTION,
 }
-
-
-def system_instruction_for_target_mode(target_mode):
-    """System instruction of the MCQA-style prompt for a comparison arm
-    ('letter' | 'answer_explanation'). Raises on anything else."""
-    try:
-        return TARGET_MODE_SYSTEM_INSTRUCTION[target_mode]
-    except KeyError:
-        raise ValueError(f"no MCQA-style system instruction for target_mode={target_mode!r}; "
-                         f"expected one of {sorted(TARGET_MODE_SYSTEM_INSTRUCTION)}")
 
 
 def multiple_choice_prompt_engineer(
@@ -47,7 +39,7 @@ def multiple_choice_prompt_engineer(
     Preprocess a single example to form the input prompt.
     Returns a dictionary with input text and the correct answer.
     `system_instruction` (optional) overrides the default MCQ system prompt
-    (used by the arm-B "answer_explanation" prompt); None = unchanged behaviour.
+    (the comparison arms pass COMPARISON_SYSTEM_INSTRUCTION); None = unchanged behaviour.
     """
 
     SYSTEM_INSTRUCTION = system_instruction if system_instruction is not None else MCQ_SYSTEM_INSTRUCTION

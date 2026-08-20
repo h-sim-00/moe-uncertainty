@@ -67,7 +67,11 @@ from .data import (
     is_generation_dataset,
     GENERATION_DATASETS,
     TARGET_MODES,
+    COMPARISON_MODES,
+    TARGET_MODE_SUFFIX,
+    add_target_mode_arg,
     build_target_mode_example,
+    comparison_eligible_indices,
     loss_mode_label,
 )
 
@@ -75,9 +79,9 @@ from .prompt import (
     multi_shot_prompt_engineer,
     multiple_choice_prompt_engineer,
     generation_prompt_engineer,
-    system_instruction_for_target_mode,
     MCQ_SYSTEM_INSTRUCTION,
-    ANSWER_EXPLANATION_SYSTEM_INSTRUCTION,
+    COMPARISON_SYSTEM_INSTRUCTION,
+    SYSTEM_INSTRUCTIONS,
     parse_mcqa_question,
     render_inner,
     canonicalise_inner,
