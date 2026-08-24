@@ -1,3 +1,5 @@
+import os
+
 from transformers import PreTrainedModel
 from peft import LoraConfig, get_peft_model, TaskType, PeftModel
 
@@ -86,6 +88,15 @@ def load_peft_model(model_shortcode: str, finetune_mode: str, r: int = 64, lora_
             lora_alpha=16,
             lora_dropout=lora_dropout,
         )
+
+    # Opt-in via GRADIENT_CHECKPOINTING=1: recomputes activations in backward,
+    # cutting activation memory enough to fit arm B (bs=4, max_seq_len 768) on a
+    # 44-46 GiB card at ~25-35% speed cost. Mathematically identical training.
+    if os.environ.get("GRADIENT_CHECKPOINTING", "0") == "1":
+        peft_model.config.use_cache = False
+        peft_model.enable_input_require_grads()
+        peft_model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+        print("--- Gradient checkpointing ENABLED (GRADIENT_CHECKPOINTING=1) ---")
 
     peft_model.print_trainable_parameters()
 
