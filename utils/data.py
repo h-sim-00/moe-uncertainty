@@ -713,12 +713,19 @@ def write_split_manifest(dataset_shortcode, train, val, test, path):
 def verify_split_manifest(dataset_shortcode, train, val, test, seed=42, path=None):
     """Check the in-memory derived split against the frozen manifest.
 
-    * manifest present  -> every example must be in the recorded split, and the
-      per-split counts must match; otherwise raise (the split moved: RNG order,
-      dedup, or upstream data changed). Set <DATASET>_SKIP_MANIFEST=1 to bypass.
+
+        * manifest present  -> the multiset of (qhash, split) pairs must match the
+      manifest exactly; otherwise raise (the split moved: RNG order, dedup, or
+      upstream data changed). Set <DATASET>_SKIP_MANIFEST=1 to bypass.
     * manifest absent   -> print how to create it (write-<dataset>-split-manifest.py).
+
+    Duplicate question texts are tolerated: rows are compared as a multiset of
+    (qhash, split) pairs, so datasets whose loader does not dedup (obqa_gen
+    mirrors the legacy obqa pool byte-for-byte, repeats included) verify as
+    long as every copy stays in its recorded split with the same multiplicity.
     """
     import csv as _csv
+    from collections import Counter
     label = _MANIFEST_LABEL.get(dataset_shortcode, dataset_shortcode)
     env = _skip_manifest_env(dataset_shortcode)
     path = path or split_manifest_path(dataset_shortcode, seed)
@@ -730,28 +737,41 @@ def verify_split_manifest(dataset_shortcode, train, val, test, seed=42, path=Non
               f"`python {_MANIFEST_WRITER.get(dataset_shortcode, 'write-<dataset>-split-manifest.py')}` "
               f"once and commit it to freeze the split.")
         return
-    recorded = {}
+    recorded = Counter()
     with open(path, newline="", encoding="utf-8") as f:
         for row in _csv.DictReader(f):
-            recorded[row["qhash"]] = row["split"]
-    mismatches, counts = [], {"train": 0, "val": 0, "test": 0}
+            recorded[(row["qhash"], row["split"])] += 1
+    inmem, snippet = Counter(), {}
     for split_name, rows in (("train", train), ("val", val), ("test", test)):
         for ex in rows:
-            counts[split_name] += 1
-            got = recorded.get(example_hash(ex))
-            if got != split_name:
-                mismatches.append((split_name, got, ex["question"][:60]))
-    rec_counts = {s: sum(1 for v in recorded.values() if v == s) for s in counts}
-    if mismatches or rec_counts != counts:
-        head = "\n".join(f"    in-memory={a} manifest={b}: {q!r}" for a, b, q in mismatches[:5])
+            h = example_hash(ex)
+            inmem[(h, split_name)] += 1
+            snippet.setdefault(h, ex["question"][:60])
+    if inmem != recorded:
+        counts = {s: sum(n for (_, sp), n in inmem.items() if sp == s) for s in ("train", "val", "test")}
+        rec_counts = {s: sum(n for (_, sp), n in recorded.items() if sp == s) for s in ("train", "val", "test")}
+        diffs = [(h, sp, inmem.get((h, sp), 0), recorded.get((h, sp), 0))
+                 for (h, sp) in sorted(set(inmem) | set(recorded))
+                 if inmem.get((h, sp), 0) != recorded.get((h, sp), 0)]
+        head = "\n".join(f"    qhash={h} split={sp}: in-memory x{a} vs manifest x{b}: {snippet.get(h, '?')!r}"
+                         for h, sp, a, b in diffs[:5])
         raise RuntimeError(
             f"{label} derived split does not match the frozen manifest {path}: "
-            f"{len(mismatches)} misassigned example(s); counts in-memory={counts} manifest={rec_counts}.\n"
+            f"{len(diffs)} differing (qhash, split) entries; counts in-memory={counts} manifest={rec_counts}.\n"
             f"{head}\nThe split moved (RNG order / dedup / upstream data change). Do NOT proceed with "
             f"val/test-dependent runs; investigate, or set {env}=1 to bypass knowingly."
         )
+    counts = {s: sum(n for (_, sp), n in inmem.items() if sp == s) for s in ("train", "val", "test")}
+    n_dup = sum(n - 1 for n in inmem.values() if n > 1)
+    splits_by_hash = {}
+    for (h, sp), _n in inmem.items():
+        splits_by_hash.setdefault(h, set()).add(sp)
+    n_leak = sum(1 for ss in splits_by_hash.values() if len(ss) > 1)
+    dup_note = f"; {n_dup} duplicate-question row(s) tolerated" if n_dup else ""
+    if n_leak:
+        dup_note += f"; WARNING: {n_leak} question text(s) appear in more than one split (upstream data; frozen as-is)"
     print(f"  {label}: split matches frozen manifest ({path}); "
-          f"train={counts['train']} val={counts['val']} test={counts['test']}")
+          f"train={counts['train']} val={counts['val']} test={counts['test']}{dup_note}")
 
 
 # Backward-compatible MedExQA wrappers (write-medexqa-split-manifest.py imports these).

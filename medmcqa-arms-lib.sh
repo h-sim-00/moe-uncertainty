@@ -23,9 +23,9 @@ on_error() {
     local exit_code=$? line=$1
     echo ""; echo "############################################################"
     echo "# FAILED at line ${line} (exit ${exit_code}) -- ${STEP:-unknown step}"
-    echo "# Full log: ${LOG}   (fix, then: RESUME=1 bash run-overnight-medmcqa-arms.sh)"
+    echo "# Full log: ${LOG}   (fix, then: RESUME=1 bash $(basename "$0"))"
     echo "############################################################"
-    notify error "MedMCQA-arms run FAILED: ${STEP:-unknown step}" \
+    notify error "$(basename "$0" .sh) FAILED: ${STEP:-unknown step}" \
         "Host $(hostname), run ${RUN_TAG}, exit ${exit_code} at line ${line}. Log: ${LOG}"
     exit "$exit_code"
 }
