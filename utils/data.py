@@ -12,7 +12,7 @@ from .prompt import multiple_choice_prompt_engineer, generation_prompt_engineer,
 # option letter). These route through generation_prompt_engineer, get an EOS
 # appended to the target, and use a label-preserving (Seq2Seq) collator so the
 # prompt is masked out of the loss. Everything else stays multiple-choice.
-GENERATION_DATASETS = {"medexqa", "medmcqa_gen"}
+GENERATION_DATASETS = {"medexqa", "medmcqa_gen", "obqa_gen"}
 
 # ---------------------------------------------------------------------------
 # target_mode (branch MedMCQA-comparison): what the fine-tuning TARGET of a
@@ -166,6 +166,13 @@ MEDMCQA_GEN_MAX_EXP_WORDS = 160   # ~<=256 Granite tokens incl. medical sub-word
 # canonicalisation / format-control logic in the OoD bridge test applies to both.
 GENERATION_INNER_TEMPLATE = "Question: {q}\nOptions:\n{opts}\n\nExplain the reasoning for the correct answer."
 MCQA_INNER_TEMPLATE = "Question: {q}\nChoices:\n{opts}\nAnswer:"
+
+# obqa_gen (branch OBQA-comparison): OpenBookQA with the gold science fact
+# (`fact1`, HF "additional" config) as the explanation target. fact1 is short
+# ("the sun is the source of energy for physical cycles on Earth" ~10 words),
+# so the MedMCQA bounds (10-160) would reject nearly every row.
+OBQA_GEN_MIN_EXP_WORDS = 3
+OBQA_GEN_MAX_EXP_WORDS = 60
 
 
 def is_generation_dataset(shortcodes):
@@ -667,9 +674,10 @@ def load_and_prepare_train_and_val_data(tokenizer: AutoTokenizer, train_dataset_
 # and raises if the split moved. The medexqa_* names below are kept as thin
 # wrappers so existing callers / the MedExQA manifest file are unchanged.
 # ---------------------------------------------------------------------------
-_MANIFEST_LABEL = {"medexqa": "MedExQA", "medmcqa_gen": "MedMCQA-gen"}
+_MANIFEST_LABEL = {"medexqa": "MedExQA", "medmcqa_gen": "MedMCQA-gen", "obqa_gen": "OBQA-gen"}
 _MANIFEST_WRITER = {"medexqa": "write-medexqa-split-manifest.py",
-                    "medmcqa_gen": "write-medmcqa-split-manifest.py"}
+                    "medmcqa_gen": "write-medmcqa-split-manifest.py",
+                    "obqa_gen": "write-obqa-split-manifest.py"}
 
 
 def split_manifest_path(dataset_shortcode, seed=42):
@@ -902,6 +910,73 @@ def _load_medmcqa_gen(seed):
     return train_dataset, validation_dataset, test_dataset
 
 
+def _load_obqa_gen(seed):
+    """OBQA with the gold science fact (`fact1`) as the free-text explanation
+    target (branch OBQA-comparison). Loads the HF "additional" config -- same
+    rows/order as "main", plus `fact1` -- and replicates the legacy `obqa`
+    split protocol byte-for-byte (pool = train split + validation split, drop
+    only invalid answerKey, [:5050], last 50 = val, first 5000 = train, test =
+    official test), so the train pool matches what the frozen exp4-train-ans
+    arm-A adapter (adapters/granite-obqa-ansmask) was trained on and the 50 val
+    rows are unseen by both arms. Deterministic: no RNG (`seed` only names the
+    manifest). `letter_question` is byte-identical to the legacy reformat_obqa
+    prompt. The fact1 word-count filter ([OBQA_GEN_MIN_EXP_WORDS,
+    OBQA_GEN_MAX_EXP_WORDS]) runs AFTER the split carve and only on train/val:
+    fact1 is unused at eval, and filtering before the [:5050] slice would shift
+    the pool relative to exp4. write-obqa-split-manifest.py freezes the split
+    and cross-checks it against the legacy `obqa` loader."""
+    dataset = datasets.load_dataset("openbookqa", "additional")
+
+    def reformat(example, split_name):
+        labels = example["choices"]["label"]
+        question = example.get("question_stem")
+        choices = example["choices"]["text"]
+        answer_key = example["answerKey"]
+        if answer_key not in labels:
+            return None
+        opts = "\n".join(f"{label}. {text}" for label, text in zip(labels, choices))
+        return {
+            "question": GENERATION_INNER_TEMPLATE.format(q=question, opts=opts),
+            "answer": " " + str(example.get("fact1") or "").strip(),
+            "id": f"obqa_gen_{split_name}_{example['id']}",
+            "explanation_2": "",
+            "gold_letter": answer_key,
+            "letter_question": MCQA_INNER_TEMPLATE.format(q=question, opts=opts),
+        }
+
+    train_pool = ([reformat(ex, "train") for ex in dataset["train"]]
+                  + [reformat(ex, "validation") for ex in dataset["validation"]])
+    train_pool = [r for r in train_pool if r is not None][:5050]
+    validation_dataset = train_pool[-50:]
+    train_dataset = train_pool[:-50]
+    test_dataset = [r for ex in dataset["test"] if (r := reformat(ex, "test")) is not None]
+
+    def fact1_filter(rows, split_name):
+        funnel = {"rows": len(rows), "kept": 0, "no_fact1": 0, "fact1_too_short": 0, "fact1_too_long": 0}
+        out = []
+        for r in rows:
+            n_words = len(r["answer"].split())
+            if not r["answer"].strip():
+                funnel["no_fact1"] += 1
+            elif n_words < OBQA_GEN_MIN_EXP_WORDS:
+                funnel["fact1_too_short"] += 1
+            elif n_words > OBQA_GEN_MAX_EXP_WORDS:
+                funnel["fact1_too_long"] += 1
+            else:
+                out.append(r); funnel["kept"] += 1
+        print(f"  OBQA-gen [{split_name}] fact1 filter funnel: {funnel}")
+        return out
+
+    train_dataset = fact1_filter(train_dataset, "train")
+    validation_dataset = fact1_filter(validation_dataset, "val")
+    print(f"  OBQA-gen [test] fact1 filter NOT applied ({len(test_dataset)} rows; fact1 unused at eval)")
+
+    if len(train_dataset) < 4000 or len(validation_dataset) < 20 or len(test_dataset) < 400:
+        raise ValueError(f"OBQA-gen: unexpectedly small split after filtering: "
+                         f"train={len(train_dataset)} val={len(validation_dataset)} test={len(test_dataset)}")
+    return train_dataset, validation_dataset, test_dataset
+
+
 def load_exp_dataset(dataset_shortcode, seed=42, split=None):
     """
     Loads and processes one of the six specified experimental datasets with
@@ -910,7 +985,8 @@ def load_exp_dataset(dataset_shortcode, seed=42, split=None):
     Args:
         dataset_shortcode (str): One of 'obqa', 'arc_c', 'arc_e', 'sciq',
                                  'mmlu_law', 'medmcqa_med' (MCQA) or the
-                                 generation sets 'medexqa', 'medmcqa_gen'.
+                                 generation sets 'medexqa', 'medmcqa_gen',
+                                 'obqa_gen'.
         seed (int): Random seed for shuffling and sampling.
         split (str, optional): If specified, returns only the 'train', 
                                'validation', or 'test' split. 
@@ -1151,16 +1227,20 @@ def load_exp_dataset(dataset_shortcode, seed=42, split=None):
     elif dataset_shortcode == "medmcqa_gen":
         train_dataset, validation_dataset, test_dataset = _load_medmcqa_gen(seed)
 
+    elif dataset_shortcode == "obqa_gen":
+        train_dataset, validation_dataset, test_dataset = _load_obqa_gen(seed)
+
     else:
         raise ValueError(f"Dataset '{dataset_shortcode}' not supported by load_exp_dataset.")
 
-    if dataset_shortcode != "medmcqa_gen":
+    if dataset_shortcode not in ("medmcqa_gen", "obqa_gen"):
         # Generic tail: the last 50 train rows become the val set. medmcqa_gen
-        # builds its own (larger, stratified) val set above.
+        # builds its own (larger, stratified) val set above; obqa_gen carves its
+        # own last-50 val BEFORE the fact1 filter (exp4 pool parity).
         validation_dataset = train_dataset[-50:]
         train_dataset = train_dataset[:-50]
 
-    if dataset_shortcode in ("medexqa", "medmcqa_gen"):
+    if dataset_shortcode in ("medexqa", "medmcqa_gen", "obqa_gen"):
         verify_split_manifest(dataset_shortcode, train_dataset, validation_dataset, test_dataset, seed=seed)
 
     print(f"Dataset '{dataset_shortcode}' processed: Train={len(train_dataset)}, Val={len(validation_dataset)}, Test={len(test_dataset)}")

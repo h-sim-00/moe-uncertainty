@@ -16,11 +16,21 @@ This is deliberately separate from ``evaluate_letter.py``:
 
 Protocol
 --------
-* ID: frozen ``medmcqa_gen`` split (default: test, data seed 42).
-* OoD: distinct-source datasets such as MedExQA, OBQA, ARC, SciQ, and
-  MMLU-Law. ``medmcqa_med`` is refused because it is sampled from the same
-  upstream MedMCQA corpus and overlaps the training distribution.
-* Prompt: the comparison prompt used by BOTH arms.
+* ID: a registered comparison anchor (``--id_dataset``): frozen ``medmcqa_gen``
+  (default) or ``obqa_gen`` (branch OBQA-comparison). The per-dataset arm
+  registry (``ARM_SETUP``) carries each arm's adapter/FCVR paths, the dataset
+  shortcode its FCVR weights were trained under, and its system prompt.
+* OoD: distinct-source datasets. Same-corpus shortcodes (``medmcqa_med`` for a
+  MedMCQA anchor, ``obqa`` for an OBQA anchor) are refused because they overlap
+  the training distribution.
+* Prompt: each arm's own training-time system prompt. For medmcqa_gen both
+  arms share the comparison prompt; for obqa_gen arm A keeps the FROZEN
+  exp4-train-ans Stage-1 adapter (granite-obqa-ansmask, plain MCQ prompt) with
+  FCVR routers retrained under the corrected KL mask (exp4's originals averaged
+  padding into the KL; suffix ansmask-klattn-...), so the arms differ in prompt
+  as well as target -- the accepted confound of branch OBQA-comparison -- and
+  the cross-arm prompt-length guard is only enforced when the arms share a
+  system prompt.
 * Read-out: final predictive position, averaged across the ten FCVR layers.
 * Primary signal: ``ilv_last = mean_layer tr(L L^T) = mean_layer ||L||_F^2``.
 * Paper baseline: routing Gate-Entropy on the same FCVR layers.
@@ -69,37 +79,82 @@ import torch
 from evaluate_letter import prepare, readout
 from uq_stats import auprc, auroc, bootstrap_ci
 from utils import load_exp_dataset, seed_everything, setup_environment
-from utils.prompt import COMPARISON_SYSTEM_INSTRUCTION, multiple_choice_prompt_engineer
+from utils.prompt import SYSTEM_INSTRUCTIONS, multiple_choice_prompt_engineer
 
 
 DEFAULT_LAYERS = [5, 6, 7, 8, 19, 20, 28, 29, 30, 31]
-DEFAULT_OOD = ["medexqa", "obqa", "arc_e", "arc_c", "sciq", "mmlu_law"]
 
-ARM_CONFIG = {
-    "armA-letter": {
-        "label": "Arm A: answer-only",
-        "adapter": "adapters/granite-medmcqa_gen-armA-letter",
-        "run_suffix": "armA-letter-pretrained-prior-beta0.01",
+# Per-ID-dataset registry of the two comparison arms. Each arm records where its
+# Stage-1 adapter and FCVR weights live, which dataset shortcode the FCVR
+# weights were trained under (None = the ID dataset itself; selects
+# router_weights/fcvr/fcvr-<model>-<that>-<run_suffix>), and which system
+# prompt the arm was trained with (key into utils.prompt.SYSTEM_INSTRUCTIONS).
+# obqa_gen arm A = FROZEN exp4-train-ans Stage-1 adapter (legacy `obqa`
+# shortcode, plain MCQ prompt) + FCVR routers retrained with --kl_mask attention
+# (the klattn suffix; exp4's originals averaged padding into the KL).
+ARM_SETUP = {
+    "medmcqa_gen": {
+        "tag": "medmcqa-arms",
+        "default_ood": ["medexqa", "obqa", "arc_e", "arc_c", "sciq", "mmlu_law"],
+        "ood_description": {
+            "medexqa": "near-domain: medical/allied-health, distinct source",
+            "obqa": "non-medical commonsense science",
+            "arc_e": "non-medical primary science (easy)",
+            "arc_c": "non-medical primary science (challenge)",
+            "sciq": "non-medical broad science",
+            "mmlu_law": "far-domain professional law",
+        },
+        "arms": {
+            "armA-letter": {
+                "label": "Arm A: answer-only",
+                "adapter": "adapters/granite-medmcqa_gen-armA-letter",
+                "run_suffix": "armA-letter-pretrained-prior-beta0.01",
+                "weights_dataset": None,
+                "system_prompt": "comparison",
+            },
+            "armB-ansexp": {
+                "label": "Arm B: answer + explanation",
+                "adapter": "adapters/granite-medmcqa_gen-armB-ansexp",
+                "run_suffix": "armB-ansexp-pretrained-prior-beta0.01",
+                "weights_dataset": None,
+                "system_prompt": "comparison",
+            },
+        },
     },
-    "armB-ansexp": {
-        "label": "Arm B: answer + explanation",
-        "adapter": "adapters/granite-medmcqa_gen-armB-ansexp",
-        "run_suffix": "armB-ansexp-pretrained-prior-beta0.01",
+    "obqa_gen": {
+        "tag": "obqa-arms",
+        "default_ood": ["medexqa", "medmcqa_gen", "arc_e", "arc_c", "sciq", "mmlu_law"],
+        "ood_description": {
+            "medexqa": "far-domain medical/allied-health",
+            "medmcqa_gen": "far-domain medical MCQA",
+            "arc_e": "near-domain primary science (easy)",
+            "arc_c": "near-domain primary science (challenge)",
+            "sciq": "near-domain broad science",
+            "mmlu_law": "far-domain professional law",
+        },
+        "arms": {
+            "armA-letter": {
+                "label": "Arm A: answer-only (frozen exp4 Stage-1, KL-mask-fixed FCVR)",
+                "adapter": "adapters/granite-obqa-ansmask",
+                "run_suffix": "ansmask-klattn-pretrained-prior-beta0.01",
+                "weights_dataset": "obqa",
+                "system_prompt": "mcq",
+            },
+            "armB-ansexp": {
+                "label": "Arm B: answer + explanation (fact1)",
+                "adapter": "adapters/granite-obqa_gen-armB-ansexp",
+                "run_suffix": "armB-ansexp-pretrained-prior-beta0.01",
+                "weights_dataset": None,
+                "system_prompt": "comparison",
+            },
+        },
     },
 }
 
-OOD_DESCRIPTION = {
-    "medexqa": "near-domain: medical/allied-health, distinct source",
-    "obqa": "non-medical commonsense science",
-    "arc_e": "non-medical primary science (easy)",
-    "arc_c": "non-medical primary science (challenge)",
-    "sciq": "non-medical broad science",
-    "mmlu_law": "far-domain professional law",
-}
-
-# medmcqa_med draws from the same official MedMCQA train/validation corpus as
-# medmcqa_gen. It is not unseen to a medmcqa_gen-trained model.
-SAME_SOURCE = {"medmcqa_gen": {"medmcqa_med", "medmcqa"}}
+# Shortcodes drawn from the same upstream corpus as an ID anchor: not unseen to
+# a model trained on that anchor, so refused as OoD.
+SAME_SOURCE = {"medmcqa_gen": {"medmcqa_med", "medmcqa"},
+               "obqa_gen": {"obqa", "openbookqa"}}
 
 SIGNALS = ("ilv_last", "gate_entropy_last_fcvr", "letter_entropy", "one_minus_maxprob")
 
@@ -116,10 +171,11 @@ def parse_args():
         description="Paired Arm A/B comparison of final-token ILV for ID-vs-OoD detection."
     )
     p.add_argument("--model_shortcode", default="granite")
-    p.add_argument("--id_dataset", default="medmcqa_gen",
-                   help="Training distribution and ID anchor. This comparison expects medmcqa_gen.")
-    p.add_argument("--ood_datasets", nargs="+", default=DEFAULT_OOD,
-                   help="Distinct-source OoD datasets. medmcqa_med is refused for a medmcqa_gen anchor.")
+    p.add_argument("--id_dataset", default="medmcqa_gen", choices=sorted(ARM_SETUP),
+                   help="Training distribution and ID anchor; selects the ARM_SETUP registry entry.")
+    p.add_argument("--ood_datasets", nargs="+", default=None,
+                   help="Distinct-source OoD datasets. Default: the registry list for --id_dataset. "
+                        "Same-corpus shortcodes (SAME_SOURCE) are refused.")
     p.add_argument("--split", choices=["val", "test"], default="test")
     p.add_argument("--n_per_domain", type=int, default=500,
                    help="Maximum examples loaded per domain. Each ID/OoD comparison is balanced to the smaller side; 0 = all.")
@@ -133,16 +189,39 @@ def parse_args():
     p.add_argument("--bootstrap_seed", type=int, default=0)
     p.add_argument("--swap_layers", type=int, nargs="+", default=DEFAULT_LAYERS)
     p.add_argument("--prior_source", choices=["pretrained", "map"], default="pretrained")
-    p.add_argument("--arm_a_adapter", default=ARM_CONFIG["armA-letter"]["adapter"])
-    p.add_argument("--arm_b_adapter", default=ARM_CONFIG["armB-ansexp"]["adapter"])
-    p.add_argument("--arm_a_run_suffix", default=ARM_CONFIG["armA-letter"]["run_suffix"])
-    p.add_argument("--arm_b_run_suffix", default=ARM_CONFIG["armB-ansexp"]["run_suffix"])
+    p.add_argument("--arm_a_adapter", default=None, help="Default: ARM_SETUP entry for --id_dataset.")
+    p.add_argument("--arm_b_adapter", default=None, help="Default: ARM_SETUP entry for --id_dataset.")
+    p.add_argument("--arm_a_run_suffix", default=None, help="Default: ARM_SETUP entry for --id_dataset.")
+    p.add_argument("--arm_b_run_suffix", default=None, help="Default: ARM_SETUP entry for --id_dataset.")
     p.add_argument("--map_suffix", default=None,
                    help="Only used with --prior_source map; must match the router checkpoint.")
     p.add_argument("--output_dir", default="results/ilv_ood_arms")
-    p.add_argument("--tag", default="medmcqa-arms")
+    p.add_argument("--tag", default=None,
+                   help="Output file stem. Default: the registry tag for --id_dataset "
+                        "(medmcqa-arms / obqa-arms).")
     p.add_argument("--overwrite", action="store_true")
     return p.parse_args()
+
+
+def resolve_arm_setup(args):
+    """Fill registry defaults for --id_dataset and apply the per-arm CLI
+    overrides. Returns (registry entry, {arm_key: arm cfg dict})."""
+    setup = ARM_SETUP[args.id_dataset]
+    if args.ood_datasets is None:
+        args.ood_datasets = list(setup["default_ood"])
+    if args.tag is None:
+        args.tag = setup["tag"]
+    arm_cfgs = {}
+    for arm_key, cli in (("armA-letter", "a"), ("armB-ansexp", "b")):
+        cfg = dict(setup["arms"][arm_key])
+        adapter = getattr(args, f"arm_{cli}_adapter")
+        run_suffix = getattr(args, f"arm_{cli}_run_suffix")
+        if adapter:
+            cfg["adapter"] = adapter
+        if run_suffix:
+            cfg["run_suffix"] = run_suffix
+        arm_cfgs[arm_key] = cfg
+    return setup, arm_cfgs
 
 
 def git_revision() -> str:
@@ -160,9 +239,9 @@ def validate_args(args):
             "The two saved comparison arms and evaluate_fcvr.prepare_model_fcvr are Granite-specific; "
             "--model_shortcode must be granite."
         )
-    if args.id_dataset != "medmcqa_gen":
+    if args.id_dataset not in ARM_SETUP:
         raise SystemExit(
-            "This evaluator compares the two MedMCQA arms, so --id_dataset must be medmcqa_gen. "
+            f"--id_dataset must be a registered arm comparison {sorted(ARM_SETUP)}. "
             "Use fcvr_input_level_ood_check.py for a generic single-arm anchor."
         )
     if args.n_per_domain < 0:
@@ -179,7 +258,7 @@ def validate_args(args):
             continue
         if code in SAME_SOURCE.get(args.id_dataset, set()):
             raise SystemExit(
-                f"ERROR: {code} is sampled from the same upstream MedMCQA corpus as {args.id_dataset}; "
+                f"ERROR: {code} is sampled from the same upstream corpus as {args.id_dataset}; "
                 "it overlaps the training distribution and is not a valid OoD domain."
             )
         if code not in ood:
@@ -227,8 +306,9 @@ def load_domains(args) -> dict[str, DomainData]:
     return out
 
 
-def prompts_for_rows(rows: list[dict], tokenizer) -> list[str]:
-    """Render the identical comparison-arm prompt for ID and every OoD set.
+def prompts_for_rows(rows: list[dict], tokenizer, system_instruction) -> list[str]:
+    """Render one arm's prompt for ID and every OoD set (the same instruction
+    is used for every domain within an arm).
 
     Gold labels are intentionally unnecessary for OoD detection. Generation
     datasets use their MCQA ``letter_question`` field when available; ordinary
@@ -243,13 +323,13 @@ def prompts_for_rows(rows: list[dict], tokenizer) -> list[str]:
         engineered = multiple_choice_prompt_engineer(
             {"question": inner, "answer": "A", "id": ex.get("id", str(i))},
             tokenizer=tokenizer,
-            system_instruction=COMPARISON_SYSTEM_INSTRUCTION,
+            system_instruction=system_instruction,
         )
         prompts.append(engineered["question"])
     return prompts
 
 
-def make_prepare_args(args, adapter_path, run_suffix):
+def make_prepare_args(args, adapter_path, run_suffix, weights_dataset=None):
     """Namespace expected by evaluate_letter.prepare/evaluate_fcvr."""
     return argparse.Namespace(
         model_shortcode=args.model_shortcode,
@@ -260,7 +340,7 @@ def make_prepare_args(args, adapter_path, run_suffix):
         swap_layers=list(args.swap_layers),
         run_suffix=run_suffix,
         prior_source=args.prior_source,
-        weights_dataset_shortcode=None,
+        weights_dataset_shortcode=weights_dataset,
         num_samples=args.num_samples,
         batch_size=args.batch_size,
     )
@@ -271,21 +351,25 @@ def domain_sampling_seed(base_seed: int, domain_index: int) -> int:
     return int(base_seed + domain_index * 1_000_003)
 
 
-def evaluate_arm(args, domains, arm_key, adapter_path, run_suffix):
-    """Load one arm, score every fixed domain, then release GPU memory."""
+def evaluate_arm(args, domains, arm_key, cfg):
+    """Load one arm (registry cfg dict), score every fixed domain, then
+    release GPU memory."""
     print("\n" + "=" * 80)
-    print(f"{ARM_CONFIG[arm_key]['label']} | adapter={adapter_path} | suffix={run_suffix}")
+    print(f"{cfg['label']} | adapter={cfg['adapter']} | suffix={cfg['run_suffix']} | "
+          f"weights_ds={cfg['weights_dataset'] or args.id_dataset} | system_prompt={cfg['system_prompt']}")
     print("=" * 80)
 
     seed_everything(args.sampling_seed)
-    model, tokenizer, fcvr_layers = prepare(make_prepare_args(args, adapter_path, run_suffix))
+    model, tokenizer, fcvr_layers = prepare(
+        make_prepare_args(args, cfg["adapter"], cfg["run_suffix"], cfg["weights_dataset"]))
     if sorted(fcvr_layers) != sorted(args.swap_layers):
         raise RuntimeError(f"loaded FCVR layers {fcvr_layers} != requested {sorted(args.swap_layers)}")
 
+    system_instruction = SYSTEM_INSTRUCTIONS[cfg["system_prompt"]]
     arm = {}
     try:
         for domain_index, (code, d) in enumerate(domains.items()):
-            prompts = prompts_for_rows(d.rows, tokenizer)
+            prompts = prompts_for_rows(d.rows, tokenizer, system_instruction)
             lengths = np.asarray([
                 len(tokenizer(p, add_special_tokens=False).input_ids) for p in prompts
             ], dtype=float)
@@ -615,34 +699,37 @@ def write_perexample(path, args, arms):
 
 def main():
     args = parse_args()
+    setup, arm_cfgs = resolve_arm_setup(args)
     validate_args(args)
     paths = output_paths(args)
     check_output_collisions(paths, args.overwrite)
     setup_environment()
 
     print("#" * 80)
-    print("# Paired MedMCQA-arm ILV OoD evaluation")
+    print(f"# Paired {args.id_dataset} arm ILV OoD evaluation")
     print(f"# DATA seed={args.data_seed} (fixed rows) | MC seed={args.sampling_seed} | S={args.num_samples}")
     print(f"# ID={args.id_dataset} | OoD={args.ood_datasets} | split={args.split}")
     print("#" * 80)
 
     domains = load_domains(args)
     arms = {
-        "armA-letter": evaluate_arm(
-            args, domains, "armA-letter", args.arm_a_adapter, args.arm_a_run_suffix
-        ),
-        "armB-ansexp": evaluate_arm(
-            args, domains, "armB-ansexp", args.arm_b_adapter, args.arm_b_run_suffix
-        ),
+        arm_key: evaluate_arm(args, domains, arm_key, arm_cfgs[arm_key])
+        for arm_key in ("armA-letter", "armB-ansexp")
     }
 
-    # Absolute pairing guard: raw example IDs and prompt lengths must agree.
+    # Absolute pairing guard: raw example IDs must agree; prompt lengths can
+    # only be required to match when the arms share a system prompt.
+    same_prompt = arm_cfgs["armA-letter"]["system_prompt"] == arm_cfgs["armB-ansexp"]["system_prompt"]
     for code in domains:
         a, b = arms["armA-letter"][code], arms["armB-ansexp"][code]
         if a["ids"] != b["ids"]:
             raise RuntimeError(f"Arm A/B ID ordering differs for {code}")
-        if not np.array_equal(a["scores"]["prompt_len"], b["scores"]["prompt_len"]):
+        if same_prompt and not np.array_equal(a["scores"]["prompt_len"], b["scores"]["prompt_len"]):
             raise RuntimeError(f"Arm A/B prompts differ for {code}")
+    if not same_prompt:
+        print("NOTE: arms use different system prompts "
+              f"(A={arm_cfgs['armA-letter']['system_prompt']}, B={arm_cfgs['armB-ansexp']['system_prompt']}); "
+              "cross-arm prompt_len equality not enforced.")
 
     summary = {
         "config": {
@@ -650,7 +737,7 @@ def main():
             "model_shortcode": args.model_shortcode,
             "id_dataset": args.id_dataset,
             "ood_datasets": args.ood_datasets,
-            "ood_description": {c: OOD_DESCRIPTION.get(c, "unclassified shift") for c in args.ood_datasets},
+            "ood_description": {c: setup["ood_description"].get(c, "unclassified shift") for c in args.ood_datasets},
             "split": args.split,
             "n_per_domain_cap": args.n_per_domain,
             "data_seed": args.data_seed,
@@ -658,13 +745,18 @@ def main():
             "num_samples": args.num_samples,
             "swap_layers": sorted(args.swap_layers),
             "prior_source": args.prior_source,
-            "arm_a_adapter": args.arm_a_adapter,
-            "arm_b_adapter": args.arm_b_adapter,
-            "arm_a_run_suffix": args.arm_a_run_suffix,
-            "arm_b_run_suffix": args.arm_b_run_suffix,
+            "arm_a_adapter": arm_cfgs["armA-letter"]["adapter"],
+            "arm_b_adapter": arm_cfgs["armB-ansexp"]["adapter"],
+            "arm_a_run_suffix": arm_cfgs["armA-letter"]["run_suffix"],
+            "arm_b_run_suffix": arm_cfgs["armB-ansexp"]["run_suffix"],
+            "arm_a_weights_dataset": arm_cfgs["armA-letter"]["weights_dataset"],
+            "arm_b_weights_dataset": arm_cfgs["armB-ansexp"]["weights_dataset"],
+            "arm_a_system_prompt": arm_cfgs["armA-letter"]["system_prompt"],
+            "arm_b_system_prompt": arm_cfgs["armB-ansexp"]["system_prompt"],
             "n_boot": args.n_boot,
             "bootstrap_seed": args.bootstrap_seed,
-            "prompt": "COMPARISON_SYSTEM_INSTRUCTION + MCQA inner prompt; identical across arms/domains",
+            "prompt": "per-arm system instruction (see arm_*_system_prompt) + MCQA inner prompt; "
+                      "identical across domains within an arm",
             "primary_signal": "ilv_last = mean over FCVR layers of tr(LL^T) at final predictive position",
             "sign": "higher score => OoD; never flip inverted AUROC",
         },
