@@ -544,9 +544,9 @@ def trace_example(model, tokenizer, causal_model, fcvr_layers, choice_ids_t,
         "eos_ilv": float(ilv_mean_np[-1]),
         "letter_entropy": letter_entropy,
         "seq_ilv_max": float(ilv_mean_np.max()),
-        "seq_ilv_argmax_category": cats[int(ilv_mean_np.argmax())],
     }
     meta = {
+        "seq_ilv_argmax_category": cats[int(ilv_mean_np.argmax())],
         "pred_letter": pred_letter,
         "gold_letter": gold_letter,
         "answer_correct": bool(answer_correct),
