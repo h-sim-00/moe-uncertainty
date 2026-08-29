@@ -1149,17 +1149,21 @@ def ecqa_join(ecqa_rows, csqa_rows, split_ids, split_name):
     for row in csqa_rows:
         cid, stem, labels, texts, key, concept = _csqa_normalize(row)
         csqa_by_id[cid] = (stem, labels, texts, key, concept)
-    ecqa_by_id = {}
+    # ecqa.jsonl repeats some ids; the official generate_data.py assigns
+    # data[id][...] per line, so the LAST occurrence wins (it only counts them
+    # in a "twice" counter). Mirror that exactly and report the count.
+    ecqa_by_id, n_dup = {}, 0
     for row in ecqa_rows:
         eid = str(row.get("id") if row.get("id") is not None else row.get("q_no"))
         if eid in ecqa_by_id:
-            raise ValueError(f"ECQA: duplicate annotation id {eid}")
+            n_dup += 1
         ecqa_by_id[eid] = row
     missing_in_csqa = [i for i in ecqa_by_id if i not in csqa_by_id]
     if missing_in_csqa:
         raise ValueError(f"ECQA: {len(missing_in_csqa)} annotation ids not found in CommonsenseQA "
                          f"(first: {missing_in_csqa[:3]}) -- wrong CommonsenseQA release?")
     records, funnel = [], Counter()
+    funnel["duplicate_annotation_ids_last_wins"] = n_dup
     for sid in split_ids:
         sid = str(sid).strip()
         if not sid:

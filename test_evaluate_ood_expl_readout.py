@@ -227,6 +227,12 @@ class ECQATests(unittest.TestCase):
             ecqa_join(self.ecqa() + [{"id": "zz", "positives": ["x"], "negatives": [], "explanation": ""}],
                       self.csqa(), ["q1"], "test")
 
+    def test_duplicate_annotation_last_wins_like_official_script(self):
+        dup = self.ecqa() + [{"id": "q1", "positives": ["LATER"], "negatives": [], "explanation": "later"}]
+        rows, funnel = ecqa_join(dup, self.csqa(), ["q1"], "test")
+        self.assertEqual(rows[0]["answer"], " LATER"); self.assertEqual(rows[0]["explanation_2"], "later")
+        self.assertEqual(funnel["duplicate_annotation_ids_last_wins"], 1)
+
     def test_hf_layout_accepted(self):
         hf = [{"id": "q1", "question": "stem 1", "question_concept": "c",
                "choices": {"label": LETTERS5, "text": [f"t{L}" for L in LETTERS5]}, "answerKey": "C"}]
