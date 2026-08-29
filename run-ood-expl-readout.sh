@@ -52,6 +52,9 @@ read -r -a TRACE_OOD <<< "${TRACE_OOD:-medexqa scienceqa ecqa aqua_rat}"
 
 if [ "${SMOKE:-0}" = "1" ]; then
     N_PER_DOMAIN=12; TRACE_N_ID=6; TRACE_N_OOD=4; N_BOOT=50; MAX_NEW_TOKENS=24; TAG="smoke"
+    # Smoke outputs are disposable: overwrite them by default (real-tag runs keep
+    # the strict refuse-to-overwrite guard; RESUME=1 still skips finished stages).
+    ALLOW_EXISTING="${ALLOW_EXISTING:-1}"
 fi
 
 WANDB_PROJECT="${WANDB_PROJECT:-moe-uncertainty}"; RUN_TAG="$(date +%Y%m%d-%H%M%S)"
