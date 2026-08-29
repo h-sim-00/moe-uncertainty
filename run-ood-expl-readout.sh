@@ -114,15 +114,21 @@ if has_phase gen; then
         python evaluate_ood_expl_readout.py --stage gen --ood_datasets "${TRACE_OOD[0]}" "${common[@]}" \
             --routing deterministic --tag "${TAG}-det" "${OW[@]}"
         python - "$(stem gen | sed "s/${TAG}_/${TAG}-det_/")_perexample.jsonl" <<'PY'
-import json, sys, math
+import json, sys, math, statistics
 rows = [json.loads(l) for l in open(sys.argv[1]) if l.strip()]
 rows = [r for r in rows if r.get("kind") != "readout" and r.get("n_expl_tokens", 0) > 0]
 bad = [r for r in rows if not r.get("online_ok")]
-d = [r["online_posthoc_expl_maxabsdiff"] for r in rows if r.get("online_posthoc_expl_maxabsdiff") is not None
-     and not math.isnan(r["online_posthoc_expl_maxabsdiff"])]
+fin = lambda k: [r[k] for r in rows if r.get(k) is not None and not math.isnan(r[k])]
+d, rho, scale = fin("online_posthoc_expl_maxabsdiff"), fin("online_posthoc_expl_spearman"), fin("expl_ilv_mean")
+rel = (max(d) / statistics.mean(scale)) if d and scale else float("nan")
+med_rho = statistics.median(rho) if rho else float("nan")
 print(f"deterministic-routing alignment: {len(rows)} traced rows, online_ok failures={len(bad)}, "
-      f"max |ilv_online - ilv_posthoc| over explanation rows = {max(d) if d else float('nan'):.4g}")
-if bad or (d and max(d) > 1e-2):
+      f"max |ilv_online - ilv_posthoc| over explanation rows = {max(d) if d else float('nan'):.4g} "
+      f"(= {rel:.2e} of mean ILV; fp32 KV-cache-vs-full-forward noise is ~1e-3), "
+      f"median per-example Spearman = {med_rho:.3f} (n={len(rho)})")
+# A misaligned row would differ by the position-to-position ILV spread (units), not by
+# kernel noise; require < 1 % relative and near-perfect rank agreement.
+if bad or (d and rel > 1e-2) or (rho and med_rho < 0.95):
     raise SystemExit("ALIGNMENT CHECK FAILED: online recorder rows do not match the post-hoc forward")
 print("alignment OK")
 PY
