@@ -2,6 +2,9 @@ import os
 import json
 import datasets
 import hashlib
+import numbers
+import re
+from collections import Counter
 from datasets import Dataset
 from typing import List, Tuple
 from transformers import AutoTokenizer
@@ -997,6 +1000,337 @@ def _load_obqa_gen(seed):
     return train_dataset, validation_dataset, test_dataset
 
 
+# ---------------------------------------------------------------------------
+# Explanation-bearing OoD EVAL sets (branch OBQA-comparison,
+# evaluate_ood_expl_readout.py): scienceqa / ecqa / aqua_rat. Eval-only --
+# nothing trains on them, they are NOT in GENERATION_DATASETS and have no split
+# manifest. Every record uses the generation-dataset schema (question, answer =
+# " " + explanation, id, explanation_2, gold_letter, letter_question) plus
+#   n_choices  4 or 5 (ECQA / AQuA-RAT have five options; E is never dropped)
+#   meta       dataset-specific provenance (subject, conflict flags, raw text)
+# and ONE canonical inner prompt (MCQA_INNER_TEMPLATE, "A. text" options).
+# Raw downloads are cached under <repo>/data/ood_raw/<dataset>/ (override with
+# MOE_RAW_DATA_DIR); the row converters are pure so they can be unit-tested.
+# ---------------------------------------------------------------------------
+LETTERS5 = ["A", "B", "C", "D", "E"]
+ECQA_RAW_URL = "https://raw.githubusercontent.com/dair-iitd/ECQA-Dataset/main/"
+ECQA_URLS = {
+    "ecqa.jsonl": ECQA_RAW_URL + "ecqa.jsonl",
+    "train_ids.txt": ECQA_RAW_URL + "author_split/train_ids.txt",
+    "val_ids.txt": ECQA_RAW_URL + "author_split/val_ids.txt",
+    "test_ids.txt": ECQA_RAW_URL + "author_split/test_ids.txt",
+}
+# Official CommonsenseQA v1.11 release (the files ECQA's generate_data.py joins to).
+CSQA_URLS = {
+    "train_rand_split.jsonl": "https://s3.amazonaws.com/commensenseqa/train_rand_split.jsonl",
+    "dev_rand_split.jsonl": "https://s3.amazonaws.com/commensenseqa/dev_rand_split.jsonl",
+}
+
+
+def raw_data_dir(name):
+    root = os.environ.get("MOE_RAW_DATA_DIR") or os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "ood_raw")
+    path = os.path.join(root, name)
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def _download(url, path):
+    """Fetch `url` to `path` once (temp file + rename; refuses empty files)."""
+    if os.path.exists(path) and os.path.getsize(path) > 0:
+        return path
+    import urllib.request
+    tmp = path + ".part"
+    print(f"  downloading {url} -> {path}")
+    urllib.request.urlretrieve(url, tmp)
+    if os.path.getsize(tmp) == 0:
+        os.remove(tmp)
+        raise RuntimeError(f"empty download: {url}")
+    os.replace(tmp, path)
+    return path
+
+
+def mcqa_eval_record(code, split_name, source_id, question, choices, gold_letter, explanation,
+                     explanation_2="", meta=None):
+    """Canonical eval record. `choices` are the bare option texts (labels are
+    assigned A.. in order); `explanation` gets the loader-convention leading space."""
+    labels = LETTERS5[:len(choices)]
+    if gold_letter not in labels:
+        raise ValueError(f"{code}: gold letter {gold_letter!r} outside {labels}")
+    opts = "\n".join(f"{lab}. {txt}" for lab, txt in zip(labels, choices))
+    return {
+        "question": GENERATION_INNER_TEMPLATE.format(q=question, opts=opts),
+        "answer": " " + str(explanation).strip(),
+        "id": f"{code}_{split_name}_{source_id}",
+        "explanation_2": str(explanation_2 or "").strip(),
+        "gold_letter": gold_letter,
+        "letter_question": MCQA_INNER_TEMPLATE.format(q=question, opts=opts),
+        "n_choices": len(choices),
+        "meta": dict(meta or {}),
+    }
+
+
+# ---- ScienceQA ---------------------------------------------------------------
+def scienceqa_row_to_example(ex, idx, split_name):
+    """Keep text-only (no image), context-free (no hint), exactly-four-choice
+    rows with an authored `solution`; the 0-based integer `answer` becomes a
+    letter. Returns (record, reject_reason)."""
+    if ex.get("image") is not None:
+        return None, "has_image"
+    if str(ex.get("hint") or "").strip():
+        return None, "has_hint"
+    choices = [str(c).strip() for c in (ex.get("choices") or [])]
+    if len(choices) != 4 or any(not c for c in choices):
+        return None, "not_4_choices"
+    solution = str(ex.get("solution") or "").strip()
+    if not solution:
+        return None, "no_solution"
+    ans = ex.get("answer")
+    if isinstance(ans, bool) or not isinstance(ans, numbers.Integral) or not (0 <= int(ans) < 4):
+        return None, "bad_answer"
+    question = str(ex.get("question") or "").strip()
+    if not question:
+        return None, "no_question"
+    meta = {k: ex.get(k) for k in ("subject", "topic", "category", "grade", "task", "skill")}
+    meta["has_lecture"] = bool(str(ex.get("lecture") or "").strip())
+    return mcqa_eval_record("scienceqa", split_name, idx, question, choices, "ABCD"[int(ans)],
+                            solution, meta=meta), None
+
+
+def _load_scienceqa(seed):
+    ds = datasets.load_dataset("derek-thomas/ScienceQA")
+    out = {}
+    for split_name, hf_split in (("val", "validation"), ("test", "test")):
+        d = ds[hf_split].cast_column("image", datasets.Image(decode=False))   # never decode PIL
+        rows, funnel = [], Counter()
+        for idx, ex in enumerate(d):
+            r, why = scienceqa_row_to_example(ex, idx, split_name)
+            if r is None:
+                funnel[why] += 1
+            else:
+                rows.append(r)
+                funnel["kept"] += 1
+        random.Random(seed).shuffle(rows)
+        print(f"  ScienceQA [{split_name}] filter funnel (text-only, no hint, 4 choices, solution): {dict(funnel)}")
+        out[split_name] = rows
+    if len(out["test"]) < 100:
+        raise ValueError(f"ScienceQA: unexpectedly few usable test rows ({len(out['test'])})")
+    return [], out["val"], out["test"]
+
+
+# ---- ECQA (annotations joined BY ID to CommonsenseQA) --------------------------
+def _csqa_normalize(row):
+    """One CommonsenseQA row (official jsonl layout or HF tau/commonsense_qa
+    layout) -> (id, stem, labels, texts, answerKey, concept)."""
+    q = row.get("question")
+    if isinstance(q, dict):                      # official jsonl
+        stem = q.get("stem")
+        labels = [c["label"] for c in q.get("choices", [])]
+        texts = [c["text"] for c in q.get("choices", [])]
+        concept = q.get("question_concept")
+    else:                                        # HF layout
+        stem = q
+        ch = row.get("choices") or {}
+        labels, texts = list(ch.get("label", [])), list(ch.get("text", []))
+        concept = row.get("question_concept")
+    return str(row["id"]), str(stem or "").strip(), labels, [str(t).strip() for t in texts], \
+        str(row.get("answerKey") or "").strip().upper(), concept
+
+
+def ecqa_join(ecqa_rows, csqa_rows, split_ids, split_name):
+    """Join ECQA annotations (id, positives, negatives, explanation) to the exact
+    CommonsenseQA release BY ID -- never by row order -- restricted to the
+    author-split ids. Preserves CommonsenseQA's answerKey as the gold letter
+    (no text matching). Explanation = taskA_pos = positives joined with a
+    newline (as the official generate_data.py writes it); the free-flow
+    explanation is kept in explanation_2. Raises on any id that fails to
+    resolve. Returns (records in split_ids order, funnel)."""
+    csqa_by_id = {}
+    for row in csqa_rows:
+        cid, stem, labels, texts, key, concept = _csqa_normalize(row)
+        csqa_by_id[cid] = (stem, labels, texts, key, concept)
+    ecqa_by_id = {}
+    for row in ecqa_rows:
+        eid = str(row.get("id") if row.get("id") is not None else row.get("q_no"))
+        if eid in ecqa_by_id:
+            raise ValueError(f"ECQA: duplicate annotation id {eid}")
+        ecqa_by_id[eid] = row
+    missing_in_csqa = [i for i in ecqa_by_id if i not in csqa_by_id]
+    if missing_in_csqa:
+        raise ValueError(f"ECQA: {len(missing_in_csqa)} annotation ids not found in CommonsenseQA "
+                         f"(first: {missing_in_csqa[:3]}) -- wrong CommonsenseQA release?")
+    records, funnel = [], Counter()
+    for sid in split_ids:
+        sid = str(sid).strip()
+        if not sid:
+            continue
+        if sid not in ecqa_by_id or sid not in csqa_by_id:
+            raise ValueError(f"ECQA [{split_name}]: author-split id {sid!r} missing from "
+                             f"{'ecqa.jsonl' if sid not in ecqa_by_id else 'CommonsenseQA'}")
+        ann = ecqa_by_id[sid]
+        stem, labels, texts, key, concept = csqa_by_id[sid]
+        if labels != LETTERS5 or len(texts) != 5 or any(not t for t in texts):
+            funnel["bad_choices"] += 1
+            continue
+        if key not in LETTERS5 or not stem:
+            funnel["bad_answerkey"] += 1
+            continue
+        pos = ann.get("positives")
+        pos_text = "\n".join(str(p).strip() for p in pos if str(p).strip()) if isinstance(pos, list) \
+            else str(pos or "").strip()
+        if not pos_text:
+            funnel["no_positives"] += 1
+            continue
+        neg = ann.get("negatives")
+        meta = {
+            "taskA_neg": "\n".join(str(n).strip() for n in neg) if isinstance(neg, list) else str(neg or ""),
+            "concept": concept,
+        }
+        records.append(mcqa_eval_record("ecqa", split_name, sid, stem, texts, key, pos_text,
+                                        explanation_2=str(ann.get("explanation") or "").strip(),
+                                        meta=meta))
+        funnel["kept"] += 1
+    return records, funnel
+
+
+def _read_jsonl(path):
+    with open(path, encoding="utf-8") as f:
+        return [json.loads(line) for line in f if line.strip()]
+
+
+def _load_ecqa(seed):
+    d = raw_data_dir("ecqa")
+    local = {name: _download(url, os.path.join(d, name)) for name, url in ECQA_URLS.items()}
+    csqa_rows = []
+    try:
+        for name, url in CSQA_URLS.items():
+            csqa_rows += _read_jsonl(_download(url, os.path.join(d, name)))
+        print(f"  ECQA: CommonsenseQA train+dev from the official release ({len(csqa_rows)} rows)")
+    except Exception as e:
+        print(f"  ECQA: official CommonsenseQA download failed ({e!r}); falling back to HF tau/commonsense_qa")
+        hf = datasets.load_dataset("tau/commonsense_qa")
+        csqa_rows = list(hf["train"]) + list(hf["validation"])
+    ecqa_rows = _read_jsonl(local["ecqa.jsonl"])
+    out = {}
+    for split_name, ids_file in (("train", "train_ids.txt"), ("val", "val_ids.txt"), ("test", "test_ids.txt")):
+        with open(local[ids_file], encoding="utf-8") as f:
+            split_ids = [line.strip() for line in f if line.strip()]
+        rows, funnel = ecqa_join(ecqa_rows, csqa_rows, split_ids, split_name)
+        random.Random(seed).shuffle(rows)
+        print(f"  ECQA [{split_name}] joined by id: {dict(funnel)} (author split: {len(split_ids)} ids)")
+        out[split_name] = rows
+    if len(out["test"]) < 100:
+        raise ValueError(f"ECQA: unexpectedly few test rows ({len(out['test'])})")
+    return out["train"], out["val"], out["test"]
+
+
+# ---- AQuA-RAT ---------------------------------------------------------------
+AQUA_OPTION_RE = re.compile(r"^\s*([A-E])\s*[\)\.:]\s*(.*)$", re.S)
+# Terminal answer-conclusion phrases, matched ONLY at the very end of the
+# rationale (high precision; algebraic single letters mid-text are untouched).
+# Group `pre` is the delimiter kept in place, `letter` the concluded option.
+AQUA_TAIL_PATTERNS = [
+    ("answer_phrase", re.compile(
+        r"(?P<pre>^|[\s\.\,;:])[\(\[]?(?:so\s+|hence\s+|thus\s+|therefore\s+)?(?:the\s+)?(?:correct\s+)?"
+        r"(?:answer|option|choice|ans)\s*(?:(?:is|:|-|=|\.|will\s+be|should\s+be)\s*)?"
+        r"(?:option\s+|choice\s+)?[\(\[]?(?P<letter>[A-E])[\)\]]?\s*[.!]?\s*$", re.I)),
+    ("bare_letter", re.compile(
+        r"(?P<pre>^|\n|[.;:,!?]\s*)[\(\[]?(?P<letter>[A-E])[\)\]]?\s*[.!]?\s*$")),
+]
+
+
+def aqua_strip_option_prefix(options):
+    """["A)125", "B)150", ...] -> ["125", "150", ...]; None unless the labels are
+    exactly A..E in order and every option text is non-empty."""
+    options = list(options or [])
+    if len(options) != 5:
+        return None
+    texts = []
+    for i, opt in enumerate(options):
+        m = AQUA_OPTION_RE.match(str(opt))
+        if not m or m.group(1) != LETTERS5[i]:
+            return None
+        text = m.group(2).strip()
+        if not text or AQUA_OPTION_RE.match(text):      # double-labelled "A)A)125"
+            return None
+        texts.append(text)
+    return texts if len(texts) == 5 else None
+
+
+def aqua_normalize_rationale(raw, max_passes=3):
+    """Remove a TERMINAL answer-conclusion phrase ("Answer: C", "Correct answer -
+    A", "CORRECT OPTION: OPTION E", "Choice B", a bare final "D", ...) from the
+    rationale so the teacher-forced target does not restate the label.
+    Returns (normalized_text, extracted_letter or None, pattern_name or None)."""
+    text = str(raw or "").strip()
+    letter, name = None, None
+    for _ in range(max_passes):
+        hit = None
+        for pat_name, pat in AQUA_TAIL_PATTERNS:
+            m = pat.search(text)
+            if m:
+                hit = (pat_name, m)
+                break
+        if hit is None:
+            break
+        pat_name, m = hit
+        if letter is None:
+            letter, name = m.group("letter").upper(), pat_name
+        text = (text[:m.start()] + m.group("pre")).rstrip()
+        text = re.sub(r"[\s\-–—:;,]+$", "", text).rstrip()
+    return text, letter, name
+
+
+def aqua_row_to_example(ex, idx, split_name):
+    """One raw AQuA-RAT row -> (record, reject_reason)."""
+    correct = str(ex.get("correct") or "").strip().upper()
+    if correct not in LETTERS5:
+        return None, "bad_correct"
+    texts = aqua_strip_option_prefix(ex.get("options"))
+    if texts is None:
+        return None, "bad_options"
+    question = str(ex.get("question") or "").strip()
+    if not question:
+        return None, "no_question"
+    raw = str(ex.get("rationale") or "")
+    norm, extracted, pat = aqua_normalize_rationale(raw)
+    if not norm.strip():
+        return None, "empty_after_strip"
+    meta = {
+        "rationale_raw": raw,
+        "extracted_letter": extracted,
+        "strip_pattern": pat,
+        "rationale_label_conflict": bool(extracted is not None and extracted != correct),
+    }
+    return mcqa_eval_record("aqua_rat", split_name, idx, question, texts, correct, norm, meta=meta), None
+
+
+def _load_aqua_rat(seed):
+    ds = datasets.load_dataset("deepmind/aqua_rat", "raw")
+
+    def convert(hf_split, split_name):
+        rows, funnel = [], Counter()
+        for idx, ex in enumerate(ds[hf_split]):
+            r, why = aqua_row_to_example(ex, f"{hf_split}{idx}", split_name)
+            if r is None:
+                funnel[why] += 1
+            else:
+                rows.append(r)
+                funnel["kept"] += 1
+                funnel["label_conflict"] += int(r["meta"]["rationale_label_conflict"])
+                funnel["stripped_tail"] += int(r["meta"]["extracted_letter"] is not None)
+        print(f"  AQuA-RAT [{hf_split} -> {split_name}]: {dict(funnel)}")
+        return rows
+
+    val = convert("validation", "val")
+    test = convert("validation", "test") + convert("test", "test")   # official held-out pool (508)
+    random.Random(seed).shuffle(val)
+    random.Random(seed).shuffle(test)
+    if len(test) < 100:
+        raise ValueError(f"AQuA-RAT: unexpectedly few test rows ({len(test)})")
+    return [], val, test
+
+
 def load_exp_dataset(dataset_shortcode, seed=42, split=None):
     """
     Loads and processes one of the six specified experimental datasets with
@@ -1250,10 +1584,20 @@ def load_exp_dataset(dataset_shortcode, seed=42, split=None):
     elif dataset_shortcode == "obqa_gen":
         train_dataset, validation_dataset, test_dataset = _load_obqa_gen(seed)
 
+    # Eval-only explanation-bearing OoD sets (own val/test, empty/unused train).
+    elif dataset_shortcode == "scienceqa":
+        train_dataset, validation_dataset, test_dataset = _load_scienceqa(seed)
+
+    elif dataset_shortcode == "ecqa":
+        train_dataset, validation_dataset, test_dataset = _load_ecqa(seed)
+
+    elif dataset_shortcode == "aqua_rat":
+        train_dataset, validation_dataset, test_dataset = _load_aqua_rat(seed)
+
     else:
         raise ValueError(f"Dataset '{dataset_shortcode}' not supported by load_exp_dataset.")
 
-    if dataset_shortcode not in ("medmcqa_gen", "obqa_gen"):
+    if dataset_shortcode not in ("medmcqa_gen", "obqa_gen", "scienceqa", "ecqa", "aqua_rat"):
         # Generic tail: the last 50 train rows become the val set. medmcqa_gen
         # builds its own (larger, stratified) val set above; obqa_gen carves its
         # own last-50 val BEFORE the fact1 filter (exp4 pool parity).

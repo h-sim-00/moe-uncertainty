@@ -131,6 +131,10 @@ ARM_SETUP = {
             "arc_c": "near-domain primary science (challenge)",
             "sciq": "near-domain broad science",
             "mmlu_law": "far-domain professional law",
+            # explanation-bearing eval sets of evaluate_ood_expl_readout.py
+            "scienceqa": "near-domain school science with authored solutions (text-only, 4 choices)",
+            "ecqa": "far-domain commonsense (CommonsenseQA + ECQA positives; 5 choices)",
+            "aqua_rat": "far-domain algebra word problems with rationales (5 choices)",
         },
         "arms": {
             "armA-letter": {
