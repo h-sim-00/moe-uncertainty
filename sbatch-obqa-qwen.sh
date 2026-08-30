@@ -5,14 +5,21 @@
 # resumable with RESUME=1, so a chain of jobs = one logical run):
 #
 #   STAGE=prep     1 GPU   env sanity, HF model + dataset downloads, driver preflight
-#   STAGE=train    4 GPUs  RESUME=1 PHASES=stage1,map,fcvr   (torchrun DDP, both arms)
-#   STAGE=eval     1 GPU   RESUME=1 PHASES=eval,report,ood
+#   STAGE=train    4 GPUs  RESUME=1 PHASES=stage1,map,fcvr   (torchrun DDP, both arms;
+#                          FCVR for every layer set in LAYER_SETS, default "literal depth")
+#   STAGE=eval     1 GPU   RESUME=1 PHASES=eval,report,ood   (all layer sets, one table)
 #   STAGE=oodexpl  1 GPU   run-ood-expl-readout.sh stages stage1,tf,gen (nine
 #                          explanation ILV aggregates, teacher-forced + generated)
+#                          for ONE layer set: LAYER_SET=literal (default) or depth
+#                          -> results/ood_expl_readout/obqa-ood-expl-qwen36[-layers-depth]_*
 #
 # Submit by hand:   STAGE=prep sbatch --gpus=1 --time=04:00:00 sbatch-obqa-qwen.sh
 #                   STAGE=train sbatch --gpus-per-node=4 --time=23:30:00 sbatch-obqa-qwen.sh
-# or use submit-obqa-qwen-chain.sh (afterok chain with the right GPU counts).
+#                   STAGE=oodexpl LAYER_SET=depth sbatch --gpus=1 --time=23:30:00 sbatch-obqa-qwen.sh
+# or use submit-obqa-qwen-chain.sh (afterok chain with the right GPU counts,
+# ONE LAYER SET AT A TIME: train[literal] -> eval[literal] -> {oodexpl[literal]
+# || train[depth] -> eval[depth] -> oodexpl[depth]}; each train/eval job gets
+# LAYER_SETS=<set>, each oodexpl job LAYER_SET=<set>).
 #
 # Isambard notes (docs.isambard.ac.uk): partition workq (default), QoS
 # workq_qos MaxWall 1-00:00:00 (default 4 h -> always pass --time), --gpus=N
@@ -55,7 +62,7 @@ mkdir -p "$HF_HOME" "$MOE_RAW_DATA_DIR" "$WANDB_DIR" "$REPO/logs"
 cd "$REPO"
 
 echo "========================================"
-echo "Job ID: $SLURM_JOB_ID   Stage: $STAGE"
+echo "Job ID: $SLURM_JOB_ID   Stage: $STAGE   LAYER_SETS=${LAYER_SETS:-literal depth}   LAYER_SET(oodexpl)=${LAYER_SET:-literal}"
 echo "Started: $(date)"
 echo "Node: $(hostname)"
 echo "Git branch/commit: $(git rev-parse --abbrev-ref HEAD) $(git rev-parse HEAD)"
@@ -90,7 +97,7 @@ case "$STAGE" in
         RESUME=1 NGPUS=1 PHASES="${PHASES:-eval,report,ood}" bash run-overnight-obqa-qwen-arms.sh
         ;;
     oodexpl)
-        RESUME=1 MODEL_SHORTCODE=qwen36 STAGES="${STAGES:-stage1,tf,gen}" bash run-ood-expl-readout.sh
+        RESUME=1 MODEL_SHORTCODE=qwen36 LAYER_SET="${LAYER_SET:-literal}" STAGES="${STAGES:-stage1,tf,gen}" bash run-ood-expl-readout.sh
         ;;
     smoke)
         # tiny end-to-end on a few rows (see smoke-qwen36-model.py + plan Part 6)

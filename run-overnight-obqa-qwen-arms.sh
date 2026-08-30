@@ -17,12 +17,24 @@
 #              check for both arms (each with its own system prompt), Stage-1 and
 #              FCVR GPU memory checks at the PER-RANK batch, evaluator smoke test
 #   stage1     Stage-1 LoRA (attention-only, finetune_mode=qkv) -- both arms
-#   map        Stage-2a MAP routers -- both arms                (det rows)
-#   fcvr       Stage-2 FCVR beta (default 0.01), pretrained prior, layers LAYERS
+#   map        Stage-2a MAP routers (all 40 layers) -- both arms   (det rows)
+#   fcvr       Stage-2 FCVR beta (default 0.01), pretrained prior -- both arms x
+#              EVERY layer set in LAYER_SETS (default "literal depth", see below)
 #   eval       evaluate_letter.py on val + test: zero-shot, arm A x {kvq, det,
-#              fcvr x EVAL_SEEDS} with --system_prompt mcq, arm B likewise (comparison)
+#              fcvr x layer sets x EVAL_SEEDS} with --system_prompt mcq, arm B likewise
 #   report     letter_eval_report.py -> results/reports/obqa_gen_qwen36/letter_arms_{val,test}.md
-#   ood        evaluate_ilv_ood_arms.py --id_dataset obqa_gen --model_shortcode qwen36
+#              (both layer sets in one table; A/B pairing is per layer set)
+#   ood        evaluate_ilv_ood_arms.py --id_dataset obqa_gen --model_shortcode qwen36, per layer set
+#
+# LAYER SETS (medmcqa-arms-lib.sh: layer_set_layers / layer_set_sfx):
+#   literal  5 6 7 8 19 20 28 29 30 31  -- Granite's indices verbatim; artefacts keep
+#            the plain names (fcvr-qwen36-obqa_gen-armA-letter-pretrained-prior-beta0.01,
+#            tag armA-letter_fcvr-beta0.01_S35-s42, OoD stem obqa-arms-qwen36_*)
+#   depth    6 7 8 9 24 25 36 37 38 39   -- Granite's blocks {5-8, 19-20, last four}
+#            at the same RELATIVE depth in 40 layers; every artefact carries
+#            "-layers-depth" (…-beta0.01-layers-depth, armA-letter_fcvr-layers-depth-beta0.01_S35-s42,
+#            obqa-arms-qwen36-layers-depth_*, W&B run fcvr-qwen36-obqa_gen-…-layers-depth)
+#   Stage-1 adapters and MAP routers are shared by all layer sets (layer-independent).
 #
 # MULTI-GPU: training phases run under `torchrun --nproc_per_node=$NGPUS`
 # (NGPUS defaults to the GPUs SLURM gave the job, else nvidia-smi's count).
@@ -41,7 +53,8 @@
 #
 # Env knobs (all optional):
 #   PHASES="preflight,stage1,map,fcvr,eval,report,ood"   ARMS="letter answer_explanation"   NGPUS=4
-#   BETAS="0.01"  SEED=42  EVAL_SEEDS="42 43 44"  S=35  LAYERS="5 6 7 8 19 20 28 29 30 31"
+#   BETAS="0.01"  SEED=42  EVAL_SEEDS="42 43 44"  S=35
+#   LAYER_SETS="literal depth"  LAYERS_literal="5 6 7 8 19 20 28 29 30 31"  LAYERS_depth="6 7 8 9 24 25 36 37 38 39"
 #   STAGE1_BATCH=8 STAGE1_ACCUM=1 STAGE1_EPOCHS=3 STAGE1_LR=1e-4 STAGE1_EVAL_EVERY=1500 STAGE1_PATIENCE=3 MAX_SEQ_LEN=768
 #   MAP_BATCH=4 MAP_ACCUM=1 MAP_EPOCHS=3 MAP_LR=1e-4 MAP_EVAL_EVERY=1500 MAP_PATIENCE=2
 #   FCVR_BATCH=4 GRAD_ACCUM=4 FCVR_EPOCHS=5 FCVR_LR=1e-4 FCVR_EVAL_EVERY=500 FCVR_PATIENCE=3 KL_MASK=attention
@@ -59,7 +72,7 @@ PHASES="${PHASES:-preflight,stage1,map,fcvr,eval,report,ood}"
 ARMS="${ARMS:-letter answer_explanation}"
 SEED="${SEED:-42}"; SEED0="$SEED"; S="${S:-35}"
 read -r -a EVAL_SEEDS <<< "${EVAL_SEEDS:-42 43 44}"
-read -r -a LAYERS <<< "${LAYERS:-5 6 7 8 19 20 28 29 30 31}"
+read -r -a LAYER_SETS <<< "${LAYER_SETS:-literal depth}"
 read -r -a BETAS <<< "${BETAS:-0.01}"
 # Stage 1 (Granite-arms values; attention-only LoRA per the user's decision)
 FINETUNE_MODE="qkv"
@@ -105,7 +118,24 @@ LOG="logs/overnight-obqa-qwen-arms-${RUN_TAG}.log"; exec > >(tee -a "$LOG") 2>&1
 # shellcheck source=medmcqa-arms-lib.sh
 source "$REPO_ROOT/medmcqa-arms-lib.sh"
 trap 'on_error $LINENO' ERR
-LAST_LAYER="${LAYERS[${#LAYERS[@]}-1]}"
+
+# ---- layer sets ------------------------------------------------------------------
+# set_layers <name>: fill the LAYERS array (+ LAST_LAYER) for that set; validated up front.
+set_layers() {
+    local L; L="$(layer_set_layers "$1")" || exit 1
+    [ -n "$L" ] || { echo "ERROR: layer set '$1' is empty" >&2; exit 1; }
+    read -r -a LAYERS <<< "$L"; LAST_LAYER="${LAYERS[${#LAYERS[@]}-1]}"
+}
+for LS in "${LAYER_SETS[@]}"; do set_layers "$LS"; echo "# layer set '$LS': ${LAYERS[*]}"; done
+# MAP saves every decoder layer; its done-marker is the highest layer any set will read.
+MAP_MARKER_LAYER=0; for LS in "${LAYER_SETS[@]}"; do set_layers "$LS"; [ "$LAST_LAYER" -gt "$MAP_MARKER_LAYER" ] && MAP_MARKER_LAYER="$LAST_LAYER"; done
+# Layer-set-aware artefact names (override the lib's 2/3-arg versions; an empty
+# or "literal" set name reproduces the lib's plain names exactly).
+fcvr_sfx() { echo "$(arm_sfx "$1")-${PRIOR_SOURCE}-prior-beta$2$(layer_set_sfx "${3:-}")"; }            # <arm> <beta> [set]
+fcvr_dir() { echo "./router_weights/fcvr/fcvr-${MODEL_SHORTCODE}-${DATASET_SHORTCODE}-$(fcvr_sfx "$1" "$2" "${3:-}")"; }
+tag_fcvr() { echo "$(arm_sfx "$1")_fcvr$(layer_set_sfx "${4:-}")-beta$2_S${S}-s$3"; }                    # <arm> <beta> <seed> [set]
+ood_tag()  { echo "${OOD_TAG}$(layer_set_sfx "${1:-}")"; }                                               # [set]
+ood_stem() { echo "${OOD_DIR}/$(ood_tag "${1:-}")_test_data-s${SEED0}_mc-s${SEED0}"; }                   # [set]
 
 # arm -> training/eval system prompt (utils.prompt.SYSTEM_INSTRUCTIONS key)
 arm_prompt() {
@@ -116,14 +146,28 @@ arm_prompt() {
     esac
 }
 
-# Extend the lib's collision sweep with the ood outputs.
-eval "$(declare -f all_outputs | sed 's/^all_outputs/lib_all_outputs/')"
+# Every output path this run would write (collision sweep) -- replaces the lib's
+# version so the per-layer-set FCVR / eval / ood outputs are covered.
 all_outputs() {
-    lib_all_outputs
-    if has_phase ood; then
-        local STEM="${OOD_DIR}/${OOD_TAG}_test_data-s${SEED0}_mc-s${SEED0}"
-        echo "${STEM}.json"; echo "${STEM}.md"; echo "${STEM}_perexample.jsonl"
-    fi
+    local ARM B SPLIT SEED LS
+    has_phase eval && for SPLIT in val test; do echo "$(eval_json zero-shot "$SPLIT")"; done
+    for ARM in $ARMS; do
+        has_phase stage1 && echo "$(adapter_dir "$ARM")"
+        has_phase map && echo "$(map_dir "$ARM")"
+        for LS in "${LAYER_SETS[@]}"; do for B in "${BETAS[@]}"; do has_phase fcvr && echo "$(fcvr_dir "$ARM" "$B" "$LS")"; done; done
+        if has_phase eval; then
+            for SPLIT in val test; do
+                echo "$(eval_json "$(tag_kvq "$ARM" "$SEED0")" "$SPLIT")"
+                echo "$(eval_json "$(tag_det "$ARM" "$SEED0")" "$SPLIT")"
+                for LS in "${LAYER_SETS[@]}"; do for B in "${BETAS[@]}"; do for SEED in "${EVAL_SEEDS[@]}"; do
+                    echo "$(eval_json "$(tag_fcvr "$ARM" "$B" "$SEED" "$LS")" "$SPLIT")"
+                done; done; done
+            done
+        fi
+    done
+    if has_phase ood; then for LS in "${LAYER_SETS[@]}"; do
+        echo "$(ood_stem "$LS").json"; echo "$(ood_stem "$LS").md"; echo "$(ood_stem "$LS")_perexample.jsonl"
+    done; fi
 }
 
 echo "############################################################"
@@ -132,7 +176,8 @@ echo "# Phases: $PHASES | Arms trained: $ARMS | Betas: ${BETAS[*]} | train seed 
 echo "# GPUs: NGPUS=$NGPUS launcher='${LAUNCH[*]}' | per-rank batches: stage1 ${STAGE1_BATCH_RANK}x${STAGE1_ACCUM} map ${MAP_BATCH_RANK}x${MAP_ACCUM} fcvr ${FCVR_BATCH_RANK}x${GRAD_ACCUM} | grad-ckpt=${GRADIENT_CHECKPOINTING}"
 echo "# Stage1: ${FINETUNE_MODE} epochs=${STAGE1_EPOCHS} eff-bs=${STAGE1_BATCH}x${STAGE1_ACCUM} lr=${STAGE1_LR} eval_every=${STAGE1_EVAL_EVERY} patience=${STAGE1_PATIENCE} max_seq_len=${MAX_SEQ_LEN}"
 echo "# MAP:    epochs=${MAP_EPOCHS} eff-bs=${MAP_BATCH}x${MAP_ACCUM} lr=${MAP_LR} eval_every=${MAP_EVAL_EVERY} patience=${MAP_PATIENCE}"
-echo "# FCVR:   epochs<=${FCVR_EPOCHS} eff-bs=${FCVR_BATCH}x${GRAD_ACCUM} lr=${FCVR_LR} eval_every=${FCVR_EVAL_EVERY} patience=${FCVR_PATIENCE} prior=${PRIOR_SOURCE} kl_mask=${KL_MASK} layers=${LAYERS[*]}"
+echo "# FCVR:   epochs<=${FCVR_EPOCHS} eff-bs=${FCVR_BATCH}x${GRAD_ACCUM} lr=${FCVR_LR} eval_every=${FCVR_EVAL_EVERY} patience=${FCVR_PATIENCE} prior=${PRIOR_SOURCE} kl_mask=${KL_MASK}"
+for LS in "${LAYER_SETS[@]}"; do set_layers "$LS"; echo "#          layer set '$LS' (suffix '$(layer_set_sfx "$LS")'): ${LAYERS[*]}"; done
 echo "# W&B project: ${WANDB_PROJECT} | RESUME=${RESUME:-0} ALLOW_EXISTING=${ALLOW_EXISTING:-0} | python=$(which python) | log: $LOG"
 echo "############################################################"
 
@@ -158,15 +203,17 @@ if has_phase preflight; then
         if grep -q "VERDICT: OUT OF MEMORY" "logs/obqa-qwen-memcheck-stage1-${RUN_TAG}.log"; then
             echo "ERROR: Stage-1 does not fit at per-rank bs ${STAGE1_BATCH_RANK}. Re-run with STAGE1_BATCH=4 STAGE1_ACCUM=2 (same effective batch)." >&2; exit 1
         fi
-        STEP="preflight: GPU memory check (FCVR, worst-case batch)"
-        echo ""; echo "==== preflight 5/6: FCVR memory check, answer_explanation @ per-rank bs ${FCVR_BATCH_RANK} ===="
-        python expert-lora-memory-check.py --model_shortcode "$MODEL_SHORTCODE" --dataset_shortcode "$DATASET_SHORTCODE" \
-            --stage fcvr --swap_layers "${LAYERS[@]}" --beta "${BETAS[0]}" --batch_size "$FCVR_BATCH_RANK" --lr "$FCVR_LR" \
-            --epochs "$FCVR_EPOCHS" --target_mode answer_explanation --system_prompt comparison \
-            --max_seq_len "$MAX_SEQ_LEN" --seed "$SEED" 2>&1 | tee "logs/obqa-qwen-memcheck-fcvr-${RUN_TAG}.log"
-        if grep -q "VERDICT: OUT OF MEMORY" "logs/obqa-qwen-memcheck-fcvr-${RUN_TAG}.log"; then
-            echo "ERROR: FCVR does not fit at per-rank bs ${FCVR_BATCH_RANK}. Re-run with FCVR_BATCH=$NGPUS GRAD_ACCUM=$(( 16 / NGPUS )) (same effective batch 16)." >&2; exit 1
-        fi
+        for LS in "${LAYER_SETS[@]}"; do set_layers "$LS"
+            STEP="preflight: GPU memory check (FCVR, layer set $LS, worst-case batch)"
+            echo ""; echo "==== preflight 5/6: FCVR memory check, layer set '$LS' (${LAYERS[*]}), answer_explanation @ per-rank bs ${FCVR_BATCH_RANK} ===="
+            python expert-lora-memory-check.py --model_shortcode "$MODEL_SHORTCODE" --dataset_shortcode "$DATASET_SHORTCODE" \
+                --stage fcvr --swap_layers "${LAYERS[@]}" --beta "${BETAS[0]}" --batch_size "$FCVR_BATCH_RANK" --lr "$FCVR_LR" \
+                --epochs "$FCVR_EPOCHS" --target_mode answer_explanation --system_prompt comparison \
+                --max_seq_len "$MAX_SEQ_LEN" --seed "$SEED" 2>&1 | tee "logs/obqa-qwen-memcheck-fcvr-${LS}-${RUN_TAG}.log"
+            if grep -q "VERDICT: OUT OF MEMORY" "logs/obqa-qwen-memcheck-fcvr-${LS}-${RUN_TAG}.log"; then
+                echo "ERROR: FCVR (layer set $LS) does not fit at per-rank bs ${FCVR_BATCH_RANK}. Re-run with FCVR_BATCH=$NGPUS GRAD_ACCUM=$(( 16 / NGPUS )) (same effective batch 16)." >&2; exit 1
+            fi
+        done
     else echo ""; echo "==== preflight 4-5/6: memory checks SKIPPED (SKIP_PREFLIGHT=1) ===="; fi
     STEP="preflight: evaluator smoke test"; echo ""; echo "==== preflight 6/6: evaluate_letter.py smoke test (zero-shot, 50 val rows) ===="
     python evaluate_letter.py --model_shortcode "$MODEL_SHORTCODE" --dataset_shortcode "$DATASET_SHORTCODE" --split val --method zero_shot --n 50 \
@@ -190,7 +237,7 @@ done; fi
 if has_phase map; then for ARM in $ARMS; do
     SFX=$(arm_sfx "$ARM"); ADIR=$(adapter_dir "$ARM"); MDIR=$(map_dir "$ARM")
     [ -d "$ADIR" ] || { echo "ERROR: Stage-1 adapter $ADIR missing (run stage1 first)." >&2; exit 1; }
-    run_stage "Stage 2a MAP [$ARM] -> $MDIR" "$MDIR/layer_${LAST_LAYER}_weights.pt" "logs/obqa-qwen-${SFX}-map-${RUN_TAG}.log" \
+    run_stage "Stage 2a MAP [$ARM] -> $MDIR" "$MDIR/layer_${MAP_MARKER_LAYER}_weights.pt" "logs/obqa-qwen-${SFX}-map-${RUN_TAG}.log" \
         "${OUT_DIR}/train_info_${SFX}.txt" "validation loss|Early stopping|complete" -- \
         "${LAUNCH[@]}" scripts/python/router-tuning.py --model_shortcode "$MODEL_SHORTCODE" --dataset_shortcode "$DATASET_SHORTCODE" \
             --base_adapter_path "$ADIR" --map_suffix "$SFX" --target_mode "$ARM" --system_prompt "$(arm_prompt "$ARM")" \
@@ -199,19 +246,20 @@ if has_phase map; then for ARM in $ARMS; do
 done; fi
 
 # ============================================================================
-if has_phase fcvr; then for ARM in $ARMS; do for B in "${BETAS[@]}"; do
-    SFX=$(arm_sfx "$ARM"); ADIR=$(adapter_dir "$ARM"); FDIR=$(fcvr_dir "$ARM" "$B")
+if has_phase fcvr; then for LS in "${LAYER_SETS[@]}"; do set_layers "$LS"; for ARM in $ARMS; do for B in "${BETAS[@]}"; do
+    SFX=$(arm_sfx "$ARM"); ADIR=$(adapter_dir "$ARM"); FDIR=$(fcvr_dir "$ARM" "$B" "$LS")
     [ -d "$ADIR" ] || { echo "ERROR: Stage-1 adapter $ADIR missing (run stage1 first)." >&2; exit 1; }
-    run_stage "Stage 2 FCVR [$ARM] beta=$B -> $FDIR" "$FDIR/layer_${LAST_LAYER}_weights.pt" "logs/obqa-qwen-${SFX}-fcvr-beta${B}-${RUN_TAG}.log" \
+    run_stage "Stage 2 FCVR [$ARM] beta=$B layers=$LS (${LAYERS[*]}) -> $FDIR" "$FDIR/layer_${LAST_LAYER}_weights.pt" \
+        "logs/obqa-qwen-${SFX}-fcvr-beta${B}-${LS}-${RUN_TAG}.log" \
         "${OUT_DIR}/train_info_${SFX}.txt" "validation loss|Early stopping|complete" -- \
         "${LAUNCH[@]}" scripts/python/fcvr-tuning.py --model_shortcode "$MODEL_SHORTCODE" --dataset_shortcode "$DATASET_SHORTCODE" \
             --base_adapter_path "$ADIR" --target_mode "$ARM" --system_prompt "$(arm_prompt "$ARM")" \
             --swap_layers "${LAYERS[@]}" --load_layers --train_layers "${LAYERS[@]}" \
             --epochs "$FCVR_EPOCHS" --batch_size "$FCVR_BATCH_RANK" --grad_accum_steps "$GRAD_ACCUM" --lr "$FCVR_LR" \
             --warmup_ratio "$WARMUP_RATIO" --early_stop_patience "$FCVR_PATIENCE" --eval_every "$FCVR_EVAL_EVERY" \
-            --max_seq_len "$MAX_SEQ_LEN" --beta "$B" --seed "$SEED" --run_suffix "$(fcvr_sfx "$ARM" "$B")" \
+            --max_seq_len "$MAX_SEQ_LEN" --beta "$B" --seed "$SEED" --run_suffix "$(fcvr_sfx "$ARM" "$B" "$LS")" \
             --prior_source "$PRIOR_SOURCE" --kl_mask "$KL_MASK"
-done; done; fi
+done; done; done; fi
 
 # ============================================================================
 if has_phase eval; then for SPLIT in val test; do
@@ -223,12 +271,12 @@ if has_phase eval; then for SPLIT in val test; do
         if [ -d "$(map_dir "$ARM")" ]; then
             run_eval "$(tag_det "$ARM" "$SEED0")" "$SPLIT" "$SEED0" det --kvq_adapter_path "$ADIR" --map_suffix "$SFX" --system_prompt "$SP"
         else echo "  (no $(map_dir "$ARM") -> skipping det row for $ARM)"; fi
-        for B in "${BETAS[@]}"; do
-            if [ -d "$(fcvr_dir "$ARM" "$B")" ]; then for SEED in "${EVAL_SEEDS[@]}"; do
-                run_eval "$(tag_fcvr "$ARM" "$B" "$SEED")" "$SPLIT" "$SEED" fcvr --kvq_adapter_path "$ADIR" --system_prompt "$SP" \
-                    --swap_layers "${LAYERS[@]}" --run_suffix "$(fcvr_sfx "$ARM" "$B")" --prior_source "$PRIOR_SOURCE"
-            done; else echo "  (no $(fcvr_dir "$ARM" "$B") -> skipping fcvr beta=$B rows for $ARM)"; fi
-        done
+        for LS in "${LAYER_SETS[@]}"; do set_layers "$LS"; for B in "${BETAS[@]}"; do
+            if [ -d "$(fcvr_dir "$ARM" "$B" "$LS")" ]; then for SEED in "${EVAL_SEEDS[@]}"; do
+                run_eval "$(tag_fcvr "$ARM" "$B" "$SEED" "$LS")" "$SPLIT" "$SEED" fcvr --kvq_adapter_path "$ADIR" --system_prompt "$SP" \
+                    --swap_layers "${LAYERS[@]}" --run_suffix "$(fcvr_sfx "$ARM" "$B" "$LS")" --prior_source "$PRIOR_SOURCE"
+            done; else echo "  (no $(fcvr_dir "$ARM" "$B" "$LS") -> skipping fcvr beta=$B layers=$LS rows for $ARM)"; fi
+        done; done
     done
 done; echo "eval done -- $(date)"; fi
 
@@ -243,22 +291,24 @@ if has_phase report; then
 fi
 
 # ============================================================================
-if has_phase ood; then
-    STEP="ood: paired ILV OoD arms comparison"
-    echo ""; echo "==== ood: evaluate_ilv_ood_arms.py --id_dataset obqa_gen --model_shortcode ${MODEL_SHORTCODE} -- $(date) ===="
-    OOD_STEM="${OOD_DIR}/${OOD_TAG}_test_data-s${SEED0}_mc-s${SEED0}"
-    if skip_done "${OOD_STEM}.json"; then :; else
+if has_phase ood; then for LS in "${LAYER_SETS[@]}"; do set_layers "$LS"
+    STEP="ood: paired ILV OoD arms comparison (layer set $LS)"
+    echo ""; echo "==== ood [$LS: ${LAYERS[*]}]: evaluate_ilv_ood_arms.py --id_dataset obqa_gen --model_shortcode ${MODEL_SHORTCODE} --tag $(ood_tag "$LS") -- $(date) ===="
+    if skip_done "$(ood_stem "$LS").json"; then :; else
         OW=(); [ "${ALLOW_EXISTING:-0}" = "1" ] && OW=(--overwrite)
+        # run suffixes passed explicitly (the ARM_SETUP registry defaults name the literal set)
         python evaluate_ilv_ood_arms.py --model_shortcode "$MODEL_SHORTCODE" --id_dataset "$DATASET_SHORTCODE" --split test \
             --n_per_domain "$OOD_N_PER_DOMAIN" --data_seed "$SEED0" --sampling_seed "$SEED0" \
-            --num_samples "$S" --batch_size "$EVAL_BATCH" --swap_layers "${LAYERS[@]}" --tag "$OOD_TAG" \
-            --arm_a_adapter "$(adapter_dir letter)" --arm_b_adapter "$(adapter_dir answer_explanation)" "${OW[@]}"
+            --num_samples "$S" --batch_size "$EVAL_BATCH" --swap_layers "${LAYERS[@]}" --tag "$(ood_tag "$LS")" \
+            --arm_a_adapter "$(adapter_dir letter)" --arm_b_adapter "$(adapter_dir answer_explanation)" \
+            --arm_a_run_suffix "$(fcvr_sfx letter "${BETAS[0]}" "$LS")" \
+            --arm_b_run_suffix "$(fcvr_sfx answer_explanation "${BETAS[0]}" "$LS")" "${OW[@]}"
     fi
-fi
+done; fi
 
 echo ""; echo "############################################################"
 echo "# ALL DONE -- $(date)"
-echo "# Table: ${REPORT_DIR}/letter_arms_test.md (and _val.md) | evals: ${OUT_DIR}/ | OoD: ${OOD_DIR}/${OOD_TAG}_* | log: ${LOG}"
+echo "# Table: ${REPORT_DIR}/letter_arms_test.md (and _val.md) | evals: ${OUT_DIR}/ | OoD: $(for LS in "${LAYER_SETS[@]}"; do printf '%s ' "$(ood_stem "$LS").*"; done)| log: ${LOG}"
 echo "############################################################"
 notify info "OBQA-qwen arms run finished (${PHASES})" \
     "Host $(hostname), run ${RUN_TAG}. Arms: ${ARMS}. Betas: ${BETAS[*]}. Table: ${REPORT_DIR}/letter_arms_test.md. Log: ${LOG}"

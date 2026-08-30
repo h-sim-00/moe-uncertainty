@@ -15,7 +15,9 @@ split and writes one report:
   4. per-subject ACC / ECE (medmcqa_gen only)
 
 Tag grammar (set by run-overnight-medmcqa-arms.sh):
-    <armA-letter|armB-ansexp>_<kvq|det|fcvr[-beta<b>]>[_S<S>]-s<seed>
+    <armA-letter|armB-ansexp>_<kvq|det|fcvr[-layers-<set>][-beta<b>]>[_S<S>]-s<seed>
+    (the optional -layers-<set> marks a non-default FCVR layer set, OBQA-qwen; arms
+    are still paired on the exact remainder, so each layer set pairs with itself)
 Usage (CPU):
     python letter_eval_report.py --split test
 Writes <out_dir>/letter_arms_<split>.md and .json; never touches the inputs.

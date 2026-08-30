@@ -47,6 +47,26 @@ fcvr_sfx()    { echo "$(arm_sfx "$1")-${PRIOR_SOURCE}-prior-beta$2"; }          
 fcvr_dir()    { echo "./router_weights/fcvr/fcvr-${MODEL_SHORTCODE}-${DATASET_SHORTCODE}-$(fcvr_sfx "$1" "$2")"; }
 eval_json()   { echo "${OUT_DIR}/$1_$2.json"; }                                     # <tag> <split>
 
+# ---- FCVR layer sets (OBQA-qwen; Granite drivers never call these) ----------
+# A named set of decoder layers to Bayesianify. "literal" = the Granite indices
+# copied verbatim (its artefacts keep the plain Granite-style names, so the
+# ARM_SETUP registry defaults resolve to it); any other set gets "-layers-<name>"
+# appended to the FCVR run_suffix / eval tags / OoD tags so nothing collides.
+#   depth = Granite's three blocks {5-8, 19-20, last four of 32} mapped to
+#           Qwen's 40 layers by relative depth i/L (x1.25): {6-9, 24-25, 36-39};
+#           |i/40 - j/32| <= 0.025 for every pair, the last layer stays last.
+# Override a set with LAYERS_<name>="..." (LAYERS alone still overrides literal).
+layer_set_layers() {   # <name> -> space-separated layer indices
+    local V="LAYERS_$1"
+    if [ -n "${!V:-}" ]; then echo "${!V}"; return; fi
+    case "$1" in
+        literal) echo "${LAYERS:-5 6 7 8 19 20 28 29 30 31}" ;;
+        depth)   echo "6 7 8 9 24 25 36 37 38 39" ;;
+        *) echo "ERROR: unknown layer set '$1' (literal|depth, or set LAYERS_$1)" >&2; return 1 ;;
+    esac
+}
+layer_set_sfx() { if [ -z "${1:-}" ] || [ "$1" = "literal" ]; then echo ""; else echo "-layers-$1"; fi; }
+
 # evaluate_letter.py tags (the report pairs arm A/B on an EXACT remainder match)
 tag_kvq()  { echo "$(arm_sfx "$1")_kvq-s$2"; }                  # <arm> <seed>
 tag_det()  { echo "$(arm_sfx "$1")_det-s$2"; }                  # <arm> <seed>

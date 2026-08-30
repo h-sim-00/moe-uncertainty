@@ -28,6 +28,9 @@
 #   DATA_SEED=42  SAMPLING_SEED=42  S=35  EVAL_BATCH=8  N_BOOT=2000  ROUTING=stochastic
 #   LAYERS="5 6 7 8 19 20 28 29 30 31"  TAG=obqa-ood-expl  OUT_DIR=results/ood_expl_readout
 #   MODEL_SHORTCODE=granite|qwen36 (selects the saved arms; non-granite tags get "-<model>" appended)
+#   LAYER_SET=literal|depth (OBQA-qwen; see medmcqa-arms-lib.sh layer_set_layers): a non-literal
+#           set selects its layers, appends "-layers-<set>" to TAG and reads the FCVR weights
+#           saved under "<arm suffix>-layers-<set>" (BETA=0.01 picks the beta in that suffix)
 #   STAGE1_OOD="arc_c arc_e medexqa"  TRACE_OOD="medexqa scienceqa ecqa aqua_rat"
 #   CROSSCHECK_STAGE1=<saved ilv_ood_arms perexample.jsonl>  CROSSCHECK_TF=<saved analyze_obqa_gen trace perexample.jsonl>
 #   SMOKE=1 (tiny caps, tag smoke, plus a deterministic-routing gen alignment check)
@@ -46,11 +49,11 @@ MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-256}"; MAX_SEQ_TOKENS="${MAX_SEQ_TOKENS:-2048}
 PERTOKEN_SCOPE="${PERTOKEN_SCOPE:-target}"
 DATA_SEED="${DATA_SEED:-42}"; SAMPLING_SEED="${SAMPLING_SEED:-42}"; S="${S:-35}"
 EVAL_BATCH="${EVAL_BATCH:-8}"; N_BOOT="${N_BOOT:-2000}"; ROUTING="${ROUTING:-stochastic}"
-read -r -a LAYERS <<< "${LAYERS:-5 6 7 8 19 20 28 29 30 31}"
 # MODEL_SHORTCODE selects the saved arms (ARM_SETUP registry): granite (default)
 # keeps the historical stem; any other model gets "-<model>" appended (never
 # collides with the Granite outputs).
 MODEL_SHORTCODE="${MODEL_SHORTCODE:-granite}"
+LAYER_SET="${LAYER_SET:-literal}"; BETA="${BETA:-0.01}"
 if [ "$MODEL_SHORTCODE" = "granite" ]; then TAG="${TAG:-obqa-ood-expl}"; else TAG="${TAG:-obqa-ood-expl-${MODEL_SHORTCODE}}"; fi
 OUT_DIR="${OUT_DIR:-results/ood_expl_readout}"
 read -r -a STAGE1_OOD <<< "${STAGE1_OOD:-arc_c arc_e medexqa}"
@@ -69,9 +72,20 @@ export RUN_TAG WANDB_PROJECT
 mkdir -p logs "$OUT_DIR"
 LOG="logs/ood-expl-readout-${RUN_TAG}.log"; exec > >(tee -a "$LOG") 2>&1
 # shellcheck source=medmcqa-arms-lib.sh
-source "$REPO_ROOT/medmcqa-arms-lib.sh"      # notify / on_error / skip_done / has_phase
+source "$REPO_ROOT/medmcqa-arms-lib.sh"      # notify / on_error / skip_done / has_phase / layer_set_*
 PHASES="$STAGES"
 trap 'on_error $LINENO' ERR
+
+# Layer set -> layers, tag suffix and (non-literal only) the per-arm FCVR run
+# suffixes; "literal" reproduces the historical command line exactly.
+LS_LAYERS="$(layer_set_layers "$LAYER_SET")" || exit 1
+read -r -a LAYERS <<< "$LS_LAYERS"
+TAG="${TAG}$(layer_set_sfx "$LAYER_SET")"
+ARM_SFX=()
+if [ -n "$(layer_set_sfx "$LAYER_SET")" ]; then
+    ARM_SFX=(--arm_a_run_suffix "armA-letter-pretrained-prior-beta${BETA}$(layer_set_sfx "$LAYER_SET")"
+             --arm_b_run_suffix "armB-ansexp-pretrained-prior-beta${BETA}$(layer_set_sfx "$LAYER_SET")")
+fi
 
 stem() { echo "${OUT_DIR}/${TAG}_${SPLIT}_data-s${DATA_SEED}_mc-s${SAMPLING_SEED}_$1"; }   # <stage>
 
@@ -79,13 +93,14 @@ common=(--model_shortcode "$MODEL_SHORTCODE"
         --split "$SPLIT" --n_per_domain "$N_PER_DOMAIN" --trace_n_id "$TRACE_N_ID" --trace_n_ood "$TRACE_N_OOD"
         --max_new_tokens "$MAX_NEW_TOKENS" --max_seq_tokens "$MAX_SEQ_TOKENS" --pertoken_scope "$PERTOKEN_SCOPE"
         --data_seed "$DATA_SEED" --sampling_seed "$SAMPLING_SEED" --num_samples "$S" --batch_size "$EVAL_BATCH"
-        --n_boot "$N_BOOT" --routing "$ROUTING" --swap_layers "${LAYERS[@]}" --output_dir "$OUT_DIR" --tag "$TAG")
+        --n_boot "$N_BOOT" --routing "$ROUTING" --swap_layers "${LAYERS[@]}" --output_dir "$OUT_DIR" --tag "$TAG"
+        "${ARM_SFX[@]}")
 OW=(); [ "${ALLOW_EXISTING:-0}" = "1" ] && OW=(--overwrite)
 
 echo "############################################################"
 echo "# OoD explanation read-out ${RUN_TAG}  branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?') commit=$(git rev-parse --short HEAD 2>/dev/null || echo '?')"
 echo "# stages=$STAGES split=$SPLIT n_per_domain=$N_PER_DOMAIN trace_n=$TRACE_N_ID/$TRACE_N_OOD max_new_tokens=$MAX_NEW_TOKENS"
-echo "# model=$MODEL_SHORTCODE data_seed=$DATA_SEED sampling_seed=$SAMPLING_SEED S=$S routing=$ROUTING layers=${LAYERS[*]} tag=$TAG"
+echo "# model=$MODEL_SHORTCODE data_seed=$DATA_SEED sampling_seed=$SAMPLING_SEED S=$S routing=$ROUTING layer_set=$LAYER_SET layers=${LAYERS[*]} tag=$TAG${ARM_SFX:+ arm suffixes: ${ARM_SFX[*]}}"
 echo "# stage1 OoD: ${STAGE1_OOD[*]} | trace OoD: ${TRACE_OOD[*]} | SMOKE=${SMOKE:-0} RESUME=${RESUME:-0} ALLOW_EXISTING=${ALLOW_EXISTING:-0}"
 echo "# python=$(which python) | log: $LOG"
 echo "############################################################"
