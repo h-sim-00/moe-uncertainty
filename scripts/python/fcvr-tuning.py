@@ -2,14 +2,16 @@ import argparse
 import math
 import os, torch, wandb
 from tqdm import tqdm
-from torch.utils.data import DataLoader
 from transformers import DataCollatorForSeq2Seq, get_cosine_schedule_with_warmup
 
-from model.adapters import granite_adapter, qwen_adapter, deepseek_adapter
+from model.adapters import granite_adapter, qwen_adapter, deepseek_adapter, qwen36_adapter, moe_router
 
 from utils import setup_environment, seed_everything
 from model import load_peft_model_and_adapter, load_tokenizer
-from utils import load_and_prepare_train_and_val_data, loss_mode_label, add_target_mode_arg
+from utils import (load_and_prepare_train_and_val_data, loss_mode_label, add_target_mode_arg,
+                   add_system_prompt_arg, eligible_tag_for)
+from utils.dist import (init_distributed, make_loader, set_epoch, wrap_ddp, unwrap, reduce_mean,
+                        barrier, cleanup)
 
 ADAPTER_MAP = {
     "granite": {
@@ -27,9 +29,31 @@ ADAPTER_MAP = {
         "prepare": deepseek_adapter.prepare_deepseek_bayesian_routers,
         "save": deepseek_adapter.save_deepseek_bayesian_routers,
     },
+    "qwen36": {
+        "load": qwen36_adapter.load_qwen36_map_routers,
+        "prepare": qwen36_adapter.prepare_qwen36_bayesian_routers,
+        "save": qwen36_adapter.save_qwen36_bayesian_routers,
+    },
 }
 
-def train_fcvr_router(model, tokenizer, train_loader, val_loader, args):
+def prepare_model(model, args):
+    """Swap in the FCVR routers (MAP or pre-trained prior). Runs BEFORE the DDP
+    wrap so DDP registers the trainable router parameters."""
+    adapter = ADAPTER_MAP[args.model_shortcode]
+    load_map_routers = adapter["load"]
+    prepare_bayesian_routers = adapter["prepare"]
+
+    # Seed the FCVR prior mean (mean_base) either from the fine-tuned MAP
+    # routers (inherited pipeline) or from the pre-trained routers
+    # (paper-faithful: paper freezes the pre-trained Wr and never MAP-tunes it).
+    if args.prior_source == "map":
+        model = load_map_routers(model, args=args)
+    else:
+        print("--- prior_source=pretrained: skipping MAP load; FCVR mean_base seeds from the pre-trained router ---")
+    return prepare_bayesian_routers(model, method="fcvr", args=args)
+
+
+def train_fcvr_router(model, tokenizer, train_loader, val_loader, args, info):
     """Custom training loop for the FCVR using the ELBO loss."""
     run_name = f"fcvr-{args.model_shortcode}-{args.dataset_shortcode}"
     if getattr(args, "run_suffix", None):
@@ -37,20 +61,10 @@ def train_fcvr_router(model, tokenizer, train_loader, val_loader, args):
 
     # === 0: Make sure we're using the currect swap, save functions ===
     adapter = ADAPTER_MAP[args.model_shortcode]
-    load_map_routers = adapter["load"]
-    prepare_bayesian_routers = adapter["prepare"]
     save_bayesian_routers = adapter["save"]
 
-    # === 1. Prepare Model for Training ===
-    # Seed the FCVR prior mean (mean_base) either from the fine-tuned MAP
-    # routers (inherited pipeline) or from the pre-trained Granite routers
-    # (paper-faithful: paper freezes the pre-trained Wr and never MAP-tunes it).
-    if args.prior_source == "map":
-        model = load_map_routers(model, args=args)
-    else:
-        print("--- prior_source=pretrained: skipping MAP load; FCVR mean_base seeds from the pre-trained Granite router ---")
-    model = prepare_bayesian_routers(model, method="fcvr", args=args)
-    causal_model = model.base_model.model.model
+    # === 1. Model already prepared (prepare_model) ===
+    causal_model = unwrap(model).base_model.model.model
 
     # === 2. Create Optimizer + Cosine Schedule (paper D.2) ===
     # AdamW + cosine decay with warmup_ratio warmup. Gradient accumulation lifts
@@ -67,11 +81,13 @@ def train_fcvr_router(model, tokenizer, train_loader, val_loader, args):
         optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_optim_steps
     )
     print(f"--- Optim: AdamW lr={args.lr} cosine warmup={warmup_steps}/{total_optim_steps} steps "
-          f"| per-device batch={args.batch_size} x grad_accum={grad_accum} = eff batch {args.batch_size * grad_accum} ---")
+          f"| per-device batch={args.batch_size} x grad_accum={grad_accum} x ranks={info.world} "
+          f"= eff batch {args.batch_size * grad_accum * info.world} ---")
 
     # === 3. Run Custom Training Loop ===
-    project_name = "moe-uncertainty"
-    wandb.init(project=project_name, name=run_name, config=vars(args), reinit=True)
+    project_name = os.environ.get("WANDB_PROJECT", "moe-uncertainty")
+    if info.is_main:
+        wandb.init(project=project_name, name=run_name, config=vars(args), reinit=True)
 
     # Early stopping on validation NLL (the LM reconstruction loss). Validation
     # runs at every epoch end and -- with --eval_every N > 0 -- every N OPTIMIZER
@@ -81,27 +97,33 @@ def train_fcvr_router(model, tokenizer, train_loader, val_loader, args):
     evals_no_improve = 0
     optim_step = 0
 
+    def save_routers():
+        if info.is_main:
+            save_bayesian_routers(unwrap(model), method="fcvr", args=args)
+        barrier(info)
+
     def run_validation():
         model.eval()
         total_val_loss = 0
         with torch.no_grad():
             for batch in val_loader:
-                inputs = {k: v.to(model.device) for k, v in batch.items()}
+                inputs = {k: v.to(info.device) for k, v in batch.items()}
                 outputs = model(**inputs)
                 total_val_loss += outputs.loss.item()
         model.train()
-        return total_val_loss / len(val_loader)
+        return reduce_mean(total_val_loss / len(val_loader), info)
 
     def check_and_save(avg_val_loss, where, epoch):
         """-> True if training should stop (patience exhausted)."""
         nonlocal best_val_loss, evals_no_improve
         print(f"{where} validation loss (NLL): {avg_val_loss:.4f}")
-        wandb.log({"val_loss": avg_val_loss, "epoch": epoch, "optim_step": optim_step})
+        if info.is_main:
+            wandb.log({"val_loss": avg_val_loss, "epoch": epoch, "optim_step": optim_step})
         if avg_val_loss < best_val_loss - 1e-4:
             best_val_loss = avg_val_loss
             evals_no_improve = 0
             print(f"  New best val NLL {best_val_loss:.4f} -> saving FCVR weights.")
-            save_bayesian_routers(model, method="fcvr", args=args)
+            save_routers()
             return False
         evals_no_improve += 1
         print(f"  No val-NLL improvement ({evals_no_improve}/{args.early_stop_patience}).")
@@ -116,11 +138,12 @@ def train_fcvr_router(model, tokenizer, train_loader, val_loader, args):
               f"patience {args.early_stop_patience} evaluations ---")
     stop = False
     for epoch in range(args.epochs):
+        set_epoch(train_loader, epoch)
         model.train()
         total_epoch_loss = 0
         optimizer.zero_grad()
-        for i, batch in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}")):
-            inputs = {k: v.to(model.device) for k, v in batch.items()}
+        for i, batch in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}", disable=not info.is_main)):
+            inputs = {k: v.to(info.device) for k, v in batch.items()}
             outputs = model(**inputs)
 
             reconstruction_loss = outputs.loss
@@ -136,12 +159,7 @@ def train_fcvr_router(model, tokenizer, train_loader, val_loader, args):
                 kl_mask = None
             total_kl_div = 0
             for layer_idx in args.train_layers:
-                if args.model_shortcode == "granite":
-                    router = causal_model.layers[layer_idx].block_sparse_moe.router
-                elif args.model_shortcode == "qwen":
-                    router = causal_model.layers[layer_idx].mlp.router
-                elif args.model_shortcode == "deepseek":
-                    router = causal_model.layers[layer_idx].mlp.router
+                router = moe_router(causal_model.layers[layer_idx])
                 total_kl_div += router.kl_divergence(mask=kl_mask)
 
             # Paper-faithful ELBO weighting: loss = L_task + beta * sum_layers KL_layer,
@@ -163,13 +181,14 @@ def train_fcvr_router(model, tokenizer, train_loader, val_loader, args):
                 optim_step += 1
 
             total_epoch_loss += loss.item()
-            wandb.log({
-                "train_loss": loss.item(),
-                "reconstruction_loss": reconstruction_loss.item(),
-                "kl_term": kl_term.item(),
-                "kl_tokens_in_batch": int(kl_mask.sum().item()) if kl_mask is not None else int(inputs["input_ids"].numel()),
-                "lr": scheduler.get_last_lr()[0],
-            })
+            if info.is_main:
+                wandb.log({
+                    "train_loss": loss.item(),
+                    "reconstruction_loss": reconstruction_loss.item(),
+                    "kl_term": kl_term.item(),
+                    "kl_tokens_in_batch": int(kl_mask.sum().item()) if kl_mask is not None else int(inputs["input_ids"].numel()),
+                    "lr": scheduler.get_last_lr()[0],
+                })
             if is_step and args.eval_every and optim_step % args.eval_every == 0 and (i + 1) < num_training_batches:
                 if check_and_save(run_validation(), f"Epoch {epoch+1} optim-step {optim_step}", epoch):
                     stop = True
@@ -187,7 +206,7 @@ def train_fcvr_router(model, tokenizer, train_loader, val_loader, args):
     # persist the final state so the weights dir is not empty.
     if best_val_loss == float("inf"):
         print("--- Val NLL never improved; saving final state as a fallback ---")
-        save_bayesian_routers(model, method="fcvr", args=args)
+        save_routers()
 
     print(f"--- FCVR Fine-tuning complete (best val NLL {best_val_loss:.4f}) ---")
 
@@ -196,16 +215,16 @@ def parse_args():
     parser.add_argument("--model_shortcode", type=str, required=True)
     parser.add_argument("--dataset_shortcode", type=str, required=True)
     parser.add_argument("--base_adapter_path", type=str, required=True)
-    
+
     parser.add_argument("--swap_layers", type=int, nargs='+', required=True)
-    parser.add_argument("--load_layers", type=int, nargs='*', default=[]) 
+    parser.add_argument("--load_layers", type=int, nargs='*', default=[])
     parser.add_argument("--train_layers", type=int, nargs='+', required=True)
 
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch_size", type=int, default=4,
                         help="Per-device micro-batch; paper uses {2,4,8} with grad-accum to eff batch 16.")
     parser.add_argument("--grad_accum_steps", type=int, default=4,
-                        help="Gradient accumulation steps; batch_size * grad_accum_steps = effective batch (paper: 16).")
+                        help="Gradient accumulation steps; batch_size * grad_accum_steps (* ranks under torchrun) = effective batch (paper: 16).")
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--warmup_ratio", type=float, default=0.05,
                         help="Fraction of total optimizer steps used for LR warmup (paper D.2: 0.05).")
@@ -227,21 +246,23 @@ def parse_args():
     parser.add_argument("--map_suffix", type=str, default=None,
                         help="[prior_source=map] Suffix of the MAP router weights dir (router_weights/base/<model>_<dataset>-<suffix>).")
     parser.add_argument("--prior_source", type=str, default="map", choices=["map", "pretrained"],
-                        help="Seed FCVR mean_base from fine-tuned MAP routers ('map') or the pre-trained Granite router ('pretrained', paper-faithful).")
+                        help="Seed FCVR mean_base from fine-tuned MAP routers ('map') or the pre-trained router ('pretrained', paper-faithful).")
     add_target_mode_arg(parser, "Must match the Stage-1 adapter's mode.")
+    add_system_prompt_arg(parser)
     return parser.parse_args()
 
 def main():
     print("Setting up the environment...")
     setup_environment()
     args = parse_args()
+    info = init_distributed()
 
     seed_everything(args.seed)  # random (dataset shuffles/splits) + numpy + torch
 
     model = load_peft_model_and_adapter(
         args.model_shortcode,
         adapter_path=args.base_adapter_path,
-        device_map="cuda:0"
+        device_map=info.device
     )
     tokenizer = load_tokenizer(args.model_shortcode)
 
@@ -251,17 +272,28 @@ def main():
     # rebuilding labels from input_ids (DataCollatorForLanguageModeling would train
     # on the prompt too). Seq2Seq pads input_ids with pad_token and labels with
     # -100 dynamically per batch; right padding keeps real-token positions correct
-    # during training (eval keeps left).
+    # during training (eval keeps left). Rank 0 builds the data first.
+    if not info.is_main:
+        barrier(info)
     train_dataset, val_dataset = load_and_prepare_train_and_val_data(
         tokenizer, [args.dataset_shortcode], seed=args.seed, answer_only=True, max_seq_len=args.max_seq_len or None,
-        target_mode=args.target_mode)
+        target_mode=args.target_mode, system_prompt=args.system_prompt,
+        eligible_tag=eligible_tag_for(args.model_shortcode))
+    if info.is_main:
+        barrier(info)
     tokenizer.padding_side = "right"
     data_collator = DataCollatorForSeq2Seq(tokenizer=tokenizer, padding=True, label_pad_token_id=-100)
     print(f"--- Loss mode: {loss_mode_label([args.dataset_shortcode], args.target_mode)} ---")
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, collate_fn=data_collator, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, collate_fn=data_collator)
-    
-    train_fcvr_router(model, tokenizer, train_loader, val_loader, args)
+    train_loader = make_loader(train_dataset, args.batch_size, data_collator, shuffle=True, seed=args.seed, info=info)
+    val_loader = make_loader(val_dataset, args.batch_size, data_collator, shuffle=False, seed=args.seed, info=info)
+
+    model = prepare_model(model, args)
+    model = wrap_ddp(model, info)
+    if info.distributed:
+        torch.manual_seed(args.seed + info.rank)   # per-rank reparameterisation noise (init identical: seeded before)
+
+    train_fcvr_router(model, tokenizer, train_loader, val_loader, args, info)
+    cleanup(info)
 
 if __name__ == "__main__":
     main()

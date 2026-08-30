@@ -66,8 +66,10 @@ from evaluate_ilv_ood_arms import (
     ARM_SETUP,
     DEFAULT_LAYERS,
     SAME_SOURCE,
+    check_model_registered,
     check_output_collisions,
     ci_text,
+    default_tag,
     domain_sampling_seed,
     f3,
     git_revision,
@@ -82,6 +84,7 @@ from evaluate_ilv_ood_arms import (
     signal_quality,
 )
 from evaluate_letter import CHOICES, prepare, readout
+from model.adapters import moe_router
 from uq_stats import auprc, auroc, bootstrap_ci, bootstrap_mean_ci
 from utils import seed_everything, setup_environment
 from utils.data import EXPLANATION_MARKER, build_target_mode_example
@@ -161,14 +164,16 @@ def parse_args():
     p.add_argument("--arm_a_run_suffix", default=None, help="Default: ARM_SETUP entry.")
     p.add_argument("--arm_b_run_suffix", default=None, help="Default: ARM_SETUP entry.")
     p.add_argument("--output_dir", default="results/analyze_obqa_gen")
-    p.add_argument("--tag", default="obqa-gen-analysis")
+    p.add_argument("--tag", default=None,
+                   help="Output stem. Default: obqa-gen-analysis (granite) / obqa-gen-analysis-<model_shortcode> otherwise.")
     p.add_argument("--overwrite", action="store_true")
     return p.parse_args()
 
 
 def validate_args(args):
-    if args.model_shortcode != "granite":
-        raise SystemExit("The saved comparison arms are Granite-specific; --model_shortcode must be granite.")
+    check_model_registered(args)
+    if args.tag is None:
+        args.tag = default_tag("obqa-gen-analysis", args.model_shortcode)
     if args.n_per_domain < 0 or args.trace_n_id < 0 or args.trace_n_ood < 0:
         raise SystemExit("--n_per_domain/--trace_n_id/--trace_n_ood must be >= 0")
     if args.n_boot < 1:
@@ -209,7 +214,7 @@ def output_paths(args):
 def set_routing_mode(model, fcvr_layers, routing):
     causal_model = model.base_model.model.model
     for l in fcvr_layers:
-        causal_model.layers[l].block_sparse_moe.router.deterministic_readout = (routing == "deterministic")
+        moe_router(causal_model.layers[l]).deterministic_readout = (routing == "deterministic")
 
 
 # ---------------------------------------------------------------------------
@@ -473,7 +478,7 @@ def trace_example(model, tokenizer, causal_model, fcvr_layers, choice_ids_t,
 
     per_layer = []
     for l in fcvr_layers:
-        L = causal_model.layers[l].block_sparse_moe.router.last_cholesky_factor
+        L = moe_router(causal_model.layers[l]).last_cholesky_factor
         E = L.shape[-1]
         L = L.view(1, seq_len, E, E)[0].float()
         per_layer.append((L ** 2).sum(dim=(-1, -2)))                       # tr(LL^T) [seq]

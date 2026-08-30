@@ -59,7 +59,9 @@ from evaluate_ilv_ood_arms import (
     ARM_SETUP,
     DEFAULT_LAYERS,
     SAME_SOURCE,
+    check_model_registered,
     check_output_collisions,
+    default_tag,
     git_revision,
     load_domains,
     resolve_arm_setup,
@@ -120,7 +122,8 @@ def parse_args(argv=None):
     p.add_argument("--arm_a_run_suffix", default=None, help="Default: ARM_SETUP entry.")
     p.add_argument("--arm_b_run_suffix", default=None, help="Default: ARM_SETUP entry.")
     p.add_argument("--output_dir", default="results/generation_examples")
-    p.add_argument("--tag", default="gen-examples")
+    p.add_argument("--tag", default=None,
+                   help="Output stem. Default: gen-examples (granite) / gen-examples-<model_shortcode> otherwise.")
     p.add_argument("--width", type=int, default=100, help="Report line width.")
     p.add_argument("--overwrite", action="store_true")
     p.add_argument("--from_texts", default=None, metavar="GEN_TEXTS_JSONL",
@@ -129,8 +132,9 @@ def parse_args(argv=None):
 
 
 def validate_args(args):
-    if args.model_shortcode != "granite":
-        raise SystemExit("The saved comparison arms are Granite-specific; --model_shortcode must be granite.")
+    check_model_registered(args)
+    if args.tag is None:
+        args.tag = default_tag("gen-examples", args.model_shortcode)
     if args.n_examples < 0 or args.n_per_domain < 0 or args.max_new_tokens < 1 or args.width < 40:
         raise SystemExit("--n_examples/--n_per_domain >= 0, --max_new_tokens >= 1, --width >= 40 required")
     if not args.swap_layers:

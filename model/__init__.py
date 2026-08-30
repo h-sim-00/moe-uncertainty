@@ -7,7 +7,30 @@ MODEL_SHORTCODE2ID = {
     "granite": "ibm-granite/granite-3.1-3b-a800m-instruct",
     "deepseek": "deepseek-ai/deepseek-moe-16b-chat",
     "qwen": "Qwen/Qwen1.5-MoE-A2.7B-Chat",
+    # branch OBQA-qwen: Qwen3.6-35B-A3B (transformers>=5 `Qwen3_5MoeForCausalLM`;
+    # hybrid Gated-DeltaNet/attention, 40 layers, 256 experts top-8 + shared expert).
+    "qwen36": "Qwen/Qwen3.6-35B-A3B",
 }
+
+# Stage-1 LoRA targets per model for finetune_mode in ('qkv', 'qkv_experts').
+# Qwen3.6: q/k/v_proj exist only in the 10 full-attention layers; the 30 Gated
+# DeltaNet layers project Q/K/V through the fused `in_proj_qkv` Linear, so it is
+# included so every layer's QKV projection is adapted. Granite list unchanged.
+LORA_QKV_TARGETS = {
+    "default": ["q_proj", "k_proj", "v_proj"],
+    "qwen36": ["q_proj", "k_proj", "v_proj", "in_proj_qkv"],
+}
+
+
+def _enable_gradient_checkpointing(peft_model):
+    """Opt-in via GRADIENT_CHECKPOINTING=1: recomputes activations in backward,
+    cutting activation memory (arm B on a 44-46 GiB card; every Qwen3.6 stage)
+    at ~25-35% speed cost. Mathematically identical training."""
+    if os.environ.get("GRADIENT_CHECKPOINTING", "0") == "1":
+        peft_model.config.use_cache = False
+        peft_model.enable_input_require_grads()
+        peft_model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+        print("--- Gradient checkpointing ENABLED (GRADIENT_CHECKPOINTING=1) ---")
 
 def load_tokenizer(model_shortcode: str):
     """
@@ -26,6 +49,25 @@ def load_model(model_shortcode: str, device_map: str = "cuda:0"):
     if "granite" in model_shortcode:
         from .granitemoe.modeling_granitemoe import GraniteMoeForCausalLM
         return GraniteMoeForCausalLM.from_pretrained(MODEL_SHORTCODE2ID[model_shortcode], device_map=device_map)
+    elif model_shortcode == "qwen36":
+        # Exact match BEFORE the `"qwen" in` substring branch (which would route
+        # to the vendored Qwen1.5-MoE class). Text-only class: transformers maps
+        # the multimodal checkpoint's `model.language_model.*` keys onto
+        # `model.layers.*` and ignores `model.visual.*` / `mtp.*`, so the decoder
+        # stack sits at model.model.layers (same depth as Granite under PEFT).
+        import torch
+        from transformers import Qwen3_5MoeForCausalLM   # transformers>=5 only (lazy: moe_env never imports it)
+        kwargs = dict(dtype=torch.bfloat16, device_map=device_map, attn_implementation="sdpa")
+        experts_impl = os.environ.get("QWEN_EXPERTS_IMPL")          # grouped_mm | batched_mm | eager; unset = HF default
+        if experts_impl:
+            kwargs["experts_implementation"] = experts_impl
+        if os.environ.get("QWEN_USE_HUB_KERNELS", "0") == "1":      # optional Gated-DeltaNet Hub kernel
+            kwargs.update(use_kernels=True, trust_remote_code=True)
+        m = Qwen3_5MoeForCausalLM.from_pretrained(MODEL_SHORTCODE2ID[model_shortcode], **kwargs)
+        # Never used (Granite's aux-loss coef is 0 too); after the router swap the
+        # native OutputRecorder would see no Qwen3_5MoeTopKRouter anyway.
+        m.config.output_router_logits = False
+        return m
     elif "deepseek" in model_shortcode:
         from .deepseekmoe.modeling_deepseek import DeepseekForCausalLM
         return DeepseekForCausalLM.from_pretrained(MODEL_SHORTCODE2ID[model_shortcode], device_map=device_map, trust_remote_code=True)
@@ -61,7 +103,7 @@ def load_peft_model(model_shortcode: str, finetune_mode: str, r: int = 64, lora_
             target_modules = ["router.layer"] # This uses regex-like matching for module names
     elif finetune_mode in ('qkv', 'qkv_experts'):
         # Your existing logic for targeting attention layers
-        target_modules = ["q_proj", "k_proj", "v_proj"]
+        target_modules = list(LORA_QKV_TARGETS.get(model_shortcode, LORA_QKV_TARGETS["default"]))
     else:
         raise ValueError(f"Invalid finetune_mode: {finetune_mode}")
 
@@ -89,14 +131,7 @@ def load_peft_model(model_shortcode: str, finetune_mode: str, r: int = 64, lora_
             lora_dropout=lora_dropout,
         )
 
-    # Opt-in via GRADIENT_CHECKPOINTING=1: recomputes activations in backward,
-    # cutting activation memory enough to fit arm B (bs=4, max_seq_len 768) on a
-    # 44-46 GiB card at ~25-35% speed cost. Mathematically identical training.
-    if os.environ.get("GRADIENT_CHECKPOINTING", "0") == "1":
-        peft_model.config.use_cache = False
-        peft_model.enable_input_require_grads()
-        peft_model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
-        print("--- Gradient checkpointing ENABLED (GRADIENT_CHECKPOINTING=1) ---")
+    _enable_gradient_checkpointing(peft_model)
 
     peft_model.print_trainable_parameters()
 
@@ -127,6 +162,10 @@ def load_peft_model_and_adapter(model_shortcode: str, adapter_path: str, eval_mo
 
     print(f"Loading PEFT adapter from: {adapter_path}")
     peft_model = PeftModel.from_pretrained(base_model, adapter_path, is_trainable=True)
+    # Same env-gated opt-in as load_peft_model, so the MAP / FCVR stages (which
+    # load the Stage-1 adapter through this path, with the default eval_mode and
+    # then call .train()) can checkpoint activations too. Inert in eval mode.
+    _enable_gradient_checkpointing(peft_model)
 
     from .expert_lora import EXPERT_LORA_FILENAME, has_expert_lora, expert_lora_path, load_expert_lora
     if has_expert_lora(adapter_path):

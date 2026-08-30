@@ -78,6 +78,7 @@ from utils import (
     generation_prompt_engineer,
 )
 from model import load_peft_model_and_adapter, load_tokenizer
+from model.adapters import moe_router
 from evaluate_fcvr import prepare_model_by_arm  # reuse faithful reconstruction (+ baseline arms)
 from uq_stats import auroc as _auroc_fixed_sign, bootstrap_ci, bootstrap_mean_ci
 
@@ -222,7 +223,7 @@ def records_from_ids(model, tokenizer, input_ids, fcvr_layers, causal_model, dev
 
     per_layer = []
     for l in fcvr_layers:
-        L = causal_model.layers[l].block_sparse_moe.router.last_cholesky_factor
+        L = moe_router(causal_model.layers[l]).last_cholesky_factor
         E = L.shape[-1]
         L = L.view(1, seq_len, E, E)[0].float()          # [seq, E, E]
         per_layer.append((L ** 2).sum(dim=(-1, -2)))      # [seq] = ||L||_F^2 = tr(LL^T)
@@ -290,7 +291,7 @@ class OnlineILVRecorder:
         self.gate_ent = {l: [] for l in self.layers}
         self.handles = []
         for l in self.layers:
-            router = causal_model.layers[l].block_sparse_moe.router
+            router = moe_router(causal_model.layers[l])
             self.handles.append(router.register_forward_hook(self._make_hook(l)))
 
     def _make_hook(self, l):
@@ -922,7 +923,7 @@ def main():
     print(f"Arm: {args.arm}")
     det = args.routing == "deterministic"
     for l in fcvr_layers:
-        causal_model.layers[l].block_sparse_moe.router.deterministic_readout = det
+        moe_router(causal_model.layers[l]).deterministic_readout = det
     print(f"Routing mode: {'DETERMINISTIC posterior-mean (ABLATION)' if det else f'STOCHASTIC S={args.num_samples} (paper inference; PRIMARY)'}")
 
     if args.source in GENERATION_SOURCES:

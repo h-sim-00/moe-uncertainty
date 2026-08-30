@@ -63,6 +63,7 @@ from tqdm import tqdm
 from utils import setup_environment, load_exp_dataset, generation_prompt_engineer
 from utils.prompt import canonicalise_inner
 from model import load_peft_model_and_adapter, load_tokenizer
+from model.adapters import moe_router
 from evaluate_fcvr import prepare_model_by_arm
 from uq_stats import auroc, auprc, bootstrap_ci
 
@@ -141,7 +142,7 @@ def collect_signals(model, tokenizer, dataset_code, num_examples, fcvr_layers, c
         if fcvr_layers:
             per_layer_last, per_layer_mean = [], []
             for l in fcvr_layers:
-                L = causal_model.layers[l].block_sparse_moe.router.last_cholesky_factor
+                L = moe_router(causal_model.layers[l]).last_cholesky_factor
                 E = L.shape[-1]
                 tr = (L.view(seq_len, E, E).float() ** 2).sum(dim=(-1, -2))  # [seq] = tr(LL^T)
                 per_layer_last.append(tr[-1])
@@ -235,7 +236,7 @@ def main():
 
     causal_model = model.base_model.model.model
     for l in fcvr_layers:
-        causal_model.layers[l].block_sparse_moe.router.deterministic_readout = (args.routing == "deterministic")
+        moe_router(causal_model.layers[l]).deterministic_readout = (args.routing == "deterministic")
     print(f"Routing mode: {'DETERMINISTIC posterior-mean (ABLATION)' if args.routing == 'deterministic' else f'STOCHASTIC S={args.num_samples} (paper inference; PRIMARY)'}")
     print(f"Inner prompt format: {args.inner_format} (ID and OoD alike)")
 

@@ -86,9 +86,11 @@ from evaluate_ilv_ood_arms import (
     ARM_SETUP,
     DEFAULT_LAYERS,
     SAME_SOURCE,
+    check_model_registered,
     check_output_collisions,
     ci_text,
     compare_domain,
+    default_tag,
     delta_verdict,
     domain_sampling_seed,
     f3,
@@ -110,6 +112,7 @@ from uq_stats import auprc, auroc, bootstrap_mean_ci
 from utils import seed_everything, setup_environment
 from utils.data import EXPLANATION_MARKER
 from utils.prompt import SYSTEM_INSTRUCTIONS, multiple_choice_prompt_engineer
+from model.adapters import moe_router
 
 LETTERS = ["A", "B", "C", "D", "E"]
 STAGES = ("stage1", "tf", "gen")
@@ -176,7 +179,8 @@ def parse_args(argv=None):
     p.add_argument("--arm_a_run_suffix", default=None, help="Default: ARM_SETUP entry.")
     p.add_argument("--arm_b_run_suffix", default=None, help="Default: ARM_SETUP entry.")
     p.add_argument("--output_dir", default="results/ood_expl_readout")
-    p.add_argument("--tag", default="obqa-ood-expl")
+    p.add_argument("--tag", default=None,
+                   help="Output stem. Default: obqa-ood-expl (granite) / obqa-ood-expl-<model_shortcode> otherwise.")
     p.add_argument("--overwrite", action="store_true")
     p.add_argument("--stats_only", default=None, metavar="PEREXAMPLE_JSONL",
                    help="Recompute this stage's statistics/report from a streamed per-example file (no GPU).")
@@ -187,8 +191,9 @@ def parse_args(argv=None):
 
 
 def validate_args(args):
-    if args.model_shortcode != "granite":
-        raise SystemExit("The saved comparison arms are Granite-specific; --model_shortcode must be granite.")
+    check_model_registered(args)
+    if args.tag is None:
+        args.tag = default_tag("obqa-ood-expl", args.model_shortcode)
     for k in ("n_per_domain", "trace_n_id", "trace_n_ood"):
         if getattr(args, k) < 0:
             raise SystemExit(f"--{k} must be >= 0")
@@ -427,7 +432,7 @@ def readout_masked(model, tokenizer, prompts, n_choices_list, fcvr_layers, batch
             gate_fcvr.append(ge[fcvr_layers].mean(dim=0))
             per_layer = []
             for l in fcvr_layers:
-                L = causal_model.layers[l].block_sparse_moe.router.last_cholesky_factor
+                L = moe_router(causal_model.layers[l]).last_cholesky_factor
                 E = L.shape[-1]
                 L_last = L.view(bsz, seq_len, E, E)[:, -1, :, :]
                 per_layer.append((L_last.float() ** 2).sum(dim=(-1, -2)))          # tr(LL^T)
@@ -503,7 +508,7 @@ def trace_sequence(model, causal_model, tokenizer, fcvr_layers, ids, spans, choi
 
     per_layer = []
     for l in fcvr_layers:
-        L = causal_model.layers[l].block_sparse_moe.router.last_cholesky_factor
+        L = moe_router(causal_model.layers[l]).last_cholesky_factor
         E = L.shape[-1]
         L = L.view(1, seq_len, E, E)[0].float()
         per_layer.append((L ** 2).sum(dim=(-1, -2)))                                # tr(LL^T) [seq]
@@ -596,7 +601,7 @@ def letter_probe(model, causal_model, fcvr_layers, prompt_ids, choice_ids_t, n_c
     probs = F.softmax(logits[choice_ids_t].masked_fill(~mask, float("-inf")), dim=0).cpu().numpy()
     per_layer = []
     for l in fcvr_layers:
-        L = causal_model.layers[l].block_sparse_moe.router.last_cholesky_factor
+        L = moe_router(causal_model.layers[l]).last_cholesky_factor
         per_layer.append(float((L[-1].float() ** 2).sum()))
     h = letter_entropy_of(probs)
     return {"pred_letter": LETTERS[int(probs.argmax())], "probs": probs, "letter_entropy": h,

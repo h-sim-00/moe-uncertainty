@@ -152,8 +152,48 @@ ARM_SETUP = {
                 "system_prompt": "comparison",
             },
         },
+        # Other base models (branch OBQA-qwen): selected by --model_shortcode.
+        # Both Qwen arms are trained fresh on obqa_gen (driver
+        # run-overnight-obqa-qwen-arms.sh); arm A keeps the letter-only 'mcq'
+        # instruction, arm B the 'comparison' one, as on the Granite branch.
+        "arms_by_model": {
+            "qwen36": {
+                "armA-letter": {
+                    "label": "Arm A: answer-only (Qwen3.6, mcq prompt)",
+                    "adapter": "adapters/qwen36-obqa_gen-armA-letter",
+                    "run_suffix": "armA-letter-pretrained-prior-beta0.01",
+                    "weights_dataset": None,
+                    "system_prompt": "mcq",
+                },
+                "armB-ansexp": {
+                    "label": "Arm B: answer + explanation (fact1) (Qwen3.6)",
+                    "adapter": "adapters/qwen36-obqa_gen-armB-ansexp",
+                    "run_suffix": "armB-ansexp-pretrained-prior-beta0.01",
+                    "weights_dataset": None,
+                    "system_prompt": "comparison",
+                },
+            },
+        },
     },
 }
+
+
+def registered_models(id_dataset):
+    """Base models with saved arms for this ID dataset ('granite' = the `arms` block)."""
+    return ["granite", *sorted(ARM_SETUP[id_dataset].get("arms_by_model", {}))]
+
+
+def default_tag(base, model_shortcode):
+    """Granite keeps the historical output stems; any other model gets '-<model>'
+    appended so its outputs never collide with the Granite files."""
+    return base if model_shortcode == "granite" else f"{base}-{model_shortcode}"
+
+
+def check_model_registered(args):
+    models = registered_models(args.id_dataset)
+    if args.model_shortcode not in models:
+        raise SystemExit(f"No saved comparison arms for --model_shortcode {args.model_shortcode!r} on "
+                         f"{args.id_dataset} (registered: {models}); add an ARM_SETUP[..]['arms_by_model'] entry.")
 
 # Shortcodes drawn from the same upstream corpus as an ID anchor: not unseen to
 # a model trained on that anchor, so refused as OoD.
@@ -214,10 +254,11 @@ def resolve_arm_setup(args):
     if args.ood_datasets is None:
         args.ood_datasets = list(setup["default_ood"])
     if args.tag is None:
-        args.tag = setup["tag"]
+        args.tag = default_tag(setup["tag"], args.model_shortcode)
+    arms = setup.get("arms_by_model", {}).get(args.model_shortcode, setup["arms"])
     arm_cfgs = {}
     for arm_key, cli in (("armA-letter", "a"), ("armB-ansexp", "b")):
-        cfg = dict(setup["arms"][arm_key])
+        cfg = dict(arms[arm_key])
         adapter = getattr(args, f"arm_{cli}_adapter")
         run_suffix = getattr(args, f"arm_{cli}_run_suffix")
         if adapter:
@@ -238,16 +279,12 @@ def git_revision() -> str:
 
 
 def validate_args(args):
-    if args.model_shortcode != "granite":
-        raise SystemExit(
-            "The two saved comparison arms and evaluate_fcvr.prepare_model_fcvr are Granite-specific; "
-            "--model_shortcode must be granite."
-        )
     if args.id_dataset not in ARM_SETUP:
         raise SystemExit(
             f"--id_dataset must be a registered arm comparison {sorted(ARM_SETUP)}. "
             "Use fcvr_input_level_ood_check.py for a generic single-arm anchor."
         )
+    check_model_registered(args)
     if args.n_per_domain < 0:
         raise SystemExit("--n_per_domain must be >= 0")
     if args.n_boot < 1:

@@ -9,7 +9,8 @@ from datasets import Dataset
 from typing import List, Tuple
 from transformers import AutoTokenizer
 import random
-from .prompt import multiple_choice_prompt_engineer, generation_prompt_engineer, COMPARISON_SYSTEM_INSTRUCTION
+from .prompt import (multiple_choice_prompt_engineer, generation_prompt_engineer, COMPARISON_SYSTEM_INSTRUCTION,
+                     SYSTEM_INSTRUCTIONS)
 
 # Datasets whose fine-tuning target is FREE-TEXT GENERATION (not a single MCQA
 # option letter). These route through generation_prompt_engineer, get an EOS
@@ -57,6 +58,28 @@ def add_target_mode_arg(parser, extra_help=""):
     return parser
 
 
+def add_system_prompt_arg(parser):
+    """--system_prompt for the TRAINING side of the comparison arms (branch
+    OBQA-qwen): which system instruction wraps `letter_question`. 'comparison'
+    (default) reproduces every existing run; 'mcq' is the letter-only
+    instruction (Qwen arm A is trained with it, mirroring how the Granite OBQA
+    arm A was trained). Evaluation selects the same key via evaluate_letter.py
+    --system_prompt / the ARM_SETUP registry."""
+    parser.add_argument("--system_prompt", type=str, default="comparison", choices=sorted(SYSTEM_INSTRUCTIONS),
+                        help="[comparison target modes] system instruction used to build the training prompt: "
+                             "'comparison' (default, the shared letter+explanation instruction) or 'mcq' "
+                             "(letter-only instruction). Ignored for target_mode=explanation.")
+    return parser
+
+
+def eligible_tag_for(model_shortcode):
+    """Suffix that keys the frozen eligible-ID lists to the tokenizer. Granite
+    (the model every existing list was written with) keeps the unsuffixed
+    filenames; any other model gets its own list (a different tokenizer gives
+    a different keep-list and would otherwise trip the frozen-list check)."""
+    return None if model_shortcode == "granite" else model_shortcode
+
+
 def loss_mode_label(dataset_shortcodes, target_mode="explanation"):
     """Human-readable description of which tokens carry the training loss
     (printed by the training scripts; mirrors the dispatch in
@@ -70,13 +93,15 @@ def loss_mode_label(dataset_shortcodes, target_mode="explanation"):
     }[target_mode]
 
 
-def build_target_mode_example(example, tokenizer, target_mode):
+def build_target_mode_example(example, tokenizer, target_mode, system_instruction=COMPARISON_SYSTEM_INSTRUCTION):
     """Turn one raw generation example (medmcqa_gen / medexqa layout: `question`,
     `answer` = " " + explanation, `gold_letter`, `letter_question`, `id`) into the
     prompt-engineered {question, answer, id} dict of the requested comparison arm.
 
-    The prompt is the SAME for both arms (comparison prompt = `letter_question`
-    wrapped with COMPARISON_SYSTEM_INSTRUCTION); only the target differs:
+    The prompt is `letter_question` wrapped with `system_instruction` (default
+    COMPARISON_SYSTEM_INSTRUCTION -- the SAME for both arms in the MedMCQA /
+    Granite-OBQA comparisons; the Qwen OBQA arm A passes MCQ_SYSTEM_INSTRUCTION);
+    the target differs by arm:
       letter              -> answer = gold letter (bare, e.g. "C")
       answer_explanation  -> answer = gold letter + "\\nExplanation:" + explanation
     The caller decides about EOS (answer_explanation gets one, letter does not).
@@ -91,7 +116,7 @@ def build_target_mode_example(example, tokenizer, target_mode):
                          f"example (generation datasets only); missing on id={example.get('id')!r}")
     engineered = multiple_choice_prompt_engineer(
         {"question": letter_question, "answer": gold_letter, "id": example["id"]},
-        tokenizer=tokenizer, system_instruction=COMPARISON_SYSTEM_INSTRUCTION,
+        tokenizer=tokenizer, system_instruction=system_instruction,
     )
     if target_mode == "letter":
         target = gold_letter
@@ -120,15 +145,20 @@ def comparison_eligible_indices(raw_rows, tokenizer, max_seq_len):
     return keep
 
 
-def eligible_ids_path(dataset_shortcode, max_seq_len, split_name, seed=42):
+def eligible_ids_path(dataset_shortcode, max_seq_len, split_name, seed=42, eligible_tag=None):
+    """`eligible_tag` (see eligible_tag_for): None -> the original filename (all
+    Granite lists); otherwise "-<tag>" is appended so another tokenizer's list
+    never collides with (or is checked against) the Granite one."""
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    return os.path.join(repo_root, "splits", f"{dataset_shortcode}-comparison-eligible-{split_name}-maxseq{max_seq_len}-seed{seed}.txt")
+    tag = f"-{eligible_tag}" if eligible_tag else ""
+    return os.path.join(repo_root, "splits",
+                        f"{dataset_shortcode}-comparison-eligible-{split_name}-maxseq{max_seq_len}-seed{seed}{tag}.txt")
 
 
-def _freeze_eligible_ids(dataset_shortcode, split_name, raw_rows, keep, max_seq_len, seed):
+def _freeze_eligible_ids(dataset_shortcode, split_name, raw_rows, keep, max_seq_len, seed, eligible_tag=None):
     """Write the eligible-ID list once (splits/...txt); on later calls verify the
     in-memory list is identical (so arm A and arm B provably used the same rows)."""
-    path = eligible_ids_path(dataset_shortcode, max_seq_len, split_name, seed)
+    path = eligible_ids_path(dataset_shortcode, max_seq_len, split_name, seed, eligible_tag)
     ids = [str(raw_rows[i]["id"]) for i in keep]
     if os.path.exists(path):
         frozen = [l.rstrip("\n") for l in open(path, encoding="utf-8") if l.strip()]
@@ -570,8 +600,18 @@ def _drop_overlong(dataset: Dataset, max_seq_len, name):
 
 def load_and_prepare_train_and_val_data(tokenizer: AutoTokenizer, train_dataset_shortcodes: List, seed=42,
                                         answer_only=False, max_seq_len=None,
-                                        target_mode="explanation") -> Tuple[Dataset, Dataset]:
+                                        target_mode="explanation", system_prompt="comparison",
+                                        eligible_tag=None) -> Tuple[Dataset, Dataset]:
     """Loads and preprocesses the dataset for causal language modeling.
+
+    `system_prompt` (comparison target modes only; key into SYSTEM_INSTRUCTIONS,
+    default 'comparison' = every existing run) selects the system instruction of
+    the training prompt. `eligible_tag` (see eligible_tag_for) keys the frozen
+    eligible-ID list to the tokenizer. The shared eligible-row list is ALWAYS
+    computed from the comparison-prompt answer_explanation sequence, whatever
+    `system_prompt` is, so both arms keep the same rows.
+    MOE_SMOKE_N_ROWS=<n> (env) truncates train/val to n rows AFTER the
+    eligibility list is frozen -- smoke runs only (use *_suffix smoke).
 
     Dispatch (mutually exclusive paths):
       * GENERATION datasets (see GENERATION_DATASETS), `target_mode="explanation"`
@@ -612,7 +652,10 @@ def load_and_prepare_train_and_val_data(tokenizer: AutoTokenizer, train_dataset_
                          f"got {train_dataset_shortcodes}")
     engineer = generation_prompt_engineer if generation else multiple_choice_prompt_engineer
     if target_mode != "explanation":
-        engineer = lambda x, tokenizer: build_target_mode_example(x, tokenizer, target_mode)  # noqa: E731
+        if system_prompt not in SYSTEM_INSTRUCTIONS:
+            raise ValueError(f"system_prompt must be one of {sorted(SYSTEM_INSTRUCTIONS)}, got {system_prompt!r}")
+        system_instruction = SYSTEM_INSTRUCTIONS[system_prompt]
+        engineer = lambda x, tokenizer: build_target_mode_example(x, tokenizer, target_mode, system_instruction)  # noqa: E731
 
     train_raw, val_raw = [], []
     for dataset_shortcode in train_dataset_shortcodes:
@@ -630,13 +673,20 @@ def load_and_prepare_train_and_val_data(tokenizer: AutoTokenizer, train_dataset_
         keep_va = comparison_eligible_indices(val_raw, tokenizer, max_seq_len)
         print(f"--- comparison eligibility (answer+explanation sequence <= {max_seq_len} tokens): "
               f"train {len(keep_tr)}/{len(train_raw)}, val {len(keep_va)}/{len(val_raw)} rows kept ---")
-        _freeze_eligible_ids(ds_name, "train", train_raw, keep_tr, max_seq_len, seed)
-        _freeze_eligible_ids(ds_name, "val", val_raw, keep_va, max_seq_len, seed)
+        _freeze_eligible_ids(ds_name, "train", train_raw, keep_tr, max_seq_len, seed, eligible_tag)
+        _freeze_eligible_ids(ds_name, "val", val_raw, keep_va, max_seq_len, seed, eligible_tag)
         train_raw = [train_raw[i] for i in keep_tr]
         val_raw = [val_raw[i] for i in keep_va]
 
+    smoke_n = int(os.environ.get("MOE_SMOKE_N_ROWS", "0") or 0)
+    if smoke_n > 0:
+        print(f"!!! MOE_SMOKE_N_ROWS={smoke_n}: truncating train/val to {smoke_n} rows each (SMOKE RUN ONLY) !!!")
+        train_raw, val_raw = train_raw[:smoke_n], val_raw[:smoke_n]
+
     train_engineered = [engineer(x, tokenizer=tokenizer) for x in train_raw]
     val_engineered = [engineer(x, tokenizer=tokenizer) for x in val_raw]
+    if target_mode != "explanation":
+        print(f"--- comparison training prompt: system_prompt={system_prompt!r} ---")
 
     if target_mode == "letter":
         # Arm A: exact answer-only labels on the bare letter, no EOS (exp4 recipe).

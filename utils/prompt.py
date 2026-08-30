@@ -55,7 +55,13 @@ def multiple_choice_prompt_engineer(
         }
     ]
 
-    input_text = tokenizer.apply_chat_template(chat, tokenize=False, add_generation_prompt=True, add_eos=False)
+    # enable_thinking=False: Qwen3.x chat templates open a <think> block by
+    # default; with it disabled the assistant header ends "<think>\n\n</think>\n\n"
+    # so the answer letter is the FIRST generated token (the read-out position).
+    # Granite's template ignores unknown kwargs (like the existing add_eos) ->
+    # its prompts are byte-identical.
+    input_text = tokenizer.apply_chat_template(chat, tokenize=False, add_generation_prompt=True, add_eos=False,
+                                               enable_thinking=False)
 
     return {
         "question": input_text,
@@ -87,7 +93,7 @@ def generation_prompt_engineer(
     ]
 
     input_text = tokenizer.apply_chat_template(
-        chat, tokenize=False, add_generation_prompt=True, add_eos=False
+        chat, tokenize=False, add_generation_prompt=True, add_eos=False, enable_thinking=False
     )
 
     return {

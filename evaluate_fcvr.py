@@ -29,7 +29,7 @@ from sklearn.metrics import roc_auc_score, average_precision_score
 from utils import setup_environment, load_exp_dataset, multiple_choice_prompt_engineer
 from utils import get_model_predictions, calculate_accuracy, calculate_ece_mce, calculate_nll
 from model import load_peft_model_and_adapter, load_tokenizer
-from model.adapters import granite_adapter
+from model.adapters import get_adapter, moe_router, set_moe_router
 
 # Paper Table 8 OoD targets (OBQA is the fixed ID anchor). Edit if needed.
 OOD_DATASETS = {
@@ -77,22 +77,24 @@ def prepare_model_fcvr(model, args):
     routers; FCVR layers get their trained variational weights (mean_base seeded
     from the same prior). Must mirror how the run was trained."""
     print(f"--- Preparing FCVR model (prior_source={args.prior_source}) ---")
-    # 1. Set the deterministic routers on all 32 layers. For prior_source=map,
+    adapter = get_adapter(args.model_shortcode)     # granite | qwen36 swap/save/load functions
+    # 1. Set the deterministic routers on all layers. For prior_source=map,
     #    load the fine-tuned MAP routers (also seeds FCVR mean_base); for
-    #    prior_source=pretrained, leave the pre-trained Granite routers in place.
+    #    prior_source=pretrained, leave the pre-trained routers in place.
     if args.prior_source == "map":
-        model = granite_adapter.load_granite_map_routers(model, args=args)
+        model = adapter.load_map(model, args=args)
     else:
-        print("--- prior_source=pretrained: keeping pre-trained Granite routers; FCVR mean_base seeds from them ---")
+        print("--- prior_source=pretrained: keeping pre-trained routers; FCVR mean_base seeds from them ---")
     # 2. Swap the selected layers to FCVR and load their trained weights.
-    #    load_granite_bayesian_routers reads swap_layers + run_suffix and loads
+    #    load_bayes reads swap_layers + run_suffix and loads
     #    ./router_weights/fcvr/fcvr-<model>-<dataset>-<suffix>/layer_<i>_weights.pt
-    model = granite_adapter.load_granite_bayesian_routers(model, method="fcvr", args=args)
+    #    (qwen36: also wraps every layer's MoE block in the router container).
+    model = adapter.load_bayes(model, method="fcvr", args=args)
 
     # 3. Set the number of MC samples used at inference on each FCVR router.
     causal_model = model.base_model.model.model
     for i in args.swap_layers:
-        router = causal_model.layers[i].block_sparse_moe.router
+        router = moe_router(causal_model.layers[i])
         if hasattr(router, "num_mc_samples_inference"):
             router.num_mc_samples_inference = args.num_samples
 
@@ -109,15 +111,18 @@ def prepare_model_untrained_fcvr(model, args):
     prior_source is honoured (map -> MAP routers loaded first)."""
     from model.routers.fcvr import FullCovarianceVariationalRouter
     print(f"--- Preparing UNTRAINED FCVR model (prior_source={args.prior_source}) ---")
+    adapter = get_adapter(args.model_shortcode)
     if args.prior_source == "map":
-        model = granite_adapter.load_granite_map_routers(model, args=args)
+        model = adapter.load_map(model, args=args)
+    elif hasattr(adapter, "ensure_containers"):
+        model = adapter.ensure_containers(model)      # qwen36: containers on every layer
     causal_model = model.base_model.model.model
     for i in args.swap_layers:
         target_layer = causal_model.layers[i]
         new_router = FullCovarianceVariationalRouter(
-            config=causal_model.config, existing_router=target_layer.block_sparse_moe.router)
+            config=adapter.router_config(causal_model.config), existing_router=moe_router(target_layer))
         new_router.num_mc_samples_inference = args.num_samples
-        target_layer.block_sparse_moe.router = new_router.to(model.device)
+        set_moe_router(target_layer, new_router.to(next(target_layer.parameters()).device))
     model.eval()
     print(f"UNTRAINED FCVR layers: {sorted(args.swap_layers)} | MC samples: {args.num_samples}")
     return model
@@ -172,7 +177,7 @@ def compute_signals(model, tokenizer, dataset, fcvr_layers, args):
             # --- inf-log-var: ||L||_F^2 at the final token, averaged over FCVR layers ---
             per_layer = []
             for l in fcvr_layers:
-                router = causal_model.layers[l].block_sparse_moe.router
+                router = moe_router(causal_model.layers[l])
                 L = router.last_cholesky_factor  # [bsz*seq, E, E], (batch, seq) row-major
                 E = L.shape[-1]
                 L_last = L.view(bsz, seq_len, E, E)[:, -1, :, :]  # final token per sequence

@@ -70,6 +70,8 @@ from .data import (
     COMPARISON_MODES,
     TARGET_MODE_SUFFIX,
     add_target_mode_arg,
+    add_system_prompt_arg,
+    eligible_tag_for,
     build_target_mode_example,
     comparison_eligible_indices,
     loss_mode_label,

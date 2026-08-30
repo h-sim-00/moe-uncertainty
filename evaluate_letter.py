@@ -55,7 +55,7 @@ from utils import setup_environment, seed_everything, load_exp_dataset
 from utils import calculate_accuracy, calculate_ece_mce, calculate_nll
 from utils.prompt import multiple_choice_prompt_engineer, SYSTEM_INSTRUCTIONS
 from model import load_peft_model_and_adapter, load_tokenizer
-from model.adapters import granite_adapter
+from model.adapters import get_adapter, moe_router
 from uq_stats import auroc, bootstrap_ci
 
 CHOICES = ["A", "B", "C", "D"]
@@ -107,12 +107,17 @@ def prepare(args):
     # dataset the weights were trained on.
     wargs = argparse.Namespace(**vars(args))
     wargs.dataset_shortcode = args.weights_dataset_shortcode or args.dataset_shortcode
+    adapter = get_adapter(args.model_shortcode)
     if args.method == "det":
         if not args.map_suffix:
             print("WARNING: --method det without --map_suffix -> loading the UNSUFFIXED MAP routers "
                   f"router_weights/base/{wargs.model_shortcode}_{wargs.dataset_shortcode}")
-        model = granite_adapter.load_granite_map_routers(model, args=wargs)
-    elif args.method == "fcvr":
+        model = adapter.load_map(model, args=wargs)
+    elif hasattr(adapter, "ensure_containers"):
+        # qwen36 zero_shot / kvq_ft rows: the router hooks below need our router
+        # container on every layer (the native Qwen gate returns a different tuple).
+        model = adapter.ensure_containers(model)
+    if args.method == "fcvr":
         if not args.swap_layers or not args.run_suffix:
             raise SystemExit("--method fcvr needs --swap_layers and --run_suffix")
         from evaluate_fcvr import prepare_model_fcvr   # faithful reconstruction (MAP/pretrained prior + FCVR weights + S)
@@ -159,7 +164,7 @@ class GateEntropyRecorder:
         self.layers = list(range(len(causal_model.layers)))
         self.bsz = None
         self.last = {}
-        self.handles = [causal_model.layers[l].block_sparse_moe.router.register_forward_hook(self._hook(l))
+        self.handles = [moe_router(causal_model.layers[l]).register_forward_hook(self._hook(l))
                         for l in self.layers]
 
     def _hook(self, l):
@@ -217,7 +222,7 @@ def readout(model, tokenizer, prompts, fcvr_layers, batch_size):
                 gate_fcvr.append(ge[fcvr_layers].mean(dim=0))
                 per_layer = []
                 for l in fcvr_layers:
-                    router = causal_model.layers[l].block_sparse_moe.router
+                    router = moe_router(causal_model.layers[l])
                     L = router.last_cholesky_factor                # [bsz*seq, E, E]
                     E = L.shape[-1]
                     L_last = L.view(bsz, seq_len, E, E)[:, -1, :, :]

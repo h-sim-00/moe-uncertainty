@@ -39,8 +39,9 @@ from transformers import DataCollatorForSeq2Seq
 from utils import setup_environment
 from model import load_tokenizer
 from utils.data import (load_exp_dataset, load_and_prepare_train_and_val_data, is_generation_dataset,
-                        build_target_mode_example, comparison_eligible_indices, add_target_mode_arg)
-from utils.prompt import multiple_choice_prompt_engineer, generation_prompt_engineer
+                        build_target_mode_example, comparison_eligible_indices, add_target_mode_arg,
+                        add_system_prompt_arg, eligible_tag_for)
+from utils.prompt import multiple_choice_prompt_engineer, generation_prompt_engineer, SYSTEM_INSTRUCTIONS
 
 
 def parse_args():
@@ -51,6 +52,7 @@ def parse_args():
     p.add_argument("--num_batches", type=int, default=4, help="How many val batches to check (0 = all).")
     p.add_argument("--seed", type=int, default=42)
     add_target_mode_arg(p)
+    add_system_prompt_arg(p)
     p.add_argument("--max_seq_len", type=int, default=0,
                    help="Same as the training scripts' --max_seq_len (comparison arms: applies the shared eligible-ID list).")
     return p.parse_args()
@@ -63,7 +65,8 @@ def main():
     generation = is_generation_dataset([args.dataset_shortcode])
     arm = args.target_mode != "explanation"          # MedMCQA-comparison arm A / B
     if arm:
-        engineer = lambda x, tokenizer: build_target_mode_example(x, tokenizer, args.target_mode)  # noqa: E731
+        system_instruction = SYSTEM_INSTRUCTIONS[args.system_prompt]
+        engineer = lambda x, tokenizer: build_target_mode_example(x, tokenizer, args.target_mode, system_instruction)  # noqa: E731
     else:
         engineer = generation_prompt_engineer if generation else multiple_choice_prompt_engineer
     # EOS is part of the target for the generation recipes (explanation / answer_explanation),
@@ -73,7 +76,8 @@ def main():
     # Same call the training scripts make (val split is unshuffled -> row order matches).
     _, val_dataset = load_and_prepare_train_and_val_data(
         tokenizer, [args.dataset_shortcode], seed=args.seed, answer_only=True,
-        max_seq_len=args.max_seq_len or None, target_mode=args.target_mode)
+        max_seq_len=args.max_seq_len or None, target_mode=args.target_mode,
+        system_prompt=args.system_prompt, eligible_tag=eligible_tag_for(args.model_shortcode))
     _, val_raw, _ = load_exp_dataset(args.dataset_shortcode, seed=args.seed)
     if arm and args.max_seq_len:
         # the loader kept only the shared eligible rows -> mirror that here so row order matches
@@ -167,7 +171,8 @@ def main():
           f"prompt fully masked; loss block contiguous at sequence end.")
     if arm:
         print(f"OK: first loss token is the bare gold-letter token in all {n_checked} rows "
-              f"(target_mode={args.target_mode}).")
+              f"(target_mode={args.target_mode}, system_prompt={args.system_prompt}, "
+              f"eos={tokenizer.eos_token!r}, pad={tokenizer.pad_token!r}).")
     if n_junction_diff:
         print(f"note: {n_junction_diff} row(s) had a different token split at the prompt/target junction "
               f"(joint vs separate tokenisation) but identical target text -- harmless.")
