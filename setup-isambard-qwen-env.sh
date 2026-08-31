@@ -23,7 +23,10 @@ SRC_ENV="${SRC_ENV:-moe_env}"; NEW_ENV="${NEW_ENV:-qwen_env}"
 TRANSFORMERS_PIN="${TRANSFORMERS_PIN:-5.16.1}"; PEFT_PIN="${PEFT_PIN:-0.20.0}"
 mkdir -p "$HF_HOME" "$MOE_RAW_DATA_DIR"
 
-source ~/miniforge3/bin/activate
+# Define `conda` without implicitly activating the first positional argument.
+# `bin/activate` forwards this script's mode flag (for example `--env-only`) to
+# `conda activate`, which makes Conda interpret the flag as an environment name.
+source ~/miniforge3/etc/profile.d/conda.sh
 
 if [ "$MODE" = "all" ] || [ "$MODE" = "--env-only" ]; then
     if conda env list | grep -qE "^${NEW_ENV}\s"; then
