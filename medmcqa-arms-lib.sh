@@ -56,11 +56,14 @@ eval_json()   { echo "${OUT_DIR}/$1_$2.json"; }                                 
 #           Qwen's 40 layers by relative depth i/L (x1.25): {6-9, 24-25, 36-39};
 #           |i/40 - j/32| <= 0.025 for every pair, the last layer stays last.
 # Override a set with LAYERS_<name>="..." (LAYERS alone still overrides literal).
+# Capture the legacy LAYERS override before the Qwen driver reuses LAYERS as its
+# active work array. Expanding an array as `${LAYERS}` returns only element 0.
+LITERAL_LAYER_SET="${LAYERS_literal:-${LAYERS:-5 6 7 8 19 20 28 29 30 31}}"
 layer_set_layers() {   # <name> -> space-separated layer indices
     local V="LAYERS_$1"
     if [ -n "${!V:-}" ]; then echo "${!V}"; return; fi
     case "$1" in
-        literal) echo "${LAYERS:-5 6 7 8 19 20 28 29 30 31}" ;;
+        literal) echo "$LITERAL_LAYER_SET" ;;
         depth)   echo "6 7 8 9 24 25 36 37 38 39" ;;
         *) echo "ERROR: unknown layer set '$1' (literal|depth, or set LAYERS_$1)" >&2; return 1 ;;
     esac

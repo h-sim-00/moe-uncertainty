@@ -53,7 +53,7 @@ if [ "$MODE" = "all" ] || [ "$MODE" = "--downloads-only" ]; then
     cd "$REPO"
     export PYTHONPATH="$REPO${PYTHONPATH:+:$PYTHONPATH}"
     echo "==== model: Qwen/Qwen3.6-35B-A3B -> $HF_HOME (~72 GB) ===="
-    hf download Qwen/Qwen3.6-35B-A3B --exclude "*.md" "*.png" "*.jpg" || huggingface-cli download Qwen/Qwen3.6-35B-A3B
+    hf download Qwen/Qwen3.6-35B-A3B || huggingface-cli download Qwen/Qwen3.6-35B-A3B
     echo "==== eval datasets (HF cache + raw ECQA/CommonsenseQA files) ===="
     python - <<'PY'
 from utils import setup_environment

@@ -260,7 +260,7 @@ def load_classification_dataset(dataset_shortcode, seed=42, split=None):
     if "arc" in dataset_shortcode:
         # Handles "arc_easy" and "arc_challenge"
         config_name = "ARC-Challenge" if "challenge" in dataset_shortcode else "ARC-Easy"
-        dataset = datasets.load_dataset("ai2_arc", config_name)
+        dataset = datasets.load_dataset("allenai/ai2_arc", config_name)
         
         def reformat(example):
             # Handles cases where labels might not be A,B,C,D
@@ -312,7 +312,7 @@ def load_classification_dataset(dataset_shortcode, seed=42, split=None):
         test_dataset = validation_dataset # MedMCQA doesn't have a standard test set, use validation
 
     elif dataset_shortcode == "openbookqa":
-        dataset = datasets.load_dataset("openbookqa", "main")
+        dataset = datasets.load_dataset("allenai/openbookqa", "main")
         
         def reformat(example):
             return {
@@ -998,7 +998,7 @@ def _load_obqa_gen(seed):
     fact1 is unused at eval, and filtering before the [:5050] slice would shift
     the pool relative to exp4. write-obqa-split-manifest.py freezes the split
     and cross-checks it against the legacy `obqa` loader."""
-    dataset = datasets.load_dataset("openbookqa", "additional")
+    dataset = datasets.load_dataset("allenai/openbookqa", "additional")
 
     def reformat(example, split_name):
         labels = example["choices"]["label"]
@@ -1471,13 +1471,13 @@ def load_exp_dataset(dataset_shortcode, seed=42, split=None):
 
     if dataset_shortcode == "obqa":
         # 5000 train, 500 test
-        dataset = datasets.load_dataset("openbookqa", "main")
+        dataset = datasets.load_dataset("allenai/openbookqa", "main")
         train_pool = [reformat_obqa(ex) for ex in dataset["train"]] + [reformat_obqa(ex) for ex in dataset["validation"]]
         train_dataset = [ex for ex in train_pool if ex is not None][:5050]
         test_dataset = [reformat_obqa(ex) for ex in dataset["test"] if ex is not None]
 
     elif dataset_shortcode == "arc_c":
-        dataset = datasets.load_dataset("ai2_arc", "ARC-Challenge")
+        dataset = datasets.load_dataset("allenai/ai2_arc", "ARC-Challenge")
         test_pool = [reformatted for ex in dataset["test"] if (reformatted := reformat_arc(ex)) is not None]
         random.shuffle(test_pool)
         test_dataset = test_pool[:500]
@@ -1487,7 +1487,7 @@ def load_exp_dataset(dataset_shortcode, seed=42, split=None):
         train_dataset = train_pool + extra_train_from_test
 
     elif dataset_shortcode == "arc_e":
-        dataset = datasets.load_dataset("ai2_arc", "ARC-Easy")
+        dataset = datasets.load_dataset("allenai/ai2_arc", "ARC-Easy")
         test_pool = [reformatted for ex in dataset["test"] if (reformatted := reformat_arc(ex)) is not None]
         random.shuffle(test_pool)
         test_dataset = test_pool[:500]
@@ -1496,7 +1496,7 @@ def load_exp_dataset(dataset_shortcode, seed=42, split=None):
         train_dataset = train_pool
 
     elif dataset_shortcode == "sciq":
-        dataset = datasets.load_dataset("sciq")
+        dataset = datasets.load_dataset("allenai/sciq")
         train_pool = [reformat_sciq(ex) for ex in dataset["train"]] + [reformat_sciq(ex) for ex in dataset["validation"]]
         train_dataset = [ex for ex in train_pool if ex is not None][:5050]
         test_dataset = [reformat_sciq(ex) for ex in dataset["test"] if ex is not None][:500]
