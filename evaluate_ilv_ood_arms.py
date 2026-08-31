@@ -173,6 +173,26 @@ ARM_SETUP = {
                     "system_prompt": "comparison",
                 },
             },
+            # Gemma 4 26B-A4B (branch OBQA-gemma, driver run-overnight-obqa-gemma-arms.sh).
+            # Its ONLY FCVR layer set is the depth-mapped one (Granite's literal
+            # 28-31 do not exist in 30 layers), so the weights carry the
+            # "-layers-depth" suffix: layers 5 6 7 8 18 19 26 27 28 29.
+            "gemma4": {
+                "armA-letter": {
+                    "label": "Arm A: answer-only (Gemma 4, mcq prompt)",
+                    "adapter": "adapters/gemma4-obqa_gen-armA-letter",
+                    "run_suffix": "armA-letter-pretrained-prior-beta0.01-layers-depth",
+                    "weights_dataset": None,
+                    "system_prompt": "mcq",
+                },
+                "armB-ansexp": {
+                    "label": "Arm B: answer + explanation (fact1) (Gemma 4)",
+                    "adapter": "adapters/gemma4-obqa_gen-armB-ansexp",
+                    "run_suffix": "armB-ansexp-pretrained-prior-beta0.01-layers-depth",
+                    "weights_dataset": None,
+                    "system_prompt": "comparison",
+                },
+            },
         },
     },
 }
@@ -189,11 +209,35 @@ def default_tag(base, model_shortcode):
     return base if model_shortcode == "granite" else f"{base}-{model_shortcode}"
 
 
+# Per-model FCVR layer set used when --swap_layers is left at the Granite default
+# (DEFAULT_LAYERS). Granite and Qwen3.6 (40 layers) keep the literal indices;
+# Gemma 4 has 30 layers, so its only trained set is the depth-mapped one that the
+# gemma4 ARM_SETUP run_suffixes ("-layers-depth") point at.
+MODEL_DEFAULT_LAYERS = {
+    "gemma4": [5, 6, 7, 8, 18, 19, 26, 27, 28, 29],
+}
+
+
+def apply_model_default_layers(args):
+    """If --swap_layers was not given (still == DEFAULT_LAYERS) and the model has
+    its own default set, substitute it. Explicit --swap_layers always win."""
+    layers = getattr(args, "swap_layers", None)
+    model_default = MODEL_DEFAULT_LAYERS.get(getattr(args, "model_shortcode", None))
+    if model_default is not None and layers is not None and list(layers) == list(DEFAULT_LAYERS):
+        args.swap_layers = list(model_default)
+        print(f"--swap_layers not given: using the {args.model_shortcode} default layer set {args.swap_layers}")
+    return args
+
+
 def check_model_registered(args):
+    """Refuse models without saved arms for --id_dataset; also resolves the
+    model-specific default --swap_layers (apply_model_default_layers), since
+    every consumer script calls this right after parsing."""
     models = registered_models(args.id_dataset)
     if args.model_shortcode not in models:
         raise SystemExit(f"No saved comparison arms for --model_shortcode {args.model_shortcode!r} on "
                          f"{args.id_dataset} (registered: {models}); add an ARM_SETUP[..]['arms_by_model'] entry.")
+    apply_model_default_layers(args)
 
 # Shortcodes drawn from the same upstream corpus as an ID anchor: not unseen to
 # a model trained on that anchor, so refused as OoD.

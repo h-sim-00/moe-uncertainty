@@ -27,10 +27,11 @@
 #   MAX_NEW_TOKENS=256  MAX_SEQ_TOKENS=2048  PERTOKEN_SCOPE=target|all
 #   DATA_SEED=42  SAMPLING_SEED=42  S=35  EVAL_BATCH=8  N_BOOT=2000  ROUTING=stochastic
 #   LAYERS="5 6 7 8 19 20 28 29 30 31"  TAG=obqa-ood-expl  OUT_DIR=results/ood_expl_readout
-#   MODEL_SHORTCODE=granite|qwen36 (selects the saved arms; non-granite tags get "-<model>" appended)
-#   LAYER_SET=literal|depth (OBQA-qwen; see medmcqa-arms-lib.sh layer_set_layers): a non-literal
-#           set selects its layers, appends "-layers-<set>" to TAG and reads the FCVR weights
-#           saved under "<arm suffix>-layers-<set>" (BETA=0.01 picks the beta in that suffix)
+#   MODEL_SHORTCODE=granite|qwen36|gemma4 (selects the saved arms; non-granite tags get "-<model>" appended)
+#   LAYER_SET=literal|depth (OBQA-qwen / OBQA-gemma; see medmcqa-arms-lib.sh layer_set_layers): a non-literal
+#           set selects its layers (model-specific for 'depth'), appends "-layers-<set>" to TAG and reads
+#           the FCVR weights saved under "<arm suffix>-layers-<set>" (BETA=0.01 picks the beta in that
+#           suffix). gemma4 has ONLY the depth set: MODEL_SHORTCODE=gemma4 LAYER_SET=depth.
 #   STAGE1_OOD="arc_c arc_e medexqa"  TRACE_OOD="medexqa scienceqa ecqa aqua_rat"
 #   CROSSCHECK_STAGE1=<saved ilv_ood_arms perexample.jsonl>  CROSSCHECK_TF=<saved analyze_obqa_gen trace perexample.jsonl>
 #   SMOKE=1 (tiny caps, tag smoke, plus a deterministic-routing gen alignment check)

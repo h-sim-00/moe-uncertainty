@@ -13,6 +13,10 @@ committing hours to it.
          --target_mode answer_explanation --max_seq_len 768 --batch_size 2            # Qwen3.6 Stage-1, per-rank batch
   python expert-lora-memory-check.py --model_shortcode qwen36 --dataset_shortcode obqa_gen --stage fcvr \
          --target_mode answer_explanation --max_seq_len 768 --batch_size 1            # Qwen3.6 FCVR (fresh heads)
+  python expert-lora-memory-check.py --model_shortcode gemma4 --dataset_shortcode obqa_gen --stage fcvr \
+         --swap_layers 5 6 7 8 18 19 26 27 28 29 --target_mode answer_explanation --max_seq_len 768 --batch_size 1
+                                                                                       # Gemma 4 FCVR ('depth' layers; the
+                                                                                       # Granite default set exceeds 30 layers)
 
 Uses the same loader / collator path as kvq-tuning.py (answer-only or
 target_mode labels, right padding, DataCollatorForSeq2Seq) and runs the batch of

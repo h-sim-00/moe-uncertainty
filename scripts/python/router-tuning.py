@@ -23,7 +23,7 @@ from tqdm import tqdm
 import torch
 import wandb
 
-from model.adapters import granite_adapter, qwen_adapter, deepseek_adapter, qwen36_adapter
+from model.adapters import granite_adapter, qwen_adapter, deepseek_adapter, qwen36_adapter, gemma4_adapter
 
 from utils import setup_environment, seed_everything
 from model import load_peft_model_and_adapter, load_tokenizer
@@ -48,6 +48,10 @@ ADAPTER_MAP = {
     "qwen36": {
         "prepare": qwen36_adapter.swap_qwen36_moe_blocks,
         "save": qwen36_adapter.save_qwen36_map_routers,
+    },
+    "gemma4": {
+        "prepare": gemma4_adapter.swap_gemma4_moe_blocks,
+        "save": gemma4_adapter.save_gemma4_map_routers,
     },
 }
 

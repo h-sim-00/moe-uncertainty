@@ -4,7 +4,7 @@ import os, torch, wandb
 from tqdm import tqdm
 from transformers import DataCollatorForSeq2Seq, get_cosine_schedule_with_warmup
 
-from model.adapters import granite_adapter, qwen_adapter, deepseek_adapter, qwen36_adapter, moe_router
+from model.adapters import granite_adapter, qwen_adapter, deepseek_adapter, qwen36_adapter, gemma4_adapter, moe_router
 
 from utils import setup_environment, seed_everything
 from model import load_peft_model_and_adapter, load_tokenizer
@@ -33,6 +33,11 @@ ADAPTER_MAP = {
         "load": qwen36_adapter.load_qwen36_map_routers,
         "prepare": qwen36_adapter.prepare_qwen36_bayesian_routers,
         "save": qwen36_adapter.save_qwen36_bayesian_routers,
+    },
+    "gemma4": {
+        "load": gemma4_adapter.load_gemma4_map_routers,
+        "prepare": gemma4_adapter.prepare_gemma4_bayesian_routers,
+        "save": gemma4_adapter.save_gemma4_bayesian_routers,
     },
 }
 

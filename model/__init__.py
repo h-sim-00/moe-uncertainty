@@ -10,16 +10,30 @@ MODEL_SHORTCODE2ID = {
     # branch OBQA-qwen: Qwen3.6-35B-A3B (transformers>=5 `Qwen3_5MoeForCausalLM`;
     # hybrid Gated-DeltaNet/attention, 40 layers, 256 experts top-8 + shared expert).
     "qwen36": "Qwen/Qwen3.6-35B-A3B",
+    # branch OBQA-gemma: Gemma 4 26B-A4B instruction-tuned (transformers>=5.5
+    # `Gemma4ForCausalLM`; 30 layers, MoE in every layer: 128 experts top-8 +
+    # a dense MLP in parallel; multimodal checkpoint loaded text-only).
+    "gemma4": "google/gemma-4-26B-A4B-it",
 }
 
 # Stage-1 LoRA targets per model for finetune_mode in ('qkv', 'qkv_experts').
 # Qwen3.6: q/k/v_proj exist only in the 10 full-attention layers; the 30 Gated
 # DeltaNet layers project Q/K/V through the fused `in_proj_qkv` Linear, so it is
 # included so every layer's QKV projection is adapted. Granite list unchanged.
+# Gemma 4: q/k/v_proj on the 25 sliding-window layers; the 5 global layers have
+# attention_k_eq_v (no v_proj module, V = K), so they get q/k LoRA only.
 LORA_QKV_TARGETS = {
     "default": ["q_proj", "k_proj", "v_proj"],
     "qwen36": ["q_proj", "k_proj", "v_proj", "in_proj_qkv"],
+    "gemma4": ["q_proj", "k_proj", "v_proj"],
 }
+
+# Gemma 4's tokenizer eos is "<eos>", but its chat template closes every turn
+# with "<turn|>" (id 106) and the instruct model emits that token to end a
+# turn (generation_config eos = [<eos>, <turn|>, ...]). Training targets and
+# generation stops use tokenizer.eos_token, so the Gemma tokenizer is loaded
+# with eos_token="<turn|>" -- the exact analogue of Qwen's "<|im_end|>".
+GEMMA4_EOS_TOKEN = "<turn|>"
 
 
 def _enable_gradient_checkpointing(peft_model):
@@ -38,6 +52,13 @@ def load_tokenizer(model_shortcode: str):
     """
     assert model_shortcode in MODEL_SHORTCODE2ID, f"Model shortcode '{model_shortcode}' not defined."
     from transformers import AutoTokenizer
+    if model_shortcode == "gemma4":
+        tok = AutoTokenizer.from_pretrained(MODEL_SHORTCODE2ID[model_shortcode], eos_token=GEMMA4_EOS_TOKEN)
+        eos_id = tok.convert_tokens_to_ids(GEMMA4_EOS_TOKEN)
+        assert tok.eos_token == GEMMA4_EOS_TOKEN and tok.eos_token_id == eos_id and eos_id != tok.unk_token_id, \
+            f"gemma4 tokenizer: could not set eos to {GEMMA4_EOS_TOKEN!r} (got {tok.eos_token!r}/{tok.eos_token_id})"
+        assert tok.pad_token_id is not None and tok.pad_token_id != tok.eos_token_id, "gemma4 tokenizer: pad must differ from eos"
+        return tok
     return AutoTokenizer.from_pretrained(MODEL_SHORTCODE2ID[model_shortcode])
 
 def load_model(model_shortcode: str, device_map: str = "cuda:0"):
@@ -67,6 +88,36 @@ def load_model(model_shortcode: str, device_map: str = "cuda:0"):
         # Never used (Granite's aux-loss coef is 0 too); after the router swap the
         # native OutputRecorder would see no Qwen3_5MoeTopKRouter anyway.
         m.config.output_router_logits = False
+        return m
+    elif model_shortcode == "gemma4":
+        # Text-only class on the multimodal checkpoint. Unlike qwen3_5 (whose
+        # `qwen3_5_text` conversion strips the `language_model` prefix),
+        # transformers has NO conversion entry for `gemma4_text`, so without the
+        # explicit key_mapping every decoder weight would be reported missing and
+        # silently randomly initialised. The mapping renames
+        # model.language_model.<x> -> model.<x>; vision/audio tower keys are
+        # unexpected and dropped; lm_head is tied to embed_tokens (no checkpoint
+        # key). Loading info is checked so a mapping regression fails loudly.
+        import torch
+        from transformers import Gemma4ForCausalLM   # transformers>=5.5 only (lazy: moe_env never imports it)
+        kwargs = dict(dtype=torch.bfloat16, device_map=device_map, attn_implementation="sdpa",
+                      key_mapping={r"^model\.language_model\.": "model."}, output_loading_info=True)
+        experts_impl = os.environ.get("GEMMA_EXPERTS_IMPL")        # grouped_mm | batched_mm | eager; unset = HF default
+        if experts_impl:
+            kwargs["experts_implementation"] = experts_impl
+        out = Gemma4ForCausalLM.from_pretrained(MODEL_SHORTCODE2ID[model_shortcode], **kwargs)
+        m, info = out if isinstance(out, tuple) else (out, {})
+        info = dict(info) if info else {}
+        missing = [k for k in info.get("missing_keys", []) if not str(k).startswith("lm_head.")]
+        non_text_prefixes = ("model.vision_tower.", "model.embed_vision.", "model.audio_tower.", "model.embed_audio.")
+        unexpected = [k for k in info.get("unexpected_keys", []) if not str(k).startswith(non_text_prefixes)]
+        if missing or unexpected:
+            raise RuntimeError(
+                f"gemma4 text-only load did not line up with the checkpoint: {len(missing)} missing text keys "
+                f"(e.g. {missing[:3]}), {len(unexpected)} unexpected non-vision keys (e.g. {unexpected[:3]}). "
+                f"Check the key_mapping against the transformers version.")
+        print(f"--- gemma4: {len(info.get('unexpected_keys', []))} vision/audio checkpoint keys ignored; "
+              f"text stack fully loaded ({len(m.model.layers)} layers) ---")
         return m
     elif "deepseek" in model_shortcode:
         from .deepseekmoe.modeling_deepseek import DeepseekForCausalLM

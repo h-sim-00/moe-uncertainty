@@ -7,6 +7,8 @@ __pycache__/
 *.txt
 *.jsonl
 *.png
+*.pdf
+*.csv
 
 # C extensions
 *.so
