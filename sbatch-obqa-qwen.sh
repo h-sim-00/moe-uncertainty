@@ -28,7 +28,7 @@
 # ============================================================================
 #SBATCH --job-name=obqa-qwen
 #SBATCH --nodes=1
-#SBATCH --gpus=1
+#SBATCH --gpus-per-node=1
 #SBATCH --time=23:30:00
 #SBATCH --output=/projects/u6qd/moe-uncertainty/logs/%x-%j.out
 #SBATCH --error=/projects/u6qd/moe-uncertainty/logs/%x-%j.err

@@ -16,6 +16,7 @@
 #   FROM=train bash submit-obqa-qwen-chain.sh         # skip prep (already done)
 #   FROM=eval  bash submit-obqa-qwen-chain.sh         # eval[literal] onwards
 #   FROM=train-depth bash submit-obqa-qwen-chain.sh   # literal all done: depth train/eval/oodexpl only
+#   INITIAL_DEP=afterok:<jobid> FROM=train bash ...   # attach to an already-submitted prep job
 #   LAYER_SETS="literal" bash ...                     # a single layer set end-to-end
 #   DRY=1 bash submit-obqa-qwen-chain.sh              # print the sbatch lines only
 set -euo pipefail
@@ -46,7 +47,7 @@ start=-1
 for i in "${!steps[@]}"; do [ "${steps[$i]}" = "$WANT" ] && { start=$i; break; }; done
 [ "$start" -ge 0 ] || { echo "FROM=$FROM not found; valid: ${steps[*]//:/-}" >&2; exit 2; }
 
-DEP=""            # dependency for the next step in the strict chain
+DEP="${INITIAL_DEP:-}"  # optional existing dependency, then the next step in the strict chain
 for ((i=start; i<${#steps[@]}; i++)); do
     s="${steps[$i]}"; STAGE="${s%%:*}"; LS="${s#*:}"
     case "$STAGE" in
