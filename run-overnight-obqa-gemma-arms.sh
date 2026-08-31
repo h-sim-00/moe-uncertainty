@@ -113,7 +113,9 @@ STAGE1_BATCH_RANK=$(per_rank "$STAGE1_BATCH" STAGE1_BATCH)
 MAP_BATCH_RANK=$(per_rank "$MAP_BATCH" MAP_BATCH)
 FCVR_BATCH_RANK=$(per_rank "$FCVR_BATCH" FCVR_BATCH)
 
-WANDB_PROJECT="${WANDB_PROJECT:-moe-uncertainty-gemma4}"; RUN_TAG="$(date +%Y%m%d-%H%M%S)"
+# RUN_TAG is overridable so two drivers launched in the same second (the chain's
+# parallel per-arm train jobs) never share the overnight log below.
+WANDB_PROJECT="${WANDB_PROJECT:-moe-uncertainty-gemma4}"; RUN_TAG="${RUN_TAG:-$(date +%Y%m%d-%H%M%S)}"
 export RUN_TAG WANDB_PROJECT
 mkdir -p logs "$OUT_DIR" "$REPORT_DIR" results/data
 LOG="logs/overnight-obqa-gemma-arms-${RUN_TAG}.log"; exec > >(tee -a "$LOG") 2>&1

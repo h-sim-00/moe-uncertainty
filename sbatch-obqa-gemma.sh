@@ -113,8 +113,23 @@ case "$STAGE" in
     smoke)
         # model-layer checks, then a tiny end-to-end on a few rows (suffix-free
         # dirs are namespaced by MODEL_SHORTCODE=gemma4, so nothing else is touched)
-        python smoke-gemma4-model.py
+        echo "==== smoke 1/3: model checks, HF default experts impl ===="
+        time python smoke-gemma4-model.py
+        # experts-kernel trial: same checks (incl. ELBO grads + generation) on the
+        # grouped-GEMM path -- a kernel choice read by load_model at load time, not
+        # a math change. Compare the two 'real' times; if it passes, the mini run
+        # uses it, and a later train picks it up via exported GEMMA_EXPERTS_IMPL.
+        echo "==== smoke 2/3: model checks, GEMMA_EXPERTS_IMPL=grouped_mm ===="
+        SMOKE_IMPL=""
+        if time GEMMA_EXPERTS_IMPL=grouped_mm python smoke-gemma4-model.py; then
+            echo "grouped_mm experts: ALL CHECKS PASSED"
+            SMOKE_IMPL=grouped_mm
+        else
+            echo "WARNING: grouped_mm experts smoke FAILED -- mini run falls back to the HF default impl" >&2
+        fi
+        echo "==== smoke 3/3: 64-row end-to-end (experts impl: ${GEMMA_EXPERTS_IMPL:-${SMOKE_IMPL:-HF default}}) ===="
         MOE_SMOKE_N_ROWS="${MOE_SMOKE_N_ROWS:-64}" RESUME=0 ALLOW_EXISTING=1 SKIP_PREFLIGHT=1 LAYER_SETS=depth \
+            GEMMA_EXPERTS_IMPL="${GEMMA_EXPERTS_IMPL:-$SMOKE_IMPL}" \
             PHASES="${PHASES:-preflight,stage1,fcvr,eval}" ARMS="${ARMS:-answer_explanation}" \
             STAGE1_EPOCHS=1 FCVR_EPOCHS=1 N_VAL=8 N_TEST=8 EVAL_SEEDS="42" \
             bash run-overnight-obqa-gemma-arms.sh

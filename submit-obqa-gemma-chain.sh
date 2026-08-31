@@ -2,10 +2,17 @@
 # Submit the OBQA-gemma pipeline as an afterok chain on Isambard-AI (24 h QoS):
 #
 #   prep (1 GPU, 4 h; downloads + preflight)
-#   -> train[depth]        (4 GPUs, 23.5 h; stage1 + map + fcvr on 5 6 7 8 18 19 26 27 28 29)
-#   -> train[depth]-resume (afterany insurance; RESUME=1 no-op when done)
-#   -> eval[depth]         (1 GPU; letter evals, report, OoD arms)
+#   -> train[depth,armA] || train[depth,armB]   (4 GPUs EACH, 23.5 h; the arms are
+#         independent pipelines -- stage1 + map + fcvr on 5 6 7 8 18 19 26 27 28 29 --
+#         so they run in parallel on one node each, ~halving train wall time)
+#      each with a -resume job (afterany insurance; RESUME=1 no-op when done)
+#   -> eval[depth]         (1 GPU; afterok on BOTH arm resumes; letter evals, report, OoD arms)
 #   -> oodexpl[depth]      (1 GPU; nine explanation-ILV aggregates, tf + gen)
+#
+# Parallel arms are safe: every adapter/router/eval artefact and per-stage log is
+# arm-suffixed, W&B runs are per-arm, and the shared splits/*-gemma4.txt eligible
+# lists are frozen by prep's preflight (train only re-verifies them). Each arm job
+# gets its own RUN_TAG so the drivers never share the overnight log either.
 #
 #   bash submit-obqa-gemma-chain.sh                    # full chain
 #   FROM=train bash submit-obqa-gemma-chain.sh         # skip prep (already done)
@@ -58,12 +65,19 @@ for ((i=start; i<${#steps[@]}; i++)); do
             J=$(submit prep 1 04:00:00 "$DEP")
             echo "submitted prep job $J (dependency: ${DEP:-none})"; DEP="afterok:$J" ;;
         train)
-            J=$(submit train "$TRAIN_GPUS" 23:30:00 "$DEP" "$LS" "LAYER_SETS=$LS")
-            echo "submitted train[$LS]        job $J (dependency: ${DEP:-none})"
-            # insurance re-run: continues an unfinished stage if the first hit the 24 h wall
-            J2=$(submit train "$TRAIN_GPUS" 23:30:00 "afterany:$J" "$LS-resume" "LAYER_SETS=$LS")
-            echo "submitted train[$LS]-resume job $J2 (afterany $J; RESUME=1 -> no-op when done)"
-            DEP="afterok:$J2" ;;
+            # one 4-GPU job per arm, in parallel (see header); eval waits on both resumes
+            STAMP="$(date +%Y%m%d-%H%M%S)"
+            EVAL_DEP="afterok"
+            for ARM_PAIR in armA:letter armB:answer_explanation; do
+                SFX="${ARM_PAIR%%:*}"; ARM="${ARM_PAIR#*:}"
+                J=$(submit train "$TRAIN_GPUS" 23:30:00 "$DEP" "$LS-$SFX" "LAYER_SETS=$LS,ARMS=$ARM,RUN_TAG=${STAMP}-${SFX}")
+                echo "submitted train[$LS,$SFX]        job $J (dependency: ${DEP:-none})"
+                # insurance re-run: continues an unfinished stage if the first hit the 24 h wall
+                J2=$(submit train "$TRAIN_GPUS" 23:30:00 "afterany:$J" "$LS-$SFX-resume" "LAYER_SETS=$LS,ARMS=$ARM,RUN_TAG=${STAMP}-${SFX}-resume")
+                echo "submitted train[$LS,$SFX]-resume job $J2 (afterany $J; RESUME=1 -> no-op when done)"
+                EVAL_DEP="$EVAL_DEP:$J2"
+            done
+            DEP="$EVAL_DEP" ;;
         eval)
             J=$(submit eval 1 23:30:00 "$DEP" "$LS" "LAYER_SETS=$LS")
             echo "submitted eval[$LS] job $J (dependency: ${DEP:-none})"; DEP="afterok:$J" ;;
