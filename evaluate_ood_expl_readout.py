@@ -712,8 +712,12 @@ def load_arm(args, cfg):
     return model, tokenizer, fcvr_layers
 
 
-def release_arm(model):
-    del model
+def release_arm():
+    # The caller must `del model` BEFORE calling this: a `del` of a parameter
+    # here only unbinds the function-local name, so the caller's reference kept
+    # the whole model alive and the next arm's from_pretrained OOMed with the
+    # previous ~70 GB model still resident (fatal for qwen36/gemma4; the small
+    # Granite model masked this).
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -1322,7 +1326,8 @@ def main(argv=None):
                 blocks[arm_key] = score_readout(model, tokenizer, fcvr_layers, domains,
                                                 SYSTEM_INSTRUCTIONS[cfg["system_prompt"]], args, list(domains))
             finally:
-                release_arm(model)
+                del model
+                release_arm()
         with open(paths["perexample"], "w", encoding="utf-8") as f:
             for arm_key, doms in blocks.items():
                 for code, b in doms.items():
@@ -1383,7 +1388,8 @@ def main(argv=None):
                     all_rows += rows_arm
                     blocks[arm_key] = blocks_from_rows(rows_arm)[arm_key]
                 finally:
-                    release_arm(model)
+                    del model
+                    release_arm()
         finally:
             for fh in fhs.values():
                 fh.close()
