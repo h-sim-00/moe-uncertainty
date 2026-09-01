@@ -98,9 +98,15 @@ class FullCovarianceVariationalRouter(MoERouter):
             # covariance is already stored above for read-out.
             logits = mu_final
         else:
-            logit_samples = logit_dist.rsample(sample_shape=torch.Size([self.num_mc_samples_inference]))
-            probs_samples = torch.softmax(logit_samples, dim=-1)
-            mean_probs = probs_samples.mean(dim=0)
+            # Draw the S MC samples one at a time: rsample([S]) broadcasts the
+            # [N, E, E] scale_tril to [S, N, E, E] inside matmul, which OOMs
+            # for E=256 on long-prompt batches. Sequential draws keep the peak
+            # at the [N, E, E] Cholesky itself; the estimator is unchanged.
+            mean_probs = None
+            for _ in range(self.num_mc_samples_inference):
+                probs = torch.softmax(logit_dist.rsample(), dim=-1)
+                mean_probs = probs if mean_probs is None else mean_probs + probs
+            mean_probs = mean_probs / self.num_mc_samples_inference
             logits = torch.log(mean_probs.clamp(min=1e-9))
         
         top_k_logits, top_k_indices = logits.topk(self.top_k, dim=1)

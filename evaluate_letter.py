@@ -202,6 +202,15 @@ def readout(model, tokenizer, prompts, fcvr_layers, batch_size):
     choice_ids_t = torch.tensor(choice_ids, device=device)
 
     tokenizer.padding_side = "left"     # so position -1 is the last real token for every row
+
+    # Every FCVR layer retains a [bsz*seq, E, E] Cholesky factor for the whole
+    # forward (E=256 for qwen36), so long-prompt domains OOM at the default
+    # batch size. Cap tokens per batch instead of rows: short-prompt domains
+    # keep the requested batch_size, long ones shrink (down to 1 row).
+    token_budget = int(os.environ.get("READOUT_TOKEN_BUDGET", "2048"))
+    longest = max(len(ids) for ids in tokenizer(prompts, add_special_tokens=False)["input_ids"])
+    batch_size = max(1, min(batch_size, token_budget // min(longest, 2048)))
+
     rec = GateEntropyRecorder(causal_model)
     all_probs, gate_all, gate_fcvr, ilv = [], [], [], []
     try:
